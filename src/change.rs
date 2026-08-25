@@ -126,6 +126,11 @@ pub enum FileOp {
     /// [`ReadStorage::executable`](crate::fs::ReadStorage::executable), so a
     /// bit that was already in the requested state rolls back to itself rather
     /// than to its opposite.
+    ///
+    /// A path holding a symbolic link is **refused**
+    /// ([`InvalidInput`](std::io::ErrorKind::InvalidInput)), whoever made the
+    /// link: mode writes follow links, so the bit would land on the link's
+    /// referent — wherever it points, the lexical root guard notwithstanding.
     SetExecutable {
         /// The file whose execute bit is set or cleared.
         path: PathBuf,
@@ -598,6 +603,7 @@ async fn exec<FS: Storage>(
         }
         FileOp::SetExecutable { path, executable } => {
             let full = root.join(path);
+            guard_not_link(fs, &full).await?;
             if let Some(undo) = undo {
                 // Captured through the read half, so the rollback restores
                 // what *was* — not the blind opposite of what was asked,
@@ -648,6 +654,30 @@ async fn exec<FS: Storage>(
             ensure_parent(fs, &full).await?;
             fs.set_link(&full, target).await?;
         }
+    }
+    Ok(())
+}
+
+/// Refuse a [`FileOp::SetExecutable`] whose path holds a symbolic link.
+///
+/// Mode reads and writes follow links — `metadata` and `set_permissions`
+/// both do — so setting the bit "at" a link sets it on the link's *referent*,
+/// wherever that is. The root guard cannot see this: it is lexical, the link
+/// is not, and a set that stages `set_link("l", "/outside/victim")` then
+/// `set_executable("l", true)` would chmod a file the tree does not own. The
+/// same applies to a link the set never made. So the op is refused on any
+/// link, loudly, before the undo capture reads a bit that is not the path's
+/// own. Shared by the apply and the journal replay, which faces the same
+/// combination from bytes it did not author.
+pub(crate) async fn guard_not_link<FS: Storage>(fs: &FS, full: &Path) -> Result<()> {
+    if let Ok(Some(_)) = fs.read_link(full).await {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to set the execute bit through the symbolic link at {}",
+                full.display()
+            ),
+        )));
     }
     Ok(())
 }
@@ -1220,6 +1250,37 @@ mod tests {
             std::fs::read_link(root.join("dangling.md")).unwrap(),
             PathBuf::from("nowhere.md"),
             "the removed link must come back as the link it was"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_execute_bit_is_refused_through_a_link_and_the_set_unwinds() {
+        // The escape this closes: `set_link` at a path inside the root, then
+        // `set_executable` at that same path — mode writes follow links, so
+        // without the refusal the bit lands on the referent, wherever it
+        // points. The root guard is lexical and cannot see it; the op must.
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tmp("exec-through-link");
+        let outside = tmp("exec-through-link-outside");
+        std::fs::write(outside.join("victim.sh"), "#!/bin/sh").unwrap();
+        let victim = outside.join("victim.sh");
+        let mode_before = std::fs::metadata(&victim).unwrap().permissions().mode();
+
+        let mut cs = ChangeSet::new();
+        cs.set_link("l", victim.to_str().unwrap());
+        cs.set_executable("l", true);
+        let err = block_on(cs.apply(&StdFs, &root)).unwrap_err();
+
+        assert!(err.to_string().contains("symbolic link"), "{err}");
+        assert_eq!(
+            std::fs::metadata(&victim).unwrap().permissions().mode(),
+            mode_before,
+            "the referent's mode must be untouched"
+        );
+        assert!(
+            std::fs::symlink_metadata(root.join("l")).is_err(),
+            "the refused set must unwind the link it made"
         );
     }
 

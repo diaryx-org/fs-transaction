@@ -468,9 +468,13 @@ async fn replay<FS: Storage>(fs: &FS, root: &Path, op: &FileOp) -> Result<()> {
         // Setting a bit that is already set (or already cleared) reaches the
         // same state — idempotent by nature, like a whole-file write. On a
         // backend that models no bit the call no-ops, which is what the op
-        // means there.
+        // means there. The link guard is apply's, for apply's reason: mode
+        // writes follow links, and a journal is bytes this process did not
+        // author.
         FileOp::SetExecutable { path, executable } => {
-            fs.set_executable(&root.join(path), *executable).await?;
+            let full = root.join(path);
+            crate::change::guard_not_link(fs, &full).await?;
+            fs.set_executable(&full, *executable).await?;
         }
         // `set_link` replaces whatever is at the path, so replaying it lands
         // the same link whether the crash beat the op, interrupted it midway
