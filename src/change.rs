@@ -534,16 +534,7 @@ async fn exec<FS: Storage>(
             // (a full disk) leaves a truncated file, and restoring the old
             // bytes over it is exactly the repair.
             if let Some(undo) = undo {
-                match fs.read(&full).await {
-                    Ok(old) => undo.push(Undo::Restore {
-                        path: full.clone(),
-                        bytes: old,
-                    }),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        undo.push(Undo::Delete { path: full.clone() });
-                    }
-                    Err(e) => return Err(e.into()),
-                }
+                capture_replaced(fs, &full, undo).await?;
             }
             ensure_parent(fs, &full).await?;
             // Land the document through the atomic-replace protocol, so even a
@@ -568,16 +559,28 @@ async fn exec<FS: Storage>(
         FileOp::Remove { path } => {
             let full = root.join(path);
             match undo {
-                // The removed bytes are the undo, so they have to be read out
-                // before the file goes.
-                Some(undo) => {
-                    let old = fs.read(&full).await?;
-                    fs.remove_file(&full).await?;
-                    undo.push(Undo::Restore {
-                        path: full,
-                        bytes: old,
-                    });
-                }
+                // What was removed is the undo, so it has to be read out
+                // before it goes — the *link* where the path holds one
+                // (`remove_file` removes the link, never its target, so a
+                // rollback that rewrote it as a file holding the target's
+                // bytes would remove a link and give back a copy), the bytes
+                // everywhere else. A dangling link is removable on the same
+                // terms; reading through it to capture bytes would refuse an
+                // op the filesystem itself permits.
+                Some(undo) => match fs.read_link(&full).await {
+                    Ok(Some(target)) => {
+                        fs.remove_file(&full).await?;
+                        undo.push(Undo::Relink { path: full, target });
+                    }
+                    _ => {
+                        let old = fs.read(&full).await?;
+                        fs.remove_file(&full).await?;
+                        undo.push(Undo::Restore {
+                            path: full,
+                            bytes: old,
+                        });
+                    }
+                },
                 None => fs.remove_file(&full).await?,
             }
         }
@@ -588,16 +591,7 @@ async fn exec<FS: Storage>(
             let (full, source_full) = (root.join(path), root.join(source));
             let bytes = fs.read(&source_full).await?;
             if let Some(undo) = undo {
-                match fs.read(&full).await {
-                    Ok(old) => undo.push(Undo::Restore {
-                        path: full.clone(),
-                        bytes: old,
-                    }),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        undo.push(Undo::Delete { path: full.clone() });
-                    }
-                    Err(e) => return Err(e.into()),
-                }
+                capture_replaced(fs, &full, undo).await?;
             }
             ensure_parent(fs, &full).await?;
             fs.write_atomic(&full, &bytes).await?;
@@ -654,6 +648,46 @@ async fn exec<FS: Storage>(
             ensure_parent(fs, &full).await?;
             fs.set_link(&full, target).await?;
         }
+    }
+    Ok(())
+}
+
+/// Record how to put back whatever a replacing write (`Write`, `CopyFrom`) is
+/// about to displace at `full`.
+///
+/// The link question comes first, because a plain `read` follows one: capture
+/// by bytes alone and a path holding a link rolls back to a *regular file*
+/// holding a copy of its target — the link gone, shared content duplicated,
+/// and "the tree is as it was" quietly false. So: a link is put back as a link
+/// ([`Undo::Relink`] — `write_atomic` will have replaced the entry itself,
+/// and `set_link` restores it the same way); nothing is put back by deletion;
+/// and only a path holding an actual file is captured as bytes.
+async fn capture_replaced<FS: Storage>(fs: &FS, full: &Path, undo: &mut Vec<Undo>) -> Result<()> {
+    match fs.read_link(full).await {
+        Ok(Some(target)) => undo.push(Undo::Relink {
+            path: full.to_path_buf(),
+            target,
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            undo.push(Undo::Delete {
+                path: full.to_path_buf(),
+            });
+        }
+        // `Ok(None)` — a backend with no links, where nothing can be one —
+        // and any other error — the path holds something that is not a link —
+        // both fall through to capturing bytes.
+        _ => match fs.read(full).await {
+            Ok(old) => undo.push(Undo::Restore {
+                path: full.to_path_buf(),
+                bytes: old,
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                undo.push(Undo::Delete {
+                    path: full.to_path_buf(),
+                });
+            }
+            Err(e) => return Err(e.into()),
+        },
     }
     Ok(())
 }
@@ -1133,6 +1167,59 @@ mod tests {
             block_on(fs.0.read_to_string(Path::new("root/before.md"))).unwrap(),
             "old",
             "the write that preceded the refused link must unwind"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_set_restores_a_link_a_write_replaced_as_a_link() {
+        // Capture-by-bytes would follow the link and roll back to a regular
+        // file holding a copy of the target — link gone, content duplicated,
+        // "the tree is as it was" quietly false. The link must come back as
+        // a link, pointing where it pointed.
+        let root = tmp("rollback-write-over-link");
+        std::fs::write(root.join("target.md"), "the target").unwrap();
+        std::os::unix::fs::symlink("target.md", root.join("link.md")).unwrap();
+
+        let mut cs = ChangeSet::new();
+        cs.write("link.md", "replaces the link");
+        cs.write("doomed.md", "never lands");
+        block_on(cs.apply(&FailAtWrite::nth(1), &root)).unwrap_err();
+
+        let md = std::fs::symlink_metadata(root.join("link.md")).unwrap();
+        assert!(
+            md.file_type().is_symlink(),
+            "the link must come back as a link"
+        );
+        assert_eq!(
+            std::fs::read_link(root.join("link.md")).unwrap(),
+            PathBuf::from("target.md")
+        );
+        assert_eq!(
+            read(&root, "target.md").as_deref(),
+            Some("the target"),
+            "the rollback must not have written through the link"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_set_restores_a_link_it_removed_as_a_link() {
+        // Also the dangling case: `remove_file` removes a link the read-based
+        // capture could never have read through, so removal must not require
+        // the target to exist.
+        let root = tmp("rollback-remove-link");
+        std::os::unix::fs::symlink("nowhere.md", root.join("dangling.md")).unwrap();
+
+        let mut cs = ChangeSet::new();
+        cs.remove("dangling.md");
+        cs.write("doomed.md", "never lands");
+        block_on(cs.apply(&FailAtWrite::nth(0), &root)).unwrap_err();
+
+        assert_eq!(
+            std::fs::read_link(root.join("dangling.md")).unwrap(),
+            PathBuf::from("nowhere.md"),
+            "the removed link must come back as the link it was"
         );
     }
 
