@@ -1177,12 +1177,10 @@ mod tests {
             fn capabilities(&self) -> crate::fs::Capabilities {
                 self.0.capabilities()
             }
-            // Forwarded because the wrapped backend's atomic replace is its
-            // own single locked write; the default's temp-then-rename would
-            // trip over `InMemoryFs::rename` refusing to clobber.
-            async fn write_atomic(&self, path: &Path, contents: &[u8]) -> std::io::Result<()> {
-                self.0.write_atomic(path, contents).await
-            }
+            // `write_atomic` deliberately stays at the default too: its
+            // temp-then-rename runs fine over the wrapped backend now that
+            // `InMemoryFs::rename` replaces an occupied file, which this
+            // test then exercises for free.
             // `set_link` stays at the default: the refusal.
         }
 

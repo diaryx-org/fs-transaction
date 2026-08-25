@@ -476,10 +476,21 @@ impl Storage for InMemoryFs {
 impl InMemoryFs {
     fn rename_dir(&self, from_norm: &Path, to_norm: &Path, to: &Path) -> io::Result<()> {
         {
+            // A *directory* rename keeps the refusal a file rename gave up:
+            // renaming onto a non-directory is an error on every platform,
+            // and onto a directory `std::fs::rename` is platform-divergent
+            // (unix replaces only an empty one, Windows refuses outright) —
+            // so the portable double refuses the lot, and nothing in this
+            // crate renames a directory onto an occupied name.
             let files = self.files.read().unwrap();
             let bin = self.binary_files.read().unwrap();
             let dirs = self.directories.read().unwrap();
-            if files.contains_key(to_norm) || bin.contains_key(to_norm) || dirs.contains(to_norm) {
+            let links = self.symlinks.read().unwrap();
+            if files.contains_key(to_norm)
+                || bin.contains_key(to_norm)
+                || dirs.contains(to_norm)
+                || links.contains_key(to_norm)
+            {
                 return Err(Error::new(
                     ErrorKind::AlreadyExists,
                     format!("destination already exists: {}", to.display()),
@@ -555,14 +566,16 @@ impl InMemoryFs {
             {
                 return Err(not_found(from));
             }
-            // A link occupies its name exactly as a file does.
-            if files.contains_key(to_norm)
-                || bin.contains_key(to_norm)
-                || links.contains_key(to_norm)
-            {
+            // A directory is the one occupant a file's rename never replaces —
+            // `std::fs::rename` refuses that on every platform. Any other
+            // occupant gives way below, which is the mirror's whole point:
+            // the default `write_atomic` publishes by renaming a staged
+            // sibling *over* the target, and a rename that refused an
+            // occupied destination would fail the commonest replace there is.
+            if self.directories.read().unwrap().contains(to_norm) {
                 return Err(Error::new(
                     ErrorKind::AlreadyExists,
-                    format!("destination already exists: {}", to.display()),
+                    format!("destination is a directory: {}", to.display()),
                 ));
             }
         }
@@ -570,6 +583,12 @@ impl InMemoryFs {
         if let Some(parent) = to_norm.parent() {
             self.create_dir_all(parent).await?;
         }
+
+        // The non-directory occupant, if any, is replaced — file, binary, or
+        // link alike, exactly the entry-level replacement `rename(2)` performs.
+        self.files.write().unwrap().remove(to_norm);
+        self.binary_files.write().unwrap().remove(to_norm);
+        self.symlinks.write().unwrap().remove(to_norm);
 
         // A link moves as a link — the entry relocates, the target string
         // rides along unresolved, exactly as `rename(2)` treats one.
@@ -749,12 +768,44 @@ mod tests {
     }
 
     #[test]
-    fn rename_refuses_to_clobber_an_existing_destination() {
+    fn rename_replaces_an_occupied_file_destination() {
+        // The port doc is the contract: `rename` mirrors `std::fs::rename`,
+        // which replaces an existing destination file on every platform —
+        // and the default `write_atomic` publishes by renaming a staged
+        // sibling over the target, so a double that refused would fail the
+        // commonest replace there is.
         let fs = InMemoryFs::new();
         block_on(fs.write(Path::new("a.md"), b"a")).unwrap();
         block_on(fs.write(Path::new("b.md"), b"b")).unwrap();
-        let err = block_on(fs.rename(Path::new("a.md"), Path::new("b.md"))).unwrap_err();
+        block_on(fs.rename(Path::new("a.md"), Path::new("b.md"))).unwrap();
+        assert!(!block_on(fs.try_exists(Path::new("a.md"))).unwrap());
+        assert_eq!(block_on(fs.read_to_string(Path::new("b.md"))).unwrap(), "a");
+    }
+
+    #[test]
+    fn rename_refuses_a_directory_destination() {
+        // The one occupant a file's rename never replaces, on any platform.
+        let fs = InMemoryFs::new();
+        block_on(fs.write(Path::new("a.md"), b"a")).unwrap();
+        block_on(fs.create_dir_all(Path::new("dir"))).unwrap();
+        let err = block_on(fs.rename(Path::new("a.md"), Path::new("dir"))).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(block_on(fs.read_to_string(Path::new("a.md"))).unwrap(), "a");
+    }
+
+    #[test]
+    fn a_directory_rename_still_refuses_any_occupied_destination() {
+        // Directory-onto-directory is platform-divergent in std, so the
+        // portable double keeps the refusal for directories — and nothing in
+        // this crate renames a directory onto an occupied name.
+        let fs = InMemoryFs::new();
+        block_on(fs.write(Path::new("dir/a.md"), b"a")).unwrap();
+        block_on(fs.write(Path::new("other/b.md"), b"b")).unwrap();
+        block_on(fs.write(Path::new("file.md"), b"f")).unwrap();
+        for taken in ["other", "file.md"] {
+            let err = block_on(fs.rename(Path::new("dir"), Path::new(taken))).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{taken}");
+        }
     }
 
     // ---- symlinks: coherence with `ReadStorage::metadata`'s "follows symlinks"
@@ -864,7 +915,7 @@ mod tests {
     }
 
     #[test]
-    fn rename_moves_a_link_as_a_link_and_a_link_occupies_its_name() {
+    fn rename_moves_a_link_as_a_link_and_replaces_one_at_the_destination() {
         let fs = InMemoryFs::new();
         block_on(fs.write(Path::new("real.md"), b"content")).unwrap();
         fs.add_symlink(Path::new("link.md"), Path::new("real.md"));
@@ -876,10 +927,26 @@ mod tests {
         );
         assert!(!block_on(fs.try_exists(Path::new("link.md"))).unwrap());
 
-        // And the destination check: a link is as much an occupant as a file.
+        // A link at the destination is replaced like any non-directory
+        // occupant — `rename(2)` removes the entry, never follows it.
         block_on(fs.write(Path::new("other.md"), b"other")).unwrap();
-        let err = block_on(fs.rename(Path::new("other.md"), Path::new("moved.md"))).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        block_on(fs.rename(Path::new("other.md"), Path::new("moved.md"))).unwrap();
+        assert_eq!(
+            block_on(fs.read_link(Path::new("moved.md")))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidInput,
+            "the link must be gone, replaced by the renamed file"
+        );
+        assert_eq!(
+            block_on(fs.read_to_string(Path::new("moved.md"))).unwrap(),
+            "other"
+        );
+        assert_eq!(
+            block_on(fs.read_to_string(Path::new("real.md"))).unwrap(),
+            "content",
+            "nothing may be renamed through the link"
+        );
     }
 
     #[test]

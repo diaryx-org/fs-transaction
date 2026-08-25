@@ -471,7 +471,15 @@ pub trait Storage: ReadStorage {
     /// [`std::fs::remove_dir_all`].
     fn remove_dir_all(&self, path: &Path) -> impl Future<Output = io::Result<()>>;
 
-    /// Rename or move a file or directory. Mirrors [`std::fs::rename`].
+    /// Rename or move a file or directory. Mirrors [`std::fs::rename`] — and
+    /// the load-bearing half of the mirror is that an occupied destination
+    /// *file* is replaced, as `std::fs::rename` replaces one on every platform
+    /// this crate targets. The default [`write_atomic`](Storage::write_atomic)
+    /// publishes by renaming a staged sibling over the target, so a backend
+    /// whose rename refuses an occupied file cannot take that default and must
+    /// override `write_atomic` with its own atomic replacement. A *directory*
+    /// destination is another matter — `std::fs::rename` itself is
+    /// platform-divergent there — and nothing in this crate renames onto one.
     fn rename(&self, from: &Path, to: &Path) -> impl Future<Output = io::Result<()>>;
 
     /// Give `to` the same access permissions `from` has. A `from` that does not
