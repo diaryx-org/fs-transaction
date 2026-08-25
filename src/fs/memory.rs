@@ -314,7 +314,13 @@ impl ReadStorage for InMemoryFs {
 impl Storage for InMemoryFs {
     async fn write(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
         let normalized = normalize_path(path);
-        insert_ancestor_dirs(&mut self.directories.write().unwrap(), &normalized);
+        // Through the link where the path holds one, single hop — `std::fs::write`
+        // opens the path and therefore follows, and this backend's reads
+        // already resolve; a write that instead stored bytes *under the link's
+        // own name* would leave them permanently shadowed, readable by nobody,
+        // with the write reporting success. The double must not invent that.
+        let resolved = self.resolve(&normalized);
+        insert_ancestor_dirs(&mut self.directories.write().unwrap(), &resolved);
 
         // Store as text when the bytes are valid UTF-8, so `read_to_string`
         // and `export_entries` see a plain string — matching the diaryx
@@ -326,15 +332,15 @@ impl Storage for InMemoryFs {
                 self.files
                     .write()
                     .unwrap()
-                    .insert(normalized.clone(), s.to_string());
-                self.binary_files.write().unwrap().remove(&normalized);
+                    .insert(resolved.clone(), s.to_string());
+                self.binary_files.write().unwrap().remove(&resolved);
             }
             Err(_) => {
                 self.binary_files
                     .write()
                     .unwrap()
-                    .insert(normalized.clone(), contents.to_vec());
-                self.files.write().unwrap().remove(&normalized);
+                    .insert(resolved.clone(), contents.to_vec());
+                self.files.write().unwrap().remove(&resolved);
             }
         }
         Ok(())
@@ -457,6 +463,12 @@ impl Storage for InMemoryFs {
         // only litter the map with a `.fstx-tmp` entry no caller asked for.
         // This is exactly the "backend with a better native path" case the
         // default documents overriding wholesale.
+        //
+        // One faithful difference from `write`: the rename that realizes the
+        // default protocol replaces the *entry* at the path, so a link there
+        // gives way to the file rather than forwarding to its target — the
+        // same replacement `set_link` performs in the other direction.
+        self.symlinks.write().unwrap().remove(&normalize_path(path));
         self.write(path, contents).await
     }
 }
@@ -536,10 +548,18 @@ impl InMemoryFs {
         {
             let files = self.files.read().unwrap();
             let bin = self.binary_files.read().unwrap();
-            if !files.contains_key(from_norm) && !bin.contains_key(from_norm) {
+            let links = self.symlinks.read().unwrap();
+            if !files.contains_key(from_norm)
+                && !bin.contains_key(from_norm)
+                && !links.contains_key(from_norm)
+            {
                 return Err(not_found(from));
             }
-            if files.contains_key(to_norm) || bin.contains_key(to_norm) {
+            // A link occupies its name exactly as a file does.
+            if files.contains_key(to_norm)
+                || bin.contains_key(to_norm)
+                || links.contains_key(to_norm)
+            {
                 return Err(Error::new(
                     ErrorKind::AlreadyExists,
                     format!("destination already exists: {}", to.display()),
@@ -549,6 +569,17 @@ impl InMemoryFs {
 
         if let Some(parent) = to_norm.parent() {
             self.create_dir_all(parent).await?;
+        }
+
+        // A link moves as a link — the entry relocates, the target string
+        // rides along unresolved, exactly as `rename(2)` treats one.
+        let moved_link = self.symlinks.write().unwrap().remove(from_norm);
+        if let Some(target) = moved_link {
+            self.symlinks
+                .write()
+                .unwrap()
+                .insert(to_norm.to_path_buf(), target);
+            return Ok(());
         }
 
         // Each removal is its own statement, not an `if let`'s scrutinee: an
@@ -775,6 +806,80 @@ mod tests {
         fs.add_symlink(Path::new("dangling.md"), Path::new("nowhere.md"));
         let err = block_on(fs.metadata(Path::new("dangling.md"))).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn write_follows_a_link_to_its_target() {
+        // `std::fs::write` opens and therefore follows; a double that stored
+        // the bytes under the link's own name would shadow them forever
+        // behind `resolve`, with the write reporting success.
+        let fs = InMemoryFs::new();
+        block_on(fs.write(Path::new("real.md"), b"old")).unwrap();
+        fs.add_symlink(Path::new("link.md"), Path::new("real.md"));
+
+        block_on(fs.write(Path::new("link.md"), b"new")).unwrap();
+
+        assert_eq!(
+            block_on(fs.read_to_string(Path::new("real.md"))).unwrap(),
+            "new",
+            "the bytes must land in the target"
+        );
+        assert_eq!(
+            block_on(fs.read_to_string(Path::new("link.md"))).unwrap(),
+            "new"
+        );
+        assert_eq!(
+            block_on(fs.read_link(Path::new("link.md"))).unwrap(),
+            Some(PathBuf::from("real.md")),
+            "the link itself must still stand"
+        );
+    }
+
+    #[test]
+    fn write_atomic_replaces_a_link_rather_than_writing_through_it() {
+        // The default protocol's rename replaces the entry at the path; the
+        // native override must keep that half of the contract too.
+        let fs = InMemoryFs::new();
+        block_on(fs.write(Path::new("real.md"), b"target bytes")).unwrap();
+        fs.add_symlink(Path::new("link.md"), Path::new("real.md"));
+
+        block_on(fs.write_atomic(Path::new("link.md"), b"a file now")).unwrap();
+
+        assert_eq!(
+            block_on(fs.read_link(Path::new("link.md")))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput,
+            "the link must be gone, replaced by a regular file"
+        );
+        assert_eq!(
+            block_on(fs.read_to_string(Path::new("link.md"))).unwrap(),
+            "a file now"
+        );
+        assert_eq!(
+            block_on(fs.read_to_string(Path::new("real.md"))).unwrap(),
+            "target bytes",
+            "nothing may be written through the link"
+        );
+    }
+
+    #[test]
+    fn rename_moves_a_link_as_a_link_and_a_link_occupies_its_name() {
+        let fs = InMemoryFs::new();
+        block_on(fs.write(Path::new("real.md"), b"content")).unwrap();
+        fs.add_symlink(Path::new("link.md"), Path::new("real.md"));
+
+        block_on(fs.rename(Path::new("link.md"), Path::new("moved.md"))).unwrap();
+        assert_eq!(
+            block_on(fs.read_link(Path::new("moved.md"))).unwrap(),
+            Some(PathBuf::from("real.md"))
+        );
+        assert!(!block_on(fs.try_exists(Path::new("link.md"))).unwrap());
+
+        // And the destination check: a link is as much an occupant as a file.
+        block_on(fs.write(Path::new("other.md"), b"other")).unwrap();
+        let err = block_on(fs.rename(Path::new("other.md"), Path::new("moved.md"))).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
     }
 
     #[test]
