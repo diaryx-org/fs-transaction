@@ -1,13 +1,16 @@
 # fs-transaction
 
-Multi-file filesystem transactions that survive a crash. Stage a set of writes,
-renames, removals, copies, execute-bit flips and symbolic links; apply them
-all-or-nothing; and if the power goes out halfway through, finish the job on
-the next run.
+Multi-file filesystem transactions that survive a crash.
 
-The files stay ordinary files. This is not a virtual filesystem and not a
-database — nothing here changes how your tree is *read*, only how it is
-*written*.
+This project was created for and is maintained by [Diaryx](https://github.com/diaryx-org),
+and is directly used in [prov](https://github.com/diaryx-org/prov) and [historica](https://github.com/historica).
+It is useful for people who need to maintain consistency across multiple files without a database.
+
+`fs-transaction`'s `ChangeSet` stages writes, renames, removals, copies, execute-bit flips and symbolic links,
+then applies them all-or-nothing:
+an error unwinds every operation already applied,
+and a write-ahead journal makes a committed set recoverable after a power cut.
+Files stay ordinary files — nothing here changes how the tree is *read*, only how it is *written*.
 
 ```toml
 [dependencies]
@@ -32,41 +35,17 @@ fn rearrange(root: &Path) -> Result<()> {
 }
 ```
 
-## Why
+## When half-applied is legal
 
-Single-file atomic writes are a solved problem — `write` a temporary sibling,
-`fsync` it, `rename` it over the target. What is *not* solved is a change that
-touches several files at once. Rename a note in a linked set and every file
-pointing at it has to be rewritten too; issue those one at a time and an I/O
-error partway through leaves the tree torn, updated in the files already
-written and stale in the ones never reached.
-
-A `ChangeSet` closes that window from both sides:
-
-- **On an error** — a full disk, a permission fault — every op already applied
-  is unwound in reverse, and the tree ends up exactly as it was.
-- **On a crash** — `kill -9`, a power cut — there is no error to catch and no
-  chance to unwind, so a write-ahead journal written *before* the first file is
-  touched survives instead. The next `recover` replays it forward to the
-  fully-applied state.
-
-Both endpoints are consistent. They are simply different consistent states, and
-the crate does not pretend a lost-power change never happened when its intent
-was already durably on disk.
-
-## Ordered batches: the other crash discipline
-
-All-or-nothing is the right guarantee when a half-applied set is *illegal*.
-Some trees are built the other way: an append-only, content-addressed store
-declares every partially-written batch legal — blobs that arrived without the
-record naming them are exactly what any interrupted transfer leaves. Buying
-atomicity there pays for a journal to rule out states that were never illegal.
-
-`OrderedBatch` is what such a tree actually needs — durability and ordering,
-without the journal. Tiers of writes separated by barriers: nothing durable
-ever names anything that is not durable yet, a crash leaves some prefix of the
-barriers, and there is no rollback and no recovery step, because every prefix
-is a state the tree already tolerates.
+All-or-nothing is for trees where a half-applied change is illegal.
+An append-only, content-addressed store is built the other way
+— every partially-written batch is a state it already tolerates
+— so a journal there pays to rule out states that were never wrong.
+`OrderedBatch` gives such a tree what it actually needs:
+durability and ordering, with no journal and no recovery step.
+Tiers of writes separated by barriers;
+a crash leaves some prefix of the tiers,
+and nothing durable ever names anything that is not durable yet.
 
 ```rust
 use fs_transaction::{OrderedBatch, StdFs, exec::block_on};
@@ -82,59 +61,29 @@ fn record(store: &Path) -> fs_transaction::Result<()> {
 }
 ```
 
-`finality` is the strength of the batch's own landing: `Durable` means "this
-returned, it survives a power cut"; `Ordered` means "consistent, but the tail
-may go with the crash" — often enough for an append-only tree, and one less
-drain of the drive's cache.
+The final argument is the strength of the batch's own landing:
+`Durable` survives a power cut once `apply` returns;
+`Ordered` keeps the tree consistent but lets the tail go with the crash
+—often enough, and one less drain of the drive's cache.
 
-## What it does not do
+## Backends
 
-Stated plainly, because a crate in this position should be:
+Everything is generic over a small async port whose method set mirrors `std::fs`.
+`StdFs` and an `InMemoryFs` ship with the crate;
+an adapter for OPFS, IndexedDB, or a network store is a few dozen mechanical lines.
+A backend *declares* what it can keep through `Capabilities`,
+and every member defaults to the pessimistic answer —
+a forgotten override degrades to the defensive path, never to a false promise.
 
-- **Single writer.** There is no locking. Two processes applying sets against
-  one root will race, and the stale-journal guard is a check-then-act, not a
-  mutex. Serialize them yourself.
-- **A set is bounded by memory.** Staged bytes and the undo buffer are both
-  held for the length of the apply. `FileOp::CopyFrom` is the escape hatch for
-  a large payload already on disk — it journals a *reference*, so restoring a
-  captured tree costs O(files) of journal rather than a second copy of every
-  byte. The source must be immutable for that to be sound; a content-addressed
-  blob is, by construction.
-- **Futures are not required to be `Send`.** The storage port uses native
-  `async fn`, so a backend keeps its own future types — which also means an
-  apply over a non-`Send` backend cannot be `tokio::spawn`ed.
-- **Symlinks are not resolved.** The path guard that keeps a staged op inside
-  the root is purely lexical.
+## The journal
 
-## Any backend
-
-Everything is generic over a small async port. `StdFs` and an `InMemoryFs` ship
-with the crate; an adapter for OPFS, IndexedDB, or a network store is a few
-dozen mechanical lines, since the method set mirrors `std::fs` exactly.
-
-Durability is *declared*, never assumed. A backend says what it can keep
-through `Capabilities`, and the apply path picks the strongest protocol that
-backend actually supports — rather than assuming atomic rename and silently
-lying on the backends that do not have one. Every durability member defaults to
-the pessimistic answer, so an adapter that forgets to override one degrades to
-the defensive path instead of to a false promise.
-
-## Journal naming and placement
-
-The journal is one transient dotfile, present only between a change set's
-commit point and its completion. It defaults to `.fstx-journal` at the root;
-`Journal::named` takes your own name.
-
-Apply and recovery must agree about that name — if they disagree, nothing fails
-loudly, recovery simply looks where no journal is and leaves the change
-stranded. That is why both operations hang off `Journal` rather than taking the
-name separately.
-
-For a tree something *syncs* — an iCloud or Dropbox folder — the journal must
-not live in the root at all: a sync service cannot tell crash state from
-content, and would carry one machine's journal to machines that never crashed.
-`Journal::kept_in` homes it in an absolute directory you own and nothing
-syncs:
+Present only between a set's commit point and its completion.
+`Journal::named` changes the filename of the journal, `.fstx-journal` by default.
+`Journal::kept_in` changes the location of the journal, which is at the root by default.
+It is good practice to always configure `Journal::named` so that it is easier to identify which application is responsible for it.
+It may be desirable to configure `Journal::kept_in` if the folder is very frequently read---
+for example, by a sync service such as iCloud or Dropbox.
+Otherwise, a crash could transport a journal to other devices.
 
 ```rust,ignore
 let journal = Journal::named(".myapp-journal")?.kept_in(app_support_dir)?;
@@ -142,19 +91,23 @@ block_on(journal.apply(&cs, &StdFs, root))?;   // ...and later:
 block_on(journal.recover(&StdFs, root))?;       // the same pair, both halves
 ```
 
+## Limits
+
+- **Single writer.** No locking; concurrent appliers against one root will race. Serialize them yourself.
+- **A set is bounded by memory.** Staged bytes and the undo buffer are held for the length of the apply;
+  `FileOp::CopyFrom` is the escape hatch for a large immutable payload already on disk.
+- **A root lives on one filesystem.** Barriers and drains prove nothing across a device boundary.
+- **Symlinks are not resolved.** The guard keeping staged paths inside the root is purely lexical.
+- **Futures are not required to be `Send`**, so an apply over a non-`Send` backend cannot be `tokio::spawn`ed.
+
 ## Zero dependencies (by default)
 
-A crate whose whole job is getting bytes onto disk correctly should not make
-you audit anyone else's code to trust it, and should not drag a runtime into a
-build that already has one. The checksum is hand-rolled FNV-1a; the error type
-is a hand-written enum.
-
-The one opt-in exception is the `barrier-fsync` feature (which brings in
-`libc`): on Apple platforms it answers `Durability::Ordered` with
-`F_BARRIERFSYNC` — a queue barrier — instead of `F_FULLFSYNC`'s drain of the
-drive's whole write cache. That is the difference between microseconds and
-milliseconds on exactly the calls both protocols make most, and without the
-feature every sync stays the full flush: stronger than asked, never weaker.
+The `barrier-fsync` feature brings in `libc`:
+on Apple platforms it answers `Durability::Ordered` with `F_BARRIERFSYNC`
+instead of `F_FULLFSYNC`'s drain of the drive's whole write cache.
+Without the feature every sync stays the full flush,
+which can be miliseconds instead of microseconds.
+I recommend enabling the feature where performance is important on Apple platforms.
 
 ## License
 
