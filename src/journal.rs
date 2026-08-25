@@ -214,14 +214,23 @@ impl Journal {
     /// Whether `path` names this journal, or the staging sibling
     /// [`Storage::write_atomic`] publishes it through.
     ///
-    /// A prefix test rather than an equality one, so that both the journal and
-    /// its transient `write_atomic` temporary are recognized. Used by a
-    /// fault-injecting backend to leave the journal's own writes alone and fail
-    /// only the file writes it means to.
+    /// A containment test on the file name rather than an equality one, so
+    /// that both the journal and its transient `write_atomic` temporary are
+    /// recognized. A [homed](Journal::kept_in) journal additionally requires
+    /// the path to sit in its home: the homed design's whole point is that no
+    /// file in the root is this journal, so a same-named file there — synced
+    /// in, or simply a coincidence — must not be claimed. Used by a
+    /// fault-injecting backend to leave the journal's own writes alone and
+    /// fail only the file writes it means to.
     pub fn owns_path(&self, path: &Path) -> bool {
-        path.file_name()
+        let name_matches = path
+            .file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|n| n.contains(self.name.as_ref()))
+            .is_some_and(|n| n.contains(self.name.as_ref()));
+        match &self.home {
+            Some(home) => name_matches && path.parent() == Some(home.as_path()),
+            None => name_matches,
+        }
     }
 }
 
@@ -1034,6 +1043,18 @@ mod tests {
     // ---- a journal kept outside the tree ----
 
     #[test]
+    fn a_homed_journal_owns_no_path_in_the_root() {
+        // The homed design's whole point: no file in the root is this
+        // journal, so a same-named file there — synced in, or coincidence —
+        // must not be claimed.
+        let home = tmp("owns-home");
+        let root = tmp("owns-root");
+        let journal = Journal::default().kept_in(&home).unwrap();
+        assert!(journal.owns_path(&journal.path_in(&root)));
+        assert!(!journal.owns_path(&root.join(Journal::DEFAULT_NAME)));
+    }
+
+    #[test]
     fn a_home_must_be_absolute() {
         // A relative home resolves against the process's current directory,
         // which apply and recovery have no reason to share — refused at
@@ -1065,7 +1086,10 @@ mod tests {
         assert_eq!(read(&root, "a.md").as_deref(), Some("a"));
         let stray = fs.events().iter().any(|e| {
             matches!(e, crate::fs_faults::FsEvent::Write(p)
-                if journal.owns_path(p) && p.starts_with(&root))
+                if p.starts_with(&root)
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.contains(Journal::DEFAULT_NAME)))
         });
         assert!(!stray, "events: {:?}", fs.events());
         assert!(
