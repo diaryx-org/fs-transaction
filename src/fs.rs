@@ -344,6 +344,43 @@ pub trait Storage: ReadStorage {
     /// [`std::fs::write`].
     fn write(&self, path: &Path, contents: &[u8]) -> impl Future<Output = io::Result<()>>;
 
+    /// Create a file that must not already exist, and write `contents` to it.
+    /// Mirrors [`std::fs::File::create_new`] followed by a full write.
+    ///
+    /// The create and the test-for-existence are **one operation**, and that
+    /// indivisibility is the entire point: of two writers racing to the same
+    /// name, exactly one succeeds and the other is told
+    /// [`AlreadyExists`](io::ErrorKind::AlreadyExists) — with no window between
+    /// a check and a create for either to slip a half-written file through.
+    /// `AlreadyExists` is therefore a *load-bearing answer*, not a failure to
+    /// smooth over: a write-once consumer branches on it (typically by reading
+    /// back what is there and confirming it is what it meant to write), so an
+    /// implementation must report that kind and no other for an occupied path.
+    ///
+    /// Two things this deliberately does not do, both the caller's to ask for:
+    /// parents are not created ([`create_dir_all`](Storage::create_dir_all)
+    /// first, as [`std::fs::File::create_new`] would demand), and nothing is
+    /// flushed — a caller that needs the new file to survive a crash pairs
+    /// this with [`sync`](Storage::sync), which is what lets it choose the
+    /// *weakest* durability that is correct where a built-in flush would
+    /// impose the strongest everywhere.
+    ///
+    /// The default refuses with [`Unsupported`](io::ErrorKind::Unsupported),
+    /// and [`Capabilities::exclusive_create`] defaults to `false` to match: a
+    /// backend that can keep the exclusivity promise declares it and overrides
+    /// this, and one that cannot must not paper over the difference with a
+    /// check-then-write — the window in that emulation is exactly what a
+    /// caller reaching for this method cannot tolerate.
+    fn create_new(&self, path: &Path, contents: &[u8]) -> impl Future<Output = io::Result<()>> {
+        async move {
+            let _ = (path, contents);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this backend does not support exclusive create",
+            ))
+        }
+    }
+
     /// Create a directory and all missing parents. Mirrors
     /// [`std::fs::create_dir_all`].
     fn create_dir_all(&self, path: &Path) -> impl Future<Output = io::Result<()>>;
@@ -553,6 +590,10 @@ impl<S: Storage + ?Sized> Storage for &S {
         (**self).write(path, contents).await
     }
 
+    async fn create_new(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
+        (**self).create_new(path, contents).await
+    }
+
     async fn create_dir_all(&self, path: &Path) -> io::Result<()> {
         (**self).create_dir_all(path).await
     }
@@ -589,6 +630,10 @@ impl<S: Storage + ?Sized> Storage for &S {
 impl<S: Storage + ?Sized> Storage for Arc<S> {
     async fn write(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
         (**self).write(path, contents).await
+    }
+
+    async fn create_new(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
+        (**self).create_new(path, contents).await
     }
 
     async fn create_dir_all(&self, path: &Path) -> io::Result<()> {
@@ -645,6 +690,18 @@ pub struct Capabilities {
     /// instead be atomic by nature.
     pub atomic_replace: bool,
 
+    /// The backend can create a file *only if nothing is at its path yet*, as
+    /// one operation — [`Storage::create_new`]. The create and the
+    /// test-for-existence cannot be split: two writers racing to the same name
+    /// see exactly one succeed and the other told
+    /// [`AlreadyExists`](io::ErrorKind::AlreadyExists), with no window between
+    /// the test and the create for a half-written file to slip through. This is
+    /// the primitive an append-only, write-once consumer builds its whole
+    /// concurrency story on, which is why it is declared rather than emulated:
+    /// a check-then-write emulation has the window in it, and a backend that
+    /// cannot close the window must say so instead of pretending.
+    pub exclusive_create: bool,
+
     /// How strong the backend's [`Storage::sync`] is: whether it can flush at
     /// all, and if so whether a flush merely orders writes or carries them
     /// through a power cut. `fsync` on `std::fs`, `FileSystemSyncAccessHandle
@@ -666,15 +723,19 @@ impl Capabilities {
     /// defensive branch unless a backend has explicitly earned a lighter one.
     pub const NONE: Self = Self {
         atomic_replace: false,
+        exclusive_create: false,
         sync_guarantee: SyncGuarantee::None,
         native_transactions: false,
     };
 
-    /// A conventional local filesystem: atomic replacement by rename and durable
-    /// fsync, but no native multi-object transaction (that is the journal's job).
-    /// What [`StdFs`] reports on every platform this crate targets.
+    /// A conventional local filesystem: atomic replacement by rename, exclusive
+    /// create (`O_CREAT|O_EXCL`, honored by every OS this crate targets), and
+    /// durable fsync — but no native multi-object transaction (that is the
+    /// journal's job). What [`StdFs`] reports on every platform this crate
+    /// targets.
     pub const LOCAL_FS: Self = Self {
         atomic_replace: true,
+        exclusive_create: true,
         sync_guarantee: SyncGuarantee::Durable,
         native_transactions: false,
     };
@@ -691,9 +752,12 @@ impl Capabilities {
     /// is false too — the lock makes each *single* call atomic, not a batch of
     /// several calls committed together, so a multi-file change set still
     /// needs the write-ahead journal over this backend exactly as it would over
-    /// a real filesystem.
+    /// a real filesystem. `exclusive_create` is true on the same grounds as
+    /// `atomic_replace`: one locked call checks and inserts without anything
+    /// interleaving.
     pub const IN_MEMORY: Self = Self {
         atomic_replace: true,
+        exclusive_create: true,
         sync_guarantee: SyncGuarantee::None,
         native_transactions: false,
     };
@@ -770,6 +834,15 @@ fn temp_sibling(path: &Path) -> PathBuf {
 impl Storage for StdFs {
     async fn write(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
         std::fs::write(path, contents)
+    }
+
+    async fn create_new(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
+        use std::io::Write as _;
+
+        // `O_CREAT|O_EXCL` (`CREATE_NEW` on Windows) — the one place the OS
+        // itself promises the create and the existence test are indivisible.
+        let mut file = std::fs::File::create_new(path)?;
+        file.write_all(contents)
     }
 
     async fn create_dir_all(&self, path: &Path) -> io::Result<()> {
@@ -872,10 +945,12 @@ mod tests {
 
     #[test]
     fn stdfs_declares_the_local_filesystem_guarantees() {
-        // The native adapter promises atomic replacement and durable fsync, but
-        // not native transactions — the journal's job, not the filesystem's.
+        // The native adapter promises atomic replacement, exclusive create, and
+        // durable fsync, but not native transactions — the journal's job, not
+        // the filesystem's.
         assert_eq!(StdFs.capabilities(), Capabilities::LOCAL_FS);
         assert!(StdFs.capabilities().atomic_replace);
+        assert!(StdFs.capabilities().exclusive_create);
         assert_eq!(StdFs.capabilities().sync_guarantee, SyncGuarantee::Durable);
         assert!(!StdFs.capabilities().native_transactions);
     }
@@ -894,6 +969,72 @@ mod tests {
     }
 
     // ---- the atomic-write protocol ----
+
+    // ---- exclusive create ----
+
+    #[test]
+    fn create_new_writes_a_fresh_file() {
+        let root = tmp("create-new");
+        let path = root.join("once.md");
+        block_on(StdFs.create_new(&path, b"first")).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
+    }
+
+    #[test]
+    fn create_new_refuses_an_occupied_path_with_already_exists() {
+        // `AlreadyExists` is the load-bearing half of the contract: a
+        // write-once caller branches on exactly this kind, so it must not
+        // arrive as anything vaguer.
+        let root = tmp("create-new-taken");
+        let path = root.join("once.md");
+        block_on(StdFs.create_new(&path, b"first")).unwrap();
+        let err = block_on(StdFs.create_new(&path, b"second")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        // The loser changed nothing: the winner's bytes are still what's there.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
+    }
+
+    #[test]
+    fn the_default_create_new_declines_rather_than_emulating() {
+        // A backend that overrides neither `create_new` nor `capabilities`
+        // must refuse, not check-then-write: the emulation's window is what a
+        // caller reaching for this method cannot tolerate.
+        struct Bare;
+        impl ReadStorage for Bare {
+            async fn read(&self, _: &Path) -> io::Result<Vec<u8>> {
+                unreachable!()
+            }
+            async fn read_to_string(&self, _: &Path) -> io::Result<String> {
+                unreachable!()
+            }
+            async fn read_dir(&self, _: &Path) -> io::Result<Vec<DirEntry>> {
+                unreachable!()
+            }
+            async fn metadata(&self, _: &Path) -> io::Result<Metadata> {
+                unreachable!()
+            }
+        }
+        impl Storage for Bare {
+            async fn write(&self, _: &Path, _: &[u8]) -> io::Result<()> {
+                unreachable!()
+            }
+            async fn create_dir_all(&self, _: &Path) -> io::Result<()> {
+                unreachable!()
+            }
+            async fn remove_file(&self, _: &Path) -> io::Result<()> {
+                unreachable!()
+            }
+            async fn remove_dir_all(&self, _: &Path) -> io::Result<()> {
+                unreachable!()
+            }
+            async fn rename(&self, _: &Path, _: &Path) -> io::Result<()> {
+                unreachable!()
+            }
+        }
+        assert!(!Bare.capabilities().exclusive_create);
+        let err = block_on(Bare.create_new(Path::new("x"), b"")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    }
 
     // ---- sync ----
 

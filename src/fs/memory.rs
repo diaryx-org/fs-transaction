@@ -315,6 +315,28 @@ impl Storage for InMemoryFs {
         Ok(())
     }
 
+    async fn create_new(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
+        let normalized = normalize_path(path);
+        // Anything already answering to the name occupies it — a file of either
+        // store, a symlink, or a directory, exactly the set `std::fs`'s
+        // `O_CREAT|O_EXCL` refuses. The checks and the insert are not under one
+        // lock, but nothing interleaves them on the targets this backend
+        // exists for: wasm has no threads, and a multithreaded test that
+        // races two `create_new` calls is testing the double, not the code
+        // under test.
+        let occupied = self.files.read().unwrap().contains_key(&normalized)
+            || self.binary_files.read().unwrap().contains_key(&normalized)
+            || self.symlinks.read().unwrap().contains_key(&normalized)
+            || self.directories.read().unwrap().contains(&normalized);
+        if occupied {
+            return Err(Error::new(
+                ErrorKind::AlreadyExists,
+                format!("already exists: {}", path.display()),
+            ));
+        }
+        self.write(path, contents).await
+    }
+
     async fn create_dir_all(&self, path: &Path) -> io::Result<()> {
         let normalized = normalize_path(path);
         let mut dirs = self.directories.write().unwrap();
@@ -727,6 +749,46 @@ mod tests {
             block_on(fs.read_to_string(Path::new("real.md"))).unwrap(),
             "hello"
         );
+    }
+
+    // ---- exclusive create ----
+
+    #[test]
+    fn create_new_writes_a_fresh_file_and_refuses_a_second() {
+        let fs = InMemoryFs::new();
+        block_on(fs.create_new(Path::new("once.md"), b"first")).unwrap();
+        assert_eq!(
+            block_on(fs.read_to_string(Path::new("once.md"))).unwrap(),
+            "first"
+        );
+        let err = block_on(fs.create_new(Path::new("once.md"), b"second")).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(
+            block_on(fs.read_to_string(Path::new("once.md"))).unwrap(),
+            "first",
+            "the loser must have changed nothing"
+        );
+    }
+
+    #[test]
+    fn create_new_counts_every_kind_of_occupant() {
+        // A directory, a symlink, and a binary file all answer to their names;
+        // `create_new` must refuse each exactly as `O_CREAT|O_EXCL` would.
+        let fs = InMemoryFs::new();
+        block_on(fs.create_dir_all(Path::new("dir"))).unwrap();
+        block_on(fs.write(Path::new("bin.dat"), &[0xff, 0xfe])).unwrap();
+        block_on(fs.write(Path::new("real.md"), b"hello")).unwrap();
+        fs.add_symlink(Path::new("link.md"), Path::new("real.md"));
+
+        for taken in ["dir", "bin.dat", "link.md"] {
+            let err = block_on(fs.create_new(Path::new(taken), b"x")).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::AlreadyExists, "{taken}");
+        }
+    }
+
+    #[test]
+    fn in_memory_declares_exclusive_create() {
+        assert!(InMemoryFs::new().capabilities().exclusive_create);
     }
 
     // ---- capabilities ----

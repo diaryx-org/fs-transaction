@@ -55,6 +55,18 @@ impl Storage for FailAtWrite {
         StdFs.write(path, contents).await
     }
 
+    // Counted against the same budget as `write` — a caller that stages its
+    // bytes through either is spending the same kind of I/O, and a fault test
+    // should not care which one the code under test happened to reach for.
+    async fn create_new(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
+        let n = self.writes.get();
+        self.writes.set(n + 1);
+        if n == self.fail_at {
+            return Err(io::Error::other("disk full (test)"));
+        }
+        StdFs.create_new(path, contents).await
+    }
+
     async fn create_dir_all(&self, path: &Path) -> io::Result<()> {
         StdFs.create_dir_all(path).await
     }
@@ -83,6 +95,7 @@ impl Storage for FailAtWrite {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FsEvent {
     Write(PathBuf),
+    CreateNew(PathBuf),
     Sync(PathBuf, Durability),
     Rename(PathBuf, PathBuf),
     Remove(PathBuf),
@@ -115,6 +128,13 @@ impl Storage for RecordingFs {
             .borrow_mut()
             .push(FsEvent::Write(path.to_path_buf()));
         StdFs.write(path, contents).await
+    }
+
+    async fn create_new(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
+        self.log
+            .borrow_mut()
+            .push(FsEvent::CreateNew(path.to_path_buf()));
+        StdFs.create_new(path, contents).await
     }
 
     async fn create_dir_all(&self, path: &Path) -> io::Result<()> {
