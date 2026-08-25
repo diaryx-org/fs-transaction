@@ -422,9 +422,17 @@ impl Journal {
         // through the back door — refused instead, with the journal left in
         // place like any other journal that cannot be trusted.
         crate::change::guard_ops(&ops)?;
+        let mut touched = std::collections::BTreeSet::new();
         for op in &ops {
-            replay(fs, root, op).await?;
+            replay(fs, root, op, &mut touched).await?;
         }
+        // Recovery makes the same promise a clean apply does: once the
+        // journal is given up, the state it certified survives a power cut.
+        // The replayed renames, removals, bits, and fresh directory chains
+        // are flushed — barriers capped by one durable sync — before the
+        // journal goes; the deletion itself is not flushed, because a
+        // resurrected journal replays idempotently over ops already durable.
+        crate::fs::flush_all_durable(fs, touched).await?;
         fs.remove_file(&journal).await?;
         Ok(Recovered::Applied(ops.len()))
     }
@@ -438,13 +446,22 @@ pub async fn recover<FS: Storage>(fs: &FS, root: &Path) -> Result<Recovered> {
 
 /// Re-apply one journaled op, tolerant of it having already landed before the
 /// crash — this is what makes rolling a journal forward idempotent.
-async fn replay<FS: Storage>(fs: &FS, root: &Path, op: &FileOp) -> Result<()> {
+///
+/// `touched` collects the same flush debt [`crate::change`]'s exec does — the
+/// entries, bits, and fresh chains no per-op call flushes — for
+/// [`Journal::recover`] to settle before the journal is given up.
+async fn replay<FS: Storage>(
+    fs: &FS,
+    root: &Path,
+    op: &FileOp,
+    touched: &mut std::collections::BTreeSet<PathBuf>,
+) -> Result<()> {
     match op {
         // Whole-file writes are idempotent by nature: writing the intended bytes
         // again reaches the same state whether or not the crash beat this op.
         FileOp::Write { path, bytes } => {
             let full = root.join(path);
-            ensure_parent(fs, &full).await?;
+            ensure_parent(fs, &full, touched).await?;
             fs.write_atomic(&full, bytes).await?;
         }
         // Idempotent for the same reason a `Write` is — with the bytes fetched
@@ -462,7 +479,7 @@ async fn replay<FS: Storage>(fs: &FS, root: &Path, op: &FileOp) -> Result<()> {
                     source_full.display()
                 ))
             })?;
-            ensure_parent(fs, &full).await?;
+            ensure_parent(fs, &full, touched).await?;
             fs.write_atomic(&full, &bytes).await?;
         }
         // A remove of a file already gone is the state we wanted, not a failure.
@@ -472,6 +489,9 @@ async fn replay<FS: Storage>(fs: &FS, root: &Path, op: &FileOp) -> Result<()> {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e.into()),
+            }
+            if let Some(dir) = crate::fs::parent_dir(&full) {
+                touched.insert(dir.to_path_buf());
             }
         }
         // Setting a bit that is already set (or already cleared) reaches the
@@ -484,6 +504,7 @@ async fn replay<FS: Storage>(fs: &FS, root: &Path, op: &FileOp) -> Result<()> {
             let full = root.join(path);
             crate::change::guard_not_link(fs, &full).await?;
             fs.set_executable(&full, *executable).await?;
+            touched.insert(full);
         }
         // `set_link` replaces whatever is at the path, so replaying it lands
         // the same link whether the crash beat the op, interrupted it midway
@@ -491,8 +512,11 @@ async fn replay<FS: Storage>(fs: &FS, root: &Path, op: &FileOp) -> Result<()> {
         // after it was done.
         FileOp::SetLink { path, target } => {
             let full = root.join(path);
-            ensure_parent(fs, &full).await?;
+            ensure_parent(fs, &full, touched).await?;
             fs.set_link(&full, target).await?;
+            if let Some(dir) = crate::fs::parent_dir(&full) {
+                touched.insert(dir.to_path_buf());
+            }
         }
         // The one op that is not naturally idempotent: after it lands, the source
         // is gone and the destination present, so a blind re-rename would fail.
@@ -502,7 +526,7 @@ async fn replay<FS: Storage>(fs: &FS, root: &Path, op: &FileOp) -> Result<()> {
         FileOp::Rename { from, to } => {
             let (from_full, to_full) = (root.join(from), root.join(to));
             if fs.try_exists(&from_full).await? {
-                ensure_parent(fs, &to_full).await?;
+                ensure_parent(fs, &to_full, touched).await?;
                 fs.rename(&from_full, &to_full).await?;
             } else if fs.try_exists(&to_full).await? {
                 // Already renamed before the crash — nothing to redo.
@@ -513,14 +537,28 @@ async fn replay<FS: Storage>(fs: &FS, root: &Path, op: &FileOp) -> Result<()> {
                     to_full.display()
                 )));
             }
+            // Both entries owe a flush whichever branch ran: even an
+            // already-done rename was done by a crashed process that never
+            // flushed it.
+            for side in [&from_full, &to_full] {
+                if let Some(dir) = crate::fs::parent_dir(side) {
+                    touched.insert(dir.to_path_buf());
+                }
+            }
         }
     }
     Ok(())
 }
 
-async fn ensure_parent<FS: Storage>(fs: &FS, full: &Path) -> Result<()> {
-    if let Some(dir) = full.parent() {
-        fs.create_dir_all(dir).await?;
+async fn ensure_parent<FS: Storage>(
+    fs: &FS,
+    full: &Path,
+    touched: &mut std::collections::BTreeSet<PathBuf>,
+) -> Result<()> {
+    if let Some(dir) = crate::fs::parent_dir(full) {
+        for made in crate::fs::create_dir_all_traced(fs, dir).await? {
+            touched.insert(made);
+        }
     }
     Ok(())
 }
@@ -933,6 +971,34 @@ mod tests {
 
         let err = decode(&bytes).unwrap_err();
         assert!(err.to_string().contains("op count"), "{err}");
+    }
+
+    #[test]
+    fn recovery_flushes_what_it_replayed_before_giving_up_the_journal() {
+        // Recovery keeps the same promise a clean apply does: once the
+        // journal is gone, the state it certified survives a power cut. The
+        // replayed rename's entries must be flushed before the deletion.
+        let root = tmp("recover-flush");
+        std::fs::write(root.join("a.md"), "a").unwrap();
+        let ops = vec![FileOp::Rename {
+            from: "a.md".into(),
+            to: "b.md".into(),
+        }];
+        std::fs::write(Journal::default().path_in(&root), encode(&ops).unwrap()).unwrap();
+
+        let fs = crate::fs_faults::RecordingFs::local();
+        let outcome = block_on(recover(&fs, &root)).unwrap();
+        assert_eq!(outcome, Recovered::Applied(1));
+
+        use crate::fs_faults::FsEvent;
+        assert_eq!(
+            fs.events(),
+            vec![
+                FsEvent::Rename(root.join("a.md"), root.join("b.md")),
+                FsEvent::Sync(root.clone(), crate::fs::Durability::Durable),
+                FsEvent::Remove(Journal::default().path_in(&root)),
+            ]
+        );
     }
 
     #[test]

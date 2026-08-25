@@ -1020,6 +1020,32 @@ pub(crate) async fn create_dir_all_traced<FS: Storage>(
     Ok(changed)
 }
 
+/// Make every path in `paths` durable at the price of one drain: a barrier on
+/// each, then durability asked of the last alone.
+///
+/// This is [`Durability::Ordered`]'s documented corollary, cashed in: once any
+/// later write is durably on disk, everything ordered before it is too — so a
+/// list of barriers capped by one [`Durable`](Durability::Durable) flush makes
+/// the whole list durable, without flushing it piece by piece. On a plain-fsync
+/// backend the barriers were already full flushes and the cap costs nothing
+/// new; on a barrier backend (`barrier-fsync` on Apple) this is the difference
+/// between one drain of the drive's cache and one per path.
+pub(crate) async fn flush_all_durable<FS: Storage>(
+    fs: &FS,
+    paths: impl IntoIterator<Item = PathBuf>,
+) -> io::Result<()> {
+    let mut last: Option<PathBuf> = None;
+    for path in paths {
+        if let Some(prev) = last.replace(path) {
+            fs.sync(&prev, Durability::Ordered).await?;
+        }
+    }
+    match last {
+        Some(cap) => fs.sync(&cap, Durability::Durable).await,
+        None => Ok(()),
+    }
+}
+
 /// The directory holding `path`, when there is one to name. `Path::parent`
 /// answers `Some("")` for a bare relative filename like `index.md` — the
 /// process's current directory, which this crate neither holds a path to nor owns —

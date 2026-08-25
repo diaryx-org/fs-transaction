@@ -29,6 +29,17 @@
 //! abort back to the pre-change state, while crashes recover to the committed
 //! state.
 //!
+//! Both answers are **durable**, not merely consistent. `Ok` means the whole
+//! set — the renames and removals as much as the writes — survives a power
+//! cut from that moment on: every write settles its own flush through
+//! [`Storage::write_atomic`] as it lands, and everything else the set dirtied
+//! (directory entries, execute bits, freshly-minted directory chains) is
+//! flushed before the journal is given up. `Err` from a clean rollback means
+//! the abort is equally a fact: the restored state is flushed and the
+//! journal's deletion made durable, so no later recovery can quietly roll the
+//! aborted set forward. The one answer that promises less is
+//! [`Error::Torn`], which says so.
+//!
 //! Two smaller honesties, both deliberate:
 //!
 //! - **Directories are not unwound.** Applying a set creates any parent
@@ -56,6 +67,7 @@
 //! against a *previous* interrupted change is a check-then-act, not a mutex. A
 //! caller that needs several writers has to serialize them itself.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
@@ -337,10 +349,15 @@ impl Journal {
     /// touched (see [`crate::journal`]); that flush is the commit point. From
     /// there the ops run in order, each recording how to undo itself:
     ///
-    /// - **On success**, the journal is removed and the change is done.
+    /// - **On success**, everything the set dirtied is flushed durable —
+    ///   barriers capped by one drain — and only then is the journal removed:
+    ///   `Ok` means the change survives a power cut, not merely that it
+    ///   happened.
     /// - **On an error** (a full disk, a permission fault), every op already
-    ///   applied is unwound in reverse, the tree is restored to what it was,
-    ///   and the journal is cleared — the mutation aborts as if it never began.
+    ///   applied is unwound in reverse, the restored state is flushed, and the
+    ///   journal is durably cleared — the mutation aborts as if it never
+    ///   began, and a power cut cannot contradict the abort by resurrecting
+    ///   the journal for recovery to roll forward.
     /// - **On a crash** (a `kill -9`, a power cut) there is no error to catch and
     ///   no chance to unwind, so the journal simply survives; the next
     ///   [`crate::journal::recover`] rolls the set forward to its fully-applied
@@ -353,7 +370,9 @@ impl Journal {
     /// multi-file window for a journal to close, and a crash leaves the op either
     /// wholly done or wholly not — the same two states a recovered set lands on.
     /// It is the ordinary shape of a save, and it costs one file operation rather
-    /// than four.
+    /// than four. What it does not skip is durability: a lone rename or remove
+    /// still flushes the entries it edited before `Ok`, on the same promise a
+    /// journaled set keeps.
     ///
     /// The rare exception is a rollback that *itself* fails ([`Error::Torn`]):
     /// the pre-change state could not be restored, so — rather than leave an
@@ -431,7 +450,15 @@ impl Journal {
             // the reflexive read of the very file about to be overwritten, whose
             // only purpose is to hold the old bytes for a rollback that cannot
             // happen here, goes with it.
-            return exec(fs, root, &changes.ops[0], None).await;
+            //
+            // The flush debt is still owed: a lone write settles its own (via
+            // `write_atomic`) and flushes nothing here, but a lone rename or
+            // remove edits directory entries nothing else will flush, and
+            // `Ok` from this crate means the op outlives a power cut — for a
+            // set of one exactly as for a set of many.
+            let mut touched = BTreeSet::new();
+            exec(fs, root, &changes.ops[0], None, &mut touched).await?;
+            return Ok(crate::fs::flush_all_durable(fs, touched).await?);
         }
         // The commit point: durably record the whole intent before touching a
         // single document. `write_atomic` flushes it, so a crash finds the
@@ -454,34 +481,101 @@ impl Journal {
             .await?;
 
         let mut undo: Vec<Undo> = Vec::new();
+        let mut touched = BTreeSet::new();
         for op in &changes.ops {
-            let Err(cause) = exec(fs, root, op, Some(&mut undo)).await else {
+            let Err(cause) = exec(fs, root, op, Some(&mut undo), &mut touched).await else {
                 continue;
             };
-            return Err(match unwind(fs, undo).await {
-                // Reverted cleanly: the change aborted, so the journal must go —
-                // otherwise recovery would later roll this very set *forward*,
-                // undoing the abort. If even the delete fails, fall through to
-                // `Torn` and let recovery complete the set instead.
-                Ok(()) => match fs.remove_file(&journal).await {
-                    Ok(()) => cause,
-                    Err(cleanup) => Error::Torn {
-                        cause: cause.to_string(),
-                        rollback: cleanup.to_string(),
-                    },
-                },
-                // Could not revert: keep the journal so recovery rolls the set
-                // forward to the consistent applied state.
+            return Err(match unwind_durable(fs, undo, &journal).await {
+                // Reverted cleanly and durably: the abort is now a fact a
+                // power cut cannot contradict, so the cause alone is the
+                // answer.
+                Ok(()) => cause,
+                // Could not revert (or could not certify the reversion): the
+                // journal is kept — or may still exist — so recovery rolls
+                // the set forward to the consistent applied state.
                 Err(rollback) => Error::Torn {
                     cause: cause.to_string(),
                     rollback: rollback.to_string(),
                 },
             });
         }
-        // Applied cleanly. Drop the journal; if this delete fails, a later
-        // recovery re-applies the set idempotently and clears it — harmless.
+        // Applied cleanly — now make that mean something across a power cut.
+        // `write_atomic` settled each write's own debt as it ran; what remains
+        // is everything `exec` collected (renamed and removed entries, flipped
+        // bits, fresh directory chains), flushed here as barriers capped by
+        // one durable sync, so the whole set survives before the journal that
+        // certifies it is given up.
+        crate::fs::flush_all_durable(fs, touched).await?;
+        // The deletion itself is deliberately *not* flushed: if a crash
+        // resurrects the journal, the ops it names are already durable and
+        // replay is idempotent, so the next recovery no-ops through it and
+        // clears it — the designed-for state, at the price of at most one
+        // StaleJournal prompt.
         fs.remove_file(&journal).await?;
         Ok(())
+    }
+}
+
+/// Reverse every recorded op and make the reversion durable, then durably
+/// retire `journal` — the abort-side counterpart of the flush `apply` runs on
+/// success.
+///
+/// The order is the argument. First the unwind itself; then a barrier on
+/// everything it put back; then the journal's deletion; then one durable
+/// flush of the directory that held it, which — by [`Durability::Ordered`]'s
+/// corollary — carries the restored state through with it. Only after all
+/// four is `Err` a promise: the tree is *before* the set, durably, and no
+/// later recovery can roll the aborted set forward, because the journal's
+/// absence is as durable as the state it certified. A failure anywhere in
+/// the sequence leaves the journal (or its ghost) on disk, and the caller
+/// gets [`Error::Torn`] — recovery will complete the set forward, which is a
+/// nameable state, where "aborted, unless the power went out" is not.
+///
+/// [`Durability::Ordered`]: crate::fs::Durability::Ordered
+async fn unwind_durable<FS: Storage>(fs: &FS, undo: Vec<Undo>, journal: &Path) -> Result<()> {
+    // The flush list is computed before the unwind consumes the steps: every
+    // path a reversal writes, every directory whose entries it edits.
+    let mut touched = BTreeSet::new();
+    for step in &undo {
+        match step {
+            // The file existed, so its parent's entry is unchanged; the
+            // rewritten bytes are the debt.
+            Undo::Restore { path, .. } => {
+                touched.insert(path.clone());
+            }
+            Undo::Delete { path } | Undo::Relink { path, .. } => {
+                if let Some(dir) = crate::fs::parent_dir(path) {
+                    touched.insert(dir.to_path_buf());
+                }
+            }
+            Undo::Rename { from, to } => {
+                for side in [from, to] {
+                    if let Some(dir) = crate::fs::parent_dir(side) {
+                        touched.insert(dir.to_path_buf());
+                    }
+                }
+            }
+            Undo::SetExecutable { path, .. } => {
+                touched.insert(path.clone());
+            }
+            // A link removed and bytes rewritten: entry and contents both.
+            Undo::RestoreOverLink { path, .. } => {
+                touched.insert(path.clone());
+                if let Some(dir) = crate::fs::parent_dir(path) {
+                    touched.insert(dir.to_path_buf());
+                }
+            }
+        }
+    }
+    unwind(fs, undo).await?;
+    for path in touched {
+        fs.sync(&path, crate::fs::Durability::Ordered).await?;
+    }
+    fs.remove_file(journal).await?;
+    match crate::fs::parent_dir(journal) {
+        Some(dir) => Ok(fs.sync(dir, crate::fs::Durability::Durable).await?),
+        None => Ok(()),
     }
 }
 
@@ -520,17 +614,27 @@ enum Undo {
     RestoreOverLink { path: PathBuf, bytes: Vec<u8> },
 }
 
-/// Apply one op, optionally recording how to reverse it.
+/// Apply one op, optionally recording how to reverse it, and always recording
+/// what it dirtied.
 ///
 /// `undo` is `None` only for a set of one, which has no rollback to feed: see
 /// the fast path in [`ChangeSet::apply`]. Recording is not merely unused there,
 /// it is worth skipping — for a write it costs a full read of the file about to
 /// be replaced.
+///
+/// `touched` collects everything this op changed that *nothing has flushed
+/// yet* — the flush debt `apply` settles once, at the end, before the journal
+/// is dropped. A rename or remove edits directory entries no sync ever
+/// follows; an execute-bit flip edits an inode the same way; a fresh directory
+/// chain is names a power cut can take back. What deliberately stays out is
+/// what [`Storage::write_atomic`] already made durable on its own: a write's
+/// bytes and its immediate parent.
 async fn exec<FS: Storage>(
     fs: &FS,
     root: &Path,
     op: &FileOp,
     undo: Option<&mut Vec<Undo>>,
+    touched: &mut BTreeSet<PathBuf>,
 ) -> Result<()> {
     match op {
         FileOp::Write { path, bytes } => {
@@ -541,19 +645,30 @@ async fn exec<FS: Storage>(
             if let Some(undo) = undo {
                 capture_replaced(fs, &full, undo).await?;
             }
-            ensure_parent(fs, &full).await?;
+            ensure_parent(fs, &full, touched).await?;
             // Land the document through the atomic-replace protocol, so even a
             // crash mid-write cannot expose a half-written file: the write goes to
             // a staging sibling and is renamed into place. On a backend without
             // atomic rename this degrades to a plain durable write (see
             // [`Storage::write_atomic`]) — the per-file guarantee follows the
-            // backend's declared capabilities.
+            // backend's declared capabilities. Either way the call carries its
+            // own durability, so the write leaves no flush debt behind.
             fs.write_atomic(&full, bytes).await?;
         }
         FileOp::Rename { from, to } => {
             let (from_full, to_full) = (root.join(from), root.join(to));
-            ensure_parent(fs, &to_full).await?;
+            ensure_parent(fs, &to_full, touched).await?;
             fs.rename(&from_full, &to_full).await?;
+            // Two directory entries changed — the name removed from one
+            // parent, added to the other — and nothing has flushed either.
+            // The rename's *atomicity* across a crash is the metadata
+            // journal's own gift on every filesystem this crate targets; what
+            // the flush buys is that it is not taken back wholesale.
+            for side in [&from_full, &to_full] {
+                if let Some(dir) = crate::fs::parent_dir(side) {
+                    touched.insert(dir.to_path_buf());
+                }
+            }
             if let Some(undo) = undo {
                 undo.push(Undo::Rename {
                     from: to_full,
@@ -563,6 +678,10 @@ async fn exec<FS: Storage>(
         }
         FileOp::Remove { path } => {
             let full = root.join(path);
+            // The entry leaves its parent, and nothing else flushes that.
+            if let Some(dir) = crate::fs::parent_dir(&full) {
+                touched.insert(dir.to_path_buf());
+            }
             match undo {
                 // What was removed is the undo, so it has to be read out
                 // before it goes — the *link* where the path holds one
@@ -598,7 +717,7 @@ async fn exec<FS: Storage>(
             if let Some(undo) = undo {
                 capture_replaced(fs, &full, undo).await?;
             }
-            ensure_parent(fs, &full).await?;
+            ensure_parent(fs, &full, touched).await?;
             fs.write_atomic(&full, &bytes).await?;
         }
         FileOp::SetExecutable { path, executable } => {
@@ -619,6 +738,9 @@ async fn exec<FS: Storage>(
                 }
             }
             fs.set_executable(&full, *executable).await?;
+            // A mode is inode metadata, persisting on the flush of the file
+            // itself — the one op whose debt is the path, not its parent.
+            touched.insert(full);
         }
         FileOp::SetLink { path, target } => {
             let full = root.join(path);
@@ -651,8 +773,13 @@ async fn exec<FS: Storage>(
                     }
                 }
             }
-            ensure_parent(fs, &full).await?;
+            ensure_parent(fs, &full, touched).await?;
             fs.set_link(&full, target).await?;
+            // The link is an entry (and its inode rides on the entry's
+            // flush): the parent is the debt.
+            if let Some(dir) = crate::fs::parent_dir(&full) {
+                touched.insert(dir.to_path_buf());
+            }
         }
     }
     Ok(())
@@ -809,9 +936,20 @@ pub(crate) fn guard_ops(ops: &[FileOp]) -> Result<()> {
 /// Create `full`'s parent directory if it is missing. Unconditional (rather than
 /// staged as its own op) because a directory is not part of the document graph:
 /// it is an artifact of *where* a write lands, so it belongs to the write.
-async fn ensure_parent<FS: Storage>(fs: &FS, full: &Path) -> Result<()> {
-    if let Some(dir) = full.parent() {
-        fs.create_dir_all(dir).await?;
+///
+/// Every directory the making mints joins `touched`: each is an entry of its
+/// own, persisting separately from the file that prompted it, and a
+/// durably-flushed file inside a chain of unflushed names is a file a power
+/// cut can orphan.
+async fn ensure_parent<FS: Storage>(
+    fs: &FS,
+    full: &Path,
+    touched: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    if let Some(dir) = crate::fs::parent_dir(full) {
+        for made in crate::fs::create_dir_all_traced(fs, dir).await? {
+            touched.insert(made);
+        }
     }
     Ok(())
 }
@@ -1280,6 +1418,223 @@ mod tests {
             std::fs::symlink_metadata(root.join("l")).is_err(),
             "the refused set must unwind the link it made"
         );
+    }
+
+    // ---- the durability of an answer ----
+
+    #[test]
+    fn a_set_of_renames_and_removes_is_flushed_before_the_journal_is_dropped() {
+        // `Ok` means the change survives a power cut. Renames and removes
+        // edit directory entries no per-op call flushes, so the apply must
+        // settle that debt — barriers capped by one durable sync — before it
+        // gives up the journal that certifies the set.
+        let root = tmp("flush-before-drop");
+        std::fs::write(root.join("a.md"), "a").unwrap();
+        std::fs::write(root.join("c.md"), "c").unwrap();
+        let fs = RecordingFs::local();
+        let mut cs = ChangeSet::new();
+        cs.rename("a.md", "sub/b.md");
+        cs.remove("c.md");
+        block_on(cs.apply(&fs, &root)).unwrap();
+
+        let journal = Journal::default().path_in(&root);
+        let jtmp = crate::fs::temp_sibling(&journal);
+        assert_eq!(
+            fs.events(),
+            vec![
+                // The commit point: the journal, via write_atomic.
+                FsEvent::Write(jtmp.clone()),
+                FsEvent::Sync(jtmp.clone(), crate::fs::Durability::Ordered),
+                FsEvent::Rename(jtmp, journal.clone()),
+                FsEvent::Sync(root.clone(), crate::fs::Durability::Durable),
+                // The ops.
+                FsEvent::Rename(root.join("a.md"), root.join("sub/b.md")),
+                FsEvent::Remove(root.join("c.md")),
+                // The debt: both touched directories, barriers capped by one
+                // drain, and only then the journal.
+                FsEvent::Sync(root.clone(), crate::fs::Durability::Ordered),
+                FsEvent::Sync(root.join("sub"), crate::fs::Durability::Durable),
+                FsEvent::Remove(journal),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_lone_rename_flushes_the_entries_it_edited() {
+        // The fast path skips the journal, never the promise.
+        let root = tmp("lone-rename-flush");
+        std::fs::write(root.join("a.md"), "a").unwrap();
+        let fs = RecordingFs::local();
+        let mut cs = ChangeSet::new();
+        cs.rename("a.md", "b.md");
+        block_on(cs.apply(&fs, &root)).unwrap();
+
+        assert_eq!(
+            fs.events(),
+            vec![
+                FsEvent::Rename(root.join("a.md"), root.join("b.md")),
+                FsEvent::Sync(root.clone(), crate::fs::Durability::Durable),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_lone_write_pays_only_write_atomics_own_flushes() {
+        // The commonest mutation there is must not get slower: a write
+        // settles its own debt inside write_atomic, so the fast path owes
+        // nothing more.
+        let root = tmp("lone-write-flush");
+        let fs = RecordingFs::local();
+        let mut cs = ChangeSet::new();
+        cs.write("a.md", "a");
+        block_on(cs.apply(&fs, &root)).unwrap();
+
+        let tmp_name = crate::fs::temp_sibling(&root.join("a.md"));
+        assert_eq!(
+            fs.events(),
+            vec![
+                FsEvent::Write(tmp_name.clone()),
+                FsEvent::Sync(tmp_name.clone(), crate::fs::Durability::Ordered),
+                FsEvent::Rename(tmp_name, root.join("a.md")),
+                FsEvent::Sync(root.clone(), crate::fs::Durability::Durable),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lone_exec_flip_flushes_the_inode_it_edited() {
+        // A mode is inode metadata: the debt is the file itself.
+        let root = tmp("lone-exec-flush");
+        std::fs::write(root.join("run.sh"), "#!/bin/sh").unwrap();
+        let fs = RecordingFs::local();
+        let mut cs = ChangeSet::new();
+        cs.set_executable("run.sh", true);
+        block_on(cs.apply(&fs, &root)).unwrap();
+
+        assert_eq!(
+            fs.events(),
+            vec![
+                FsEvent::SetExecutable(root.join("run.sh"), true),
+                FsEvent::Sync(root.join("run.sh"), crate::fs::Durability::Durable),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_abort_flushes_the_restored_state_and_durably_retires_the_journal() {
+        // `Err` from a clean rollback is a promise too: the restored state is
+        // flushed, the journal's deletion made durable — so a power cut right
+        // after the abort cannot resurrect the journal for the next recovery
+        // to roll the aborted set forward.
+        use std::cell::Cell;
+
+        struct FailingRecorder {
+            inner: RecordingFs,
+            writes: Cell<usize>,
+            fail_at: usize,
+        }
+        impl crate::fs::ReadStorage for FailingRecorder {
+            async fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+                self.inner.read(path).await
+            }
+            async fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+                self.inner.read_to_string(path).await
+            }
+            async fn read_dir(&self, path: &Path) -> std::io::Result<Vec<crate::fs::DirEntry>> {
+                self.inner.read_dir(path).await
+            }
+            async fn metadata(&self, path: &Path) -> std::io::Result<crate::fs::Metadata> {
+                self.inner.metadata(path).await
+            }
+            async fn read_link(&self, path: &Path) -> std::io::Result<Option<PathBuf>> {
+                self.inner.read_link(path).await
+            }
+        }
+        impl Storage for FailingRecorder {
+            async fn write(&self, path: &Path, contents: &[u8]) -> std::io::Result<()> {
+                if !Journal::default().owns_path(path) {
+                    let n = self.writes.get();
+                    self.writes.set(n + 1);
+                    if n == self.fail_at {
+                        return Err(std::io::Error::other("disk full (test)"));
+                    }
+                }
+                self.inner.write(path, contents).await
+            }
+            async fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
+                self.inner.create_dir_all(path).await
+            }
+            async fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+                self.inner.remove_file(path).await
+            }
+            async fn remove_dir_all(&self, path: &Path) -> std::io::Result<()> {
+                self.inner.remove_dir_all(path).await
+            }
+            async fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+                self.inner.rename(from, to).await
+            }
+            fn capabilities(&self) -> crate::fs::Capabilities {
+                self.inner.capabilities()
+            }
+            async fn sync(&self, path: &Path, need: crate::fs::Durability) -> std::io::Result<()> {
+                self.inner.sync(path, need).await
+            }
+        }
+
+        let root = tmp("abort-durable");
+        std::fs::write(root.join("existing.md"), "before").unwrap();
+        let fs = FailingRecorder {
+            inner: RecordingFs::local(),
+            writes: Cell::new(0),
+            fail_at: 1,
+        };
+        let mut cs = ChangeSet::new();
+        cs.write("existing.md", "after");
+        cs.write("doomed.md", "never lands");
+        let err = block_on(cs.apply(&fs, &root)).unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "{err:?}");
+        assert_eq!(read(&root, "existing.md").as_deref(), Some("before"));
+
+        // The tail of the event stream is the abort's certification: restored
+        // state barriered, the journal removed, its directory drained.
+        let journal = Journal::default().path_in(&root);
+        let events = fs.inner.events();
+        let tail = &events[events.len() - 4..];
+        assert_eq!(
+            tail,
+            &[
+                FsEvent::Sync(root.clone(), crate::fs::Durability::Ordered),
+                FsEvent::Sync(root.join("existing.md"), crate::fs::Durability::Ordered),
+                FsEvent::Remove(journal),
+                FsEvent::Sync(root.clone(), crate::fs::Durability::Durable),
+            ],
+            "events: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_deep_chain_written_through_a_set_is_flushed_link_by_link() {
+        // The same debt OrderedBatch and the journal's home already pay:
+        // directories the set freshly mints are entries a power cut can take
+        // back out from under a durably-flushed file.
+        let root = tmp("set-chain-flush");
+        let fs = RecordingFs::local();
+        let mut cs = ChangeSet::new();
+        cs.write("deep/nested/a.md", "a");
+        cs.write("b.md", "b");
+        block_on(cs.apply(&fs, &root)).unwrap();
+
+        for dir in [root.clone(), root.join("deep"), root.join("deep/nested")] {
+            assert!(
+                fs.events()
+                    .iter()
+                    .any(|e| matches!(e, FsEvent::Sync(p, _) if *p == dir)),
+                "{} never flushed; events: {:?}",
+                dir.display(),
+                fs.events()
+            );
+        }
     }
 
     #[test]
