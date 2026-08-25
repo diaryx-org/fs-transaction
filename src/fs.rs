@@ -1025,8 +1025,7 @@ pub(crate) fn parent_dir(path: &Path) -> Option<&Path> {
 /// write through before renaming it into place. A dotted, suffixed name in the
 /// target's own directory: dotted and suffixed so it will not collide with a
 /// real file, and a *sibling* so the rename that follows never crosses a
-/// filesystem boundary. Shared with [`crate::ordered`], whose replaced writes
-/// stage through the same dance minus the final directory flush.
+/// filesystem boundary.
 pub(crate) fn temp_sibling(path: &Path) -> PathBuf {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     path.with_file_name(format!(".{name}.fstx-tmp"))

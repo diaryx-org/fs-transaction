@@ -45,9 +45,13 @@
 //! The two op kinds degrade differently inside the interrupted tier, and the
 //! difference is the port's, honestly inherited:
 //!
-//! - A [`write`](OrderedBatch::write) stages through a temporary sibling and a
-//!   rename (on a backend declaring `atomic_replace`), so a crash shows the
-//!   whole old file or the whole new one — never a splice.
+//! - A [`write`](OrderedBatch::write) lands through the backend's own
+//!   [`Storage::write_atomic`] — its override included — so a crash shows the
+//!   whole old file or the whole new one wherever the backend can promise
+//!   that, and the documented degrade where it cannot. It also carries
+//!   `write_atomic`'s built-in durability (a parent flush per file): the
+//!   batch's flush economy is for the creates, and a replaced write — a
+//!   bookmark, a header — is the rare op here.
 //! - A [`create_new`](OrderedBatch::create_new) is an exclusive create under
 //!   its final name — decision-grade for concurrency (two writers racing to
 //!   one name see one winner), but a crash mid-write can leave the newest
@@ -69,7 +73,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::error::Result;
-use crate::fs::{Durability, Storage, parent_dir, temp_sibling};
+use crate::fs::{Durability, Storage, parent_dir};
 use crate::path::guard_in_root;
 
 /// One staged op of an [`OrderedBatch`]. Paths are **root-relative**, joined
@@ -78,8 +82,10 @@ use crate::path::guard_in_root;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BatchOp {
     /// Write `bytes` to `path`, creating it (and any missing parent directory)
-    /// or replacing it wholesale — atomically, where the backend can promise
-    /// that ([`atomic_replace`](crate::fs::Capabilities::atomic_replace)).
+    /// or replacing it wholesale — through [`Storage::write_atomic`], the
+    /// backend's own protocol, override included, so the atomicity promise is
+    /// exactly the backend's
+    /// ([`atomic_replace`](crate::fs::Capabilities::atomic_replace)).
     Write {
         /// The file to write.
         path: PathBuf,
@@ -220,7 +226,9 @@ impl OrderedBatch {
     /// mean only "no crash shows a later tier without an earlier one" — the
     /// batch itself may vanish with the crash, wholly or from some barrier
     /// on, and for a caller that treats its tree as append-only that is often
-    /// enough, at the cost of one less drain of the device's cache.
+    /// enough, at the cost of one less drain of the device's cache. (The
+    /// saving is the creates': a [`write`](OrderedBatch::write) always pays
+    /// [`Storage::write_atomic`]'s own durable flush, whatever the finality.)
     ///
     /// On an error the apply stops where it stands and the tree holds a
     /// consistent prefix — see the module docs for exactly what that means
@@ -236,32 +244,29 @@ impl OrderedBatch {
         for op in self.tiers.iter().flatten() {
             guard_in_root(op.path())?;
         }
-        let atomic_replace = fs.capabilities().atomic_replace;
         let tiers: Vec<&Vec<BatchOp>> = self.tiers.iter().filter(|t| !t.is_empty()).collect();
         let Some((last, earlier)) = tiers.split_last() else {
             return Ok(());
         };
 
         for tier in earlier {
-            apply_tier(fs, root, tier, Durability::Ordered, atomic_replace).await?;
+            apply_tier(fs, root, tier, Durability::Ordered).await?;
         }
-        apply_tier(fs, root, last, finality, atomic_replace).await
+        apply_tier(fs, root, last, finality).await
     }
 }
 
 /// Land one tier and flush it to `need`.
 ///
-/// Files first, in staged order; then one flush per file that still needs one;
-/// then one flush per directory that gained a name. The directory flushes come
-/// last because they are what publish the tier's *names* — the renames and
-/// creates — and a name must never be ordered ahead of the bytes it stands
-/// for.
+/// Files first, in staged order; then one flush per created file; then one
+/// flush per directory that gained a name. The directory flushes come last
+/// because they are what publish the tier's *names* — a name must never be
+/// ordered ahead of the bytes it stands for.
 async fn apply_tier<FS: Storage>(
     fs: &FS,
     root: &Path,
     tier: &[BatchOp],
     need: Durability,
-    atomic_replace: bool,
 ) -> Result<()> {
     // `BTreeSet` for a deterministic flush order — nothing correctness-shaped
     // hangs on it, but a deterministic apply is one a fault-injection test can
@@ -284,38 +289,16 @@ async fn apply_tier<FS: Storage>(
             }
         }
         match op {
-            BatchOp::Write { bytes, .. } if atomic_replace => {
-                // `write_atomic`'s staging dance minus its final directory
-                // flush: the bytes are ordered ahead of the rename that
-                // publishes them, and the *tier's* directory flush below is
-                // what carries the rename — one flush per directory instead
-                // of one per file.
-                let tmp = temp_sibling(&full);
-                let staged = async {
-                    fs.write(&tmp, bytes).await?;
-                    fs.sync(&tmp, Durability::Ordered).await?;
-                    fs.copy_permissions(&full, &tmp).await?;
-                    fs.rename(&tmp, &full).await
-                }
-                .await;
-                if let Err(e) = staged {
-                    let _ = fs.remove_file(&tmp).await;
-                    return Err(e.into());
-                }
-                // The rename does not move the inode, so the flush the bytes
-                // already got under the temporary name is the flush they
-                // have; only a `Durable` finality owes them more than the
-                // barrier they passed.
-                if need == Durability::Durable {
-                    flush.push(full);
-                }
-            }
-            // No atomic replace to lean on: a plain write, flushed with the
-            // tier. The whole-or-previous promise is gone and the caller was
-            // told so by `capabilities` — the documented degrade, not a lie.
+            // Through the backend's own `write_atomic` — override included.
+            // Re-implementing the temp-then-rename dance here would silently
+            // bypass a backend whose atomic replacement is native (a locked
+            // in-memory swap, a transactional store), and break on any whose
+            // `rename` semantics differ from the dance's assumption. The
+            // price is `write_atomic`'s built-in durability (its own parent
+            // flush, per file) even mid-tier — the batch's flush economy is
+            // for the creates, and a replaced write is the rare op here.
             BatchOp::Write { bytes, .. } => {
-                fs.write(&full, bytes).await?;
-                flush.push(full);
+                fs.write_atomic(&full, bytes).await?;
             }
             BatchOp::CreateNew { bytes, .. } => {
                 fs.create_new(&full, bytes).await?;
@@ -431,15 +414,17 @@ mod tests {
     }
 
     #[test]
-    fn an_ordered_finality_never_drains_the_device() {
+    fn an_ordered_finality_of_creates_never_drains_the_device() {
         // The cheap contract: consistent, but the tail may go with the crash.
-        // Not one `Durable` request anywhere.
+        // Not one `Durable` request anywhere — a claim the batch can only
+        // make of creates, since a `write` carries `write_atomic`'s own
+        // durable flush whatever the finality.
         let root = tmp("ordered-finality");
         let fs = RecordingFs::local();
         let mut batch = OrderedBatch::new();
         batch.create_new("blobs/a", "a");
         batch.barrier();
-        batch.write("bookmark", "b");
+        batch.create_new("rev", "names a");
         block_on(batch.apply(&fs, &root, Durability::Ordered)).unwrap();
 
         assert!(
@@ -452,10 +437,10 @@ mod tests {
     }
 
     #[test]
-    fn a_replaced_write_stages_through_a_sibling_and_flushes_once_more_when_durable() {
-        // A `write` in the last tier under `Durable` finality owes its bytes a
-        // real flush under their final name: the staging flush was only a
-        // barrier, and a barrier is not survival.
+    fn a_replaced_write_lands_through_the_backends_write_atomic() {
+        // Delegated, not re-implemented: over a backend that leaves the
+        // default in place this is the familiar temp-sibling protocol, its
+        // own durable parent flush included.
         let root = tmp("write-durable");
         std::fs::write(root.join("bookmark"), "old").unwrap();
         let fs = RecordingFs::local();
@@ -463,18 +448,38 @@ mod tests {
         batch.write("bookmark", "new");
         block_on(batch.apply(&fs, &root, Durability::Durable)).unwrap();
 
-        let tmp_name = temp_sibling(&root.join("bookmark"));
+        let tmp_name = crate::fs::temp_sibling(&root.join("bookmark"));
         assert_eq!(
             fs.events(),
             vec![
                 FsEvent::Write(tmp_name.clone()),
                 FsEvent::Sync(tmp_name.clone(), Durability::Ordered),
                 FsEvent::Rename(tmp_name, root.join("bookmark")),
-                FsEvent::Sync(root.join("bookmark"), Durability::Durable),
+                // `write_atomic`'s own flush, then the tier's — the second
+                // is redundant here and harmless, and disappears the moment
+                // any other op shares the tier.
+                FsEvent::Sync(root.clone(), Durability::Durable),
                 FsEvent::Sync(root.clone(), Durability::Durable),
             ]
         );
         assert_eq!(read(&root, "bookmark").as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn a_replaced_write_respects_a_backends_native_atomic_replace() {
+        // The delegation is the point: `InMemoryFs` overrides `write_atomic`
+        // with its locked single write, and its `rename` refuses to clobber —
+        // a batch that re-implemented the temp-then-rename dance would fail
+        // with AlreadyExists on exactly this, the commonest replace there is.
+        let fs = InMemoryFs::new();
+        block_on(fs.write(Path::new("store/bookmark"), b"old")).unwrap();
+        let mut batch = OrderedBatch::new();
+        batch.write("bookmark", "new");
+        block_on(batch.apply(&fs, Path::new("store"), Durability::Durable)).unwrap();
+        assert_eq!(
+            block_on(fs.read_to_string(Path::new("store/bookmark"))).unwrap(),
+            "new"
+        );
     }
 
     #[test]
