@@ -74,11 +74,11 @@ use crate::fs::Storage;
 /// Where a change set's write-ahead journal lives — and, because they must
 /// agree about it, both halves of the protocol that depends on the answer.
 ///
-/// The name is a single transient dotfile in the root: it exists only between a
-/// change set's commit point and its completion, so in steady state the tree
-/// carries no journal at all, and no dotfolder is spawned to hold one. It
-/// survives a crash solely so [`Journal::recover`] can find it, and is removed
-/// the moment recovery (or a clean apply) finishes.
+/// The name is a single transient dotfile, by default in the root: it exists
+/// only between a change set's commit point and its completion, so in steady
+/// state the tree carries no journal at all, and no dotfolder is spawned to
+/// hold one. It survives a crash solely so [`Journal::recover`] can find it,
+/// and is removed the moment recovery (or a clean apply) finishes.
 ///
 /// ## Why this is a type and not a parameter
 ///
@@ -102,9 +102,36 @@ use crate::fs::Storage;
 /// assert!(Journal::named("../elsewhere").is_err());
 /// # Ok::<(), fs_transaction::Error>(())
 /// ```
+///
+/// ## A journal outside the tree
+///
+/// By default the journal lands in the root it applies to, which is right for
+/// a tree only this machine writes. It is wrong for a tree something *syncs* —
+/// an iCloud or Dropbox folder — because the journal is this process's crash
+/// state, and a sync service cannot tell it from content: the file travels to
+/// machines that never crashed, where a recovery would replay *another
+/// machine's* intent against a tree that may have moved on, and an apply
+/// would refuse a "stale" journal no local change left behind.
+/// [`kept_in`](Journal::kept_in) is the fix: the journal lives in a directory
+/// the caller owns and nothing syncs (an application-support or cache
+/// directory), and the tree itself never holds a journal at all, transiently
+/// or otherwise.
+///
+/// Two obligations come with a homed journal, both the caller's. The home
+/// must be **absolute** — a relative one would resolve against whatever the
+/// process's current directory happens to be, and a journal written from one
+/// directory and sought from another is exactly the stranding this type
+/// exists to prevent; `kept_in` refuses anything else. And the pairing of
+/// home and root is not recorded anywhere: the journal does not know which
+/// tree it belongs to, so recovering it against a different root replays
+/// intent against the wrong tree. One home directory, one root, one name —
+/// a caller with several roots keeps several names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Journal {
     name: Cow<'static, str>,
+    /// Where the journal file lives, when not in the root itself. Always an
+    /// absolute directory — [`Journal::kept_in`] refuses anything else.
+    home: Option<PathBuf>,
 }
 
 impl Journal {
@@ -128,7 +155,38 @@ impl Journal {
         if !single {
             return Err(Error::InvalidJournalName(name.into_owned()));
         }
-        Ok(Self { name })
+        Ok(Self { name, home: None })
+    }
+
+    /// This journal, kept in `home` instead of in the root it applies to.
+    ///
+    /// For trees something syncs — see the type docs for why the journal must
+    /// not live where a sync service can carry it to another machine, and for
+    /// the two obligations (an absolute home, and a stable home–root pairing)
+    /// that come with taking this.
+    ///
+    /// `home` is a directory; the journal keeps its [`name`](Journal::name)
+    /// inside it. A relative `home` is refused
+    /// ([`Error::InvalidJournalHome`]): it would resolve against the process's
+    /// current directory, which apply and a later recovery have no reason to
+    /// share.
+    ///
+    /// ```
+    /// # use fs_transaction::journal::Journal;
+    /// let journal = Journal::named(".myapp-journal")?
+    ///     .kept_in("/var/lib/myapp/journals")?;
+    /// assert!(Journal::default().kept_in("not/absolute").is_err());
+    /// # Ok::<(), fs_transaction::Error>(())
+    /// ```
+    pub fn kept_in(self, home: impl Into<PathBuf>) -> Result<Self> {
+        let home = home.into();
+        if !home.is_absolute() {
+            return Err(Error::InvalidJournalHome(home));
+        }
+        Ok(Self {
+            home: Some(home),
+            ..self
+        })
     }
 
     /// The journal's file name.
@@ -136,9 +194,21 @@ impl Journal {
         &self.name
     }
 
-    /// Where this journal lives under `root`.
+    /// The directory this journal is [kept in](Journal::kept_in), if it is
+    /// not the root itself. `apply` uses this to make the home before writing
+    /// into it — a root exists by the time anything applies against it, but a
+    /// cache directory may not.
+    pub(crate) fn home(&self) -> Option<&Path> {
+        self.home.as_deref()
+    }
+
+    /// Where this journal lives when applying to `root`: its
+    /// [home](Journal::kept_in) if it has one, otherwise the root itself.
     pub fn path_in(&self, root: &Path) -> PathBuf {
-        root.join(self.name.as_ref())
+        match &self.home {
+            Some(home) => home.join(self.name.as_ref()),
+            None => root.join(self.name.as_ref()),
+        }
     }
 
     /// Whether `path` names this journal, or the staging sibling
@@ -159,6 +229,7 @@ impl Default for Journal {
     fn default() -> Self {
         Self {
             name: Cow::Borrowed(Self::DEFAULT_NAME),
+            home: None,
         }
     }
 }
@@ -900,6 +971,99 @@ mod tests {
         // Cleared on a clean apply, and the default was never written.
         assert!(!journal.path_in(&root).exists());
         assert!(!Journal::default().path_in(&root).exists());
+    }
+
+    // ---- a journal kept outside the tree ----
+
+    #[test]
+    fn a_home_must_be_absolute() {
+        // A relative home resolves against the process's current directory,
+        // which apply and recovery have no reason to share — refused at
+        // construction, not discovered as a stranded change.
+        let err = Journal::default().kept_in("relative/dir").unwrap_err();
+        assert!(
+            matches!(err, crate::Error::InvalidJournalHome(_)),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_homed_journal_keeps_the_root_journal_free() {
+        // The synced-folder deployment: the tree must never hold the journal,
+        // transiently or otherwise, because a sync service cannot tell crash
+        // state from content. The recording backend sees every write of the
+        // apply, so "no write ever landed in the root under the journal's
+        // name" is checked as stated, not just at the end.
+        let root = tmp("homed-apply");
+        let home = tmp("homed-apply-home");
+        let journal = Journal::default().kept_in(&home).unwrap();
+
+        let fs = crate::fs_faults::RecordingFs::local();
+        let mut cs = crate::ChangeSet::new();
+        cs.write("a.md", "a");
+        cs.write("b.md", "b");
+        block_on(journal.apply(&cs, &fs, &root)).unwrap();
+
+        assert_eq!(read(&root, "a.md").as_deref(), Some("a"));
+        let stray = fs.events().iter().any(|e| {
+            matches!(e, crate::fs_faults::FsEvent::Write(p)
+                if journal.owns_path(p) && p.starts_with(&root))
+        });
+        assert!(!stray, "events: {:?}", fs.events());
+        assert!(
+            !journal.path_in(&root).exists(),
+            "the homed journal is cleared after a clean apply"
+        );
+    }
+
+    #[test]
+    fn recovery_finds_a_homed_journal_and_applies_it_to_the_root() {
+        // The two halves meeting away from the tree: the journal lives in the
+        // home, the ops land in the root.
+        let root = tmp("homed-recover");
+        let home = tmp("homed-recover-home");
+        let journal = Journal::default().kept_in(&home).unwrap();
+        let ops = vec![FileOp::Write {
+            path: "restored.md".into(),
+            bytes: b"restored".to_vec(),
+        }];
+        std::fs::write(journal.path_in(&root), encode(&ops).unwrap()).unwrap();
+
+        let outcome = block_on(journal.recover(&StdFs, &root)).unwrap();
+
+        assert_eq!(outcome, Recovered::Applied(1));
+        assert_eq!(read(&root, "restored.md").as_deref(), Some("restored"));
+        assert!(!journal.path_in(&root).exists());
+    }
+
+    #[test]
+    fn a_stale_homed_journal_still_refuses_the_next_apply() {
+        let root = tmp("homed-stale");
+        let home = tmp("homed-stale-home");
+        let journal = Journal::default().kept_in(&home).unwrap();
+        std::fs::write(journal.path_in(&root), b"whatever a crash left").unwrap();
+
+        let mut cs = crate::ChangeSet::new();
+        cs.write("a.md", "a");
+        cs.write("b.md", "b");
+        let err = block_on(journal.apply(&cs, &StdFs, &root)).unwrap_err();
+        assert!(matches!(err, crate::Error::StaleJournal(_)), "{err:?}");
+        assert_eq!(read(&root, "a.md"), None);
+    }
+
+    #[test]
+    fn an_apply_makes_a_home_that_does_not_exist_yet() {
+        // A cache directory on a fresh machine: the home is the journal's own
+        // infrastructure, so the apply makes it rather than failing on it.
+        let root = tmp("homed-fresh");
+        let home = tmp("homed-fresh-home").join("nested/never-made");
+        let journal = Journal::default().kept_in(&home).unwrap();
+
+        let mut cs = crate::ChangeSet::new();
+        cs.write("a.md", "a");
+        cs.write("b.md", "b");
+        block_on(journal.apply(&cs, &StdFs, &root)).unwrap();
+        assert_eq!(read(&root, "b.md").as_deref(), Some("b"));
     }
 
     #[test]

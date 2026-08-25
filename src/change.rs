@@ -457,7 +457,14 @@ impl Journal {
         }
         // The commit point: durably record the whole intent before touching a
         // single document. `write_atomic` flushes it, so a crash finds the
-        // journal whole or not at all — never half-written.
+        // journal whole or not at all — never half-written. A journal kept
+        // outside the root may be pointed at a directory nothing has made yet
+        // (a cache directory on a fresh machine), so its home is made here;
+        // the root itself needs no such courtesy, since a tree being applied
+        // to exists.
+        if let Some(home) = self.home() {
+            fs.create_dir_all(home).await?;
+        }
         fs.write_atomic(&journal, &crate::journal::encode(&changes.ops)?)
             .await?;
 

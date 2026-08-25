@@ -1,14 +1,18 @@
 //! What a transaction can fail with.
 //!
-//! Five variants, and the split between them is the crate's whole safety story:
+//! The split between the variants is the crate's whole safety story:
 //! [`Io`](Error::Io) and [`Escape`](Error::Escape) are ordinary refusals that
-//! leave the target untouched, [`Corrupt`](Error::Corrupt) and
+//! leave the target untouched, the construction-time refusals
+//! ([`InvalidJournalName`](Error::InvalidJournalName),
+//! [`InvalidJournalHome`](Error::InvalidJournalHome),
+//! [`NonUtf8Path`](Error::NonUtf8Path)) stop a mistake before anything is
+//! written, [`Corrupt`](Error::Corrupt) and
 //! [`StaleJournal`](Error::StaleJournal) are recovery refusing to guess, and
 //! [`Torn`](Error::Torn) is the one case where the state on disk cannot be
 //! named.
 //!
-//! There is no `thiserror` here on purpose — the crate has no dependencies, and
-//! five variants do not need a derive to spell out.
+//! There is no `thiserror` here on purpose — the crate has no required
+//! dependencies, and a handful of variants do not need a derive to spell out.
 
 use std::fmt;
 use std::io;
@@ -37,6 +41,15 @@ pub enum Error {
     /// name is joined onto a caller-supplied root and one containing `..` or a
     /// separator would write outside the very tree an apply clamps into.
     InvalidJournalName(String),
+
+    /// A [`Journal`](crate::journal::Journal) was asked to live
+    /// ([`kept_in`](crate::journal::Journal::kept_in)) in a directory that is
+    /// not absolute. Refused at construction: a relative home resolves against
+    /// the process's current directory, which the apply that writes the
+    /// journal and the recovery that must find it have no reason to share —
+    /// and a journal sought where it was never written strands its change
+    /// half-applied.
+    InvalidJournalHome(PathBuf),
 
     /// A staged path could not be encoded into the journal because it is not
     /// UTF-8. The journal stores paths as UTF-8 so that a set written on one
@@ -88,6 +101,11 @@ impl fmt::Display for Error {
             Error::InvalidJournalName(name) => write!(
                 f,
                 "journal name must be a single path component, got {name:?}"
+            ),
+            Error::InvalidJournalHome(dir) => write!(
+                f,
+                "a journal's home must be an absolute directory, got {}",
+                dir.display()
             ),
             Error::NonUtf8Path(p) => {
                 write!(f, "journal cannot encode non-UTF-8 path: {}", p.display())
