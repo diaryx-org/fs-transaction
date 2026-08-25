@@ -391,7 +391,7 @@ impl Storage for InMemoryFs {
         // filesystem. Here, a single `write` already is the atomic step — it
         // takes the map's write lock for its entire duration, so no observer
         // ever sees a splice — so replaying the temp-then-rename dance would
-        // only litter the map with a `.prov-tmp` entry no caller asked for.
+        // only litter the map with a `.fstx-tmp` entry no caller asked for.
         // This is exactly the "backend with a better native path" case the
         // default documents overriding wholesale.
         self.write(path, contents).await
@@ -761,7 +761,7 @@ mod tests {
             block_on(fs.read_to_string(Path::new("doc.md"))).unwrap(),
             "new"
         );
-        // No `.doc.md.prov-tmp` sibling should exist — `write_atomic` was
+        // No `.doc.md.fstx-tmp` sibling should exist — `write_atomic` was
         // overridden to skip the default's staging dance.
         let entries = block_on(fs.read_dir(Path::new(""))).unwrap();
         assert_eq!(entries.len(), 1, "no stray temp-sibling entry: {entries:?}");

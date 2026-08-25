@@ -15,7 +15,7 @@
 //! written.
 //!
 //! ```no_run
-//! use prov_transaction::{ChangeSet, StdFs, exec::block_on, recover};
+//! use fs_transaction::{ChangeSet, StdFs, exec::block_on, recover};
 //! use std::path::Path;
 //!
 //! let root = Path::new("/tmp/example");
@@ -28,7 +28,7 @@
 //! change.rename("old.md", "notes/b.md");
 //! change.remove("stale.md");
 //! block_on(change.apply(&StdFs, root))?;
-//! # Ok::<(), prov_transaction::Error>(())
+//! # Ok::<(), fs_transaction::Error>(())
 //! ```
 //!
 //! ## Backends

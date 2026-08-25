@@ -94,12 +94,12 @@ use crate::fs::Storage;
 /// when an existing deployment already writes a journal under its own name.
 ///
 /// ```
-/// # use prov_transaction::journal::Journal;
+/// # use fs_transaction::journal::Journal;
 /// let journal = Journal::named(".myapp-journal")?;
 /// assert_eq!(journal.name(), ".myapp-journal");
 /// // Not a single path component — refused rather than escaping the root.
 /// assert!(Journal::named("../elsewhere").is_err());
-/// # Ok::<(), prov_transaction::Error>(())
+/// # Ok::<(), fs_transaction::Error>(())
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Journal {
@@ -455,7 +455,7 @@ mod tests {
     use crate::fs::StdFs;
 
     fn tmp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("prov-journal-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("fstx-journal-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -491,7 +491,7 @@ mod tests {
         // The point of the op, stated as an assertion: the journal for a copy is
         // bounded by the path lengths, not by the size of what it will write.
         // Without this, restoring a captured tree writes that whole tree
-        // into `.prov-journal` before touching a single document.
+        // into the journal before touching a single file.
         let payload: Vec<u8> = vec![7; 512 * 1024];
         let by_value = encode(&[FileOp::Write {
             path: "notes/photo.jpg".into(),

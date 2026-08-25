@@ -290,10 +290,10 @@ impl Journal {
     /// than four.
     ///
     /// The rare exception is a rollback that *itself* fails ([`Error::Torn`]):
-    /// prov could not restore the pre-change state, so — rather than leave an
-    /// unknown one — it keeps the journal, and recovery will later roll the set
+    /// the pre-change state could not be restored, so — rather than leave an
+    /// unknown one — the journal is kept, and recovery will later roll the set
     /// forward to the consistent applied state. Either way the tree lands on
-    /// a state prov can name.
+    /// a state this crate can name.
     ///
     /// Takes `fs`/`root` rather than a higher-level object so a bootstrap
     /// that must write two files before the tree exists can still land them
@@ -312,8 +312,8 @@ impl Journal {
         }
         // Clamp every staged path to the root *before* anything is
         // written or journaled. A set is built from root-relative,
-        // already-normalized paths, so an escaping op cannot arise from prov's
-        // own mutations — but `apply` also lands sets a caller assembled directly,
+        // already-normalized paths when a caller builds them that way — but
+        // `apply` also lands sets assembled from data it did not author,
         // and a link target that resolves to `../../../etc/passwd` must be refused
         // rather than let an apply write outside the tree it was pointed at.
         for op in &changes.ops {
@@ -338,8 +338,7 @@ impl Journal {
         // presence means an earlier mutation crashed mid-apply and has not been
         // recovered; overwriting it with this set's intent would strand the old
         // change half-applied with no record of how to finish it. Recovery
-        // ([`crate::journal::recover`], which `prov check` runs) must complete
-        // it first. A journal this same apply is about to write does not exist yet,
+        // ([`Journal::recover`]) must complete it first. A journal this same apply is about to write does not exist yet,
         // so this only ever fires on a genuinely stale one.
         let journal = self.path_in(root);
         if fs.try_exists(&journal).await? {
@@ -583,7 +582,7 @@ mod tests {
     use crate::journal::Journal;
 
     fn tmp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("prov-change-{name}"));
+        let dir = std::env::temp_dir().join(format!("fstx-change-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -713,7 +712,7 @@ mod tests {
 
     #[test]
     fn a_clean_rollback_reports_the_cause_not_a_tear() {
-        // `Torn` means "prov cannot say what is on disk" — it must be reserved
+        // `Torn` means "this crate cannot say what is on disk" — it must be reserved
         // for a rollback that genuinely failed. The commonest rollback of all is a
         // write to a *new* file that failed before creating it, whose undo then
         // finds nothing to delete; calling that a tear would cry wolf on every
@@ -1003,7 +1002,7 @@ mod tests {
         // An absolute path would ignore the root under `root.join`; it escapes too.
         let root = tmp("escape-abs");
         let mut cs = ChangeSet::new();
-        cs.write("/tmp/prov-abs-escape-should-not-exist.md", "nope");
+        cs.write("/tmp/fstx-abs-escape-should-not-exist.md", "nope");
         let err = block_on(cs.apply(&StdFs, &root)).unwrap_err();
         assert!(
             matches!(err, Error::Escape(_)),

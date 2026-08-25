@@ -1,17 +1,21 @@
 [package]
-name = "prov-transaction"
-description = "Crash-atomic staged filesystem changes and write-ahead recovery"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-repository.workspace = true
-homepage.workspace = true
-readme.workspace = true
-license.workspace = true
+name = "fs-transaction"
+version = "0.1.0"
+description = "Multi-file filesystem transactions that survive a crash: staged change sets, all-or-nothing apply, write-ahead recovery"
+edition = "2024"
+# Edition 2024 needs 1.85, but the crate also uses `if let … && let …`
+# let-chains in stable positions, stabilized in 1.88 — so 1.88 is the floor.
+rust-version = "1.88"
+repository = "https://github.com/diaryx-org/fs-transaction"
+homepage = "https://github.com/diaryx-org/fs-transaction"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+keywords = ["filesystem", "transaction", "atomic", "crash-safety", "journal"]
+categories = ["filesystem", "asynchronous"]
 
-# No dependencies, on purpose. This crate is the bottom of prov's stack: the
-# filesystem port every other crate is generic over, and the transaction that
-# lands a change through it. Nothing here needs to know what a document is, so
-# nothing here depends on the crates that do — which is what lets it be lifted
-# out as a general-purpose crate (see `docs/`).
+# No dependencies, on purpose. A crate whose whole job is to get bytes onto
+# disk correctly should not make you audit anyone else's code to trust it, and
+# should not pull a runtime into a build that already has one. The checksum is
+# hand-rolled FNV-1a and the error type is a hand-written enum for the same
+# reason.
 [dependencies]

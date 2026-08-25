@@ -862,7 +862,7 @@ mod tests {
     use super::*;
 
     fn tmp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("prov-fs-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("fstx-fs-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
