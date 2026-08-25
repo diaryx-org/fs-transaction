@@ -624,11 +624,11 @@ enum Undo {
 ///
 /// `touched` collects everything this op changed that *nothing has flushed
 /// yet* — the flush debt `apply` settles once, at the end, before the journal
-/// is dropped. A rename or remove edits directory entries no sync ever
-/// follows; an execute-bit flip edits an inode the same way; a fresh directory
-/// chain is names a power cut can take back. What deliberately stays out is
-/// what [`Storage::write_atomic`] already made durable on its own: a write's
-/// bytes and its immediate parent.
+/// is dropped. A write's rename-published entry (its bytes are barriered by
+/// [`Storage::replace`] itself); a rename's or remove's edited entries; an
+/// execute-bit flip's inode; a fresh directory chain. Deferring the lot to
+/// one barrier-capped flush is what makes ten writes into a directory cost
+/// one drain, not ten.
 async fn exec<FS: Storage>(
     fs: &FS,
     root: &Path,
@@ -647,13 +647,14 @@ async fn exec<FS: Storage>(
             }
             ensure_parent(fs, &full, touched).await?;
             // Land the document through the atomic-replace protocol, so even a
-            // crash mid-write cannot expose a half-written file: the write goes to
-            // a staging sibling and is renamed into place. On a backend without
-            // atomic rename this degrades to a plain durable write (see
-            // [`Storage::write_atomic`]) — the per-file guarantee follows the
-            // backend's declared capabilities. Either way the call carries its
-            // own durability, so the write leaves no flush debt behind.
-            fs.write_atomic(&full, bytes).await?;
+            // crash mid-write cannot expose a half-written file. `replace`,
+            // not `write_atomic`: the atomicity is per-file, but durability is
+            // the *set's* — the parent entry (and, on a backend that cannot
+            // replace atomically, the plainly-written bytes) joins the flush
+            // debt the apply settles once, so ten writes into one directory
+            // cost one drain rather than ten.
+            fs.replace(&full, bytes).await?;
+            record_write_debt(fs, &full, touched);
         }
         FileOp::Rename { from, to } => {
             let (from_full, to_full) = (root.join(from), root.join(to));
@@ -718,7 +719,8 @@ async fn exec<FS: Storage>(
                 capture_replaced(fs, &full, undo).await?;
             }
             ensure_parent(fs, &full, touched).await?;
-            fs.write_atomic(&full, &bytes).await?;
+            fs.replace(&full, &bytes).await?;
+            record_write_debt(fs, &full, touched);
         }
         FileOp::SetExecutable { path, executable } => {
             let full = root.join(path);
@@ -783,6 +785,23 @@ async fn exec<FS: Storage>(
         }
     }
     Ok(())
+}
+
+/// What one [`Storage::replace`] leaves for the set's final flush: the parent
+/// entry the rename published — and, on a backend that cannot replace
+/// atomically, the plainly-written bytes themselves, since there was no
+/// staging flush and no rename to fold their naming into.
+pub(crate) fn record_write_debt<FS: Storage>(
+    fs: &FS,
+    full: &Path,
+    touched: &mut BTreeSet<PathBuf>,
+) {
+    if !fs.capabilities().atomic_replace {
+        touched.insert(full.to_path_buf());
+    }
+    if let Some(dir) = crate::fs::parent_dir(full) {
+        touched.insert(dir.to_path_buf());
+    }
 }
 
 /// Refuse a [`FileOp::SetExecutable`] whose path holds a symbolic link.
@@ -1479,10 +1498,10 @@ mod tests {
     }
 
     #[test]
-    fn a_lone_write_pays_only_write_atomics_own_flushes() {
-        // The commonest mutation there is must not get slower: a write
-        // settles its own debt inside write_atomic, so the fast path owes
-        // nothing more.
+    fn a_lone_write_pays_the_staging_flush_and_one_drain() {
+        // The commonest mutation there is must not get slower: a lone write
+        // is `replace`'s three steps plus the one durable flush of its
+        // parent — the same four events `write_atomic` always cost it.
         let root = tmp("lone-write-flush");
         let fs = RecordingFs::local();
         let mut cs = ChangeSet::new();
@@ -1611,6 +1630,29 @@ mod tests {
             ],
             "events: {events:?}"
         );
+    }
+
+    #[test]
+    fn many_writes_into_one_directory_cost_one_drain() {
+        // The engineered-away redundancy: per-file durable parent flushes
+        // would make an N-write set drain the device N+1 times. Through
+        // `replace` and the batched final pass, exactly two drains remain —
+        // the journal's commit point, and the cap that certifies the set.
+        let root = tmp("write-economy");
+        let fs = RecordingFs::local();
+        let mut cs = ChangeSet::new();
+        cs.write("a.md", "a");
+        cs.write("b.md", "b");
+        cs.write("c.md", "c");
+        cs.write("d.md", "d");
+        block_on(cs.apply(&fs, &root)).unwrap();
+
+        let drains = fs
+            .events()
+            .iter()
+            .filter(|e| matches!(e, FsEvent::Sync(_, crate::fs::Durability::Durable)))
+            .count();
+        assert_eq!(drains, 2, "events: {:?}", fs.events());
     }
 
     #[test]

@@ -613,12 +613,17 @@ pub trait Storage: ReadStorage {
         }
     }
 
-    /// Replace `path`'s contents with `contents` atomically and durably: no
-    /// observer — concurrent reader or post-crash survivor — ever sees a splice
-    /// of old and new bytes, and once this returns the new contents outlive a
-    /// power loss.
+    /// Replace `path`'s contents with `contents` atomically — and *only*
+    /// atomically: no observer ever sees a splice of old and new bytes, but
+    /// nothing here outlives a power cut until the caller flushes it. The
+    /// atomic half of [`write_atomic`](Storage::write_atomic), split out so
+    /// that a protocol landing many replacements can batch one drain instead
+    /// of paying one per file — which is exactly what
+    /// [`ChangeSet`](crate::ChangeSet) and
+    /// [`OrderedBatch`](crate::OrderedBatch) do, settling the whole set's
+    /// flush debt once before the state is certified.
     ///
-    /// The default composes the primitives into the standard protocol, whenever
+    /// The default composes the primitives into the staging protocol, whenever
     /// [`capabilities`](Storage::capabilities) report `atomic_replace`:
     ///
     /// 1. write the bytes to a temporary sibling;
@@ -628,9 +633,7 @@ pub trait Storage: ReadStorage {
     ///    that sibling, so the replacement carries the target's access
     ///    permissions rather than a fresh file's defaults;
     /// 4. [`rename`](Storage::rename) it over the target — *this* is the atomic
-    ///    instant;
-    /// 5. `sync` the target's **parent directory** [`Durable`](Durability::Durable),
-    ///    which is what carries the rename itself through a power cut.
+    ///    instant.
     ///
     /// Steps 2 and 3 are in that order because a backend may implement `sync` by
     /// opening the path, and a mode faithfully copied from the target can be one
@@ -641,40 +644,37 @@ pub trait Storage: ReadStorage {
     /// before step 3 existed, so the window is a smaller bad case, never a new
     /// one.
     ///
-    /// Two flushes, and each one is load-bearing. Neither of the two this
-    /// protocol conspicuously does *not* do would buy anything. The bytes are
-    /// never flushed under their final name, because a rename does not move an
-    /// inode: the file the target now names is the very one step 2 flushed, and
-    /// nothing has been written to it since. The sibling's own directory entry is
-    /// never flushed either, because nobody is owed a temporary that survives a
-    /// crash — only the directory state *after* the rename is worth a barrier.
+    /// One flush, and it is a barrier, not a promise of survival: what it
+    /// rules out is the rename being seen before the bytes it publishes. The
+    /// bytes are never flushed under their final name, because a rename does
+    /// not move an inode — the file the target now names is the very one step
+    /// 2 flushed. The sibling's own directory entry is never flushed either,
+    /// because nobody is owed a temporary that survives a crash. What is owed
+    /// afterwards — the parent directory's entry, and durability itself — is
+    /// the caller's to settle, per file
+    /// ([`write_atomic`](Storage::write_atomic)) or batched.
     ///
-    /// A backend that cannot rename atomically falls back to a plain durable
-    /// write, which is *not* crash-atomic; a caller that needs the guarantee
-    /// consults `capabilities` and leans on the journal instead of pretending
-    /// this call gave it. A backend with a better native path — a transactional
-    /// store — overrides this method wholesale.
+    /// A backend that cannot rename atomically falls back to a plain,
+    /// unflushed write, which is *not* crash-atomic; the caller was told by
+    /// `capabilities`, and still owns every flush. A backend whose atomic
+    /// replacement is native — a locked in-memory swap, a transactional
+    /// store — overrides *this* method, and
+    /// [`write_atomic`](Storage::write_atomic)'s default composes on top of
+    /// the override.
     ///
     /// The temporary is removed on any failure, so a torn attempt leaves the
     /// target exactly as it was and no litter behind. It is a dotted sibling in
     /// the target's own directory, so the follow-up rename stays within one
     /// filesystem (a cross-device rename is neither atomic nor, often, even
     /// permitted).
-    fn write_atomic(&self, path: &Path, contents: &[u8]) -> impl Future<Output = io::Result<()>> {
+    fn replace(&self, path: &Path, contents: &[u8]) -> impl Future<Output = io::Result<()>> {
         async move {
             if !self.capabilities().atomic_replace {
-                // No atomic rename to lean on: the honest best effort is a plain
-                // durable write. Not crash-atomic — and the caller was told so by
-                // `capabilities`, so this is a documented degrade, not a lie.
-                // Both the bytes and, if this call created the file, the entry
-                // naming them have to be flushed; there is no rename here to fold
-                // the second into.
-                self.write(path, contents).await?;
-                self.sync(path, Durability::Durable).await?;
-                return match parent_dir(path) {
-                    Some(dir) => self.sync(dir, Durability::Durable).await,
-                    None => Ok(()),
-                };
+                // No atomic rename to lean on: the honest best effort is a
+                // plain write, and the caller — told so by `capabilities` —
+                // owns whatever flushing it needs. A documented degrade, not
+                // a lie.
+                return self.write(path, contents).await;
             }
             let tmp = temp_sibling(path);
             // Any failure past this point must not leave the staging file behind,
@@ -688,27 +688,12 @@ pub trait Storage: ReadStorage {
                 // before the rename publishes them — a replacement changes
                 // contents, never who may read them. A target that does not
                 // exist yet has nothing to carry, and this is a no-op.
-                //
-                // After the flush, not before: a backend may well implement
-                // `sync` by opening the path (`StdFs` does), and a target whose
-                // mode this faithfully copies can be one that forbids exactly
-                // that — a write-only `0o200` document is replaceable but not
-                // openable for reading. Narrowing the sibling first would make
-                // its own flush fail.
                 self.copy_permissions(path, &tmp).await?;
                 self.rename(&tmp, path).await
             }
             .await;
             match staged {
-                // The bytes are already flushed and the rename has happened, so
-                // the directory entry is the last thing standing between this
-                // write and a power cut.
-                Ok(()) => match parent_dir(path) {
-                    Some(dir) => self.sync(dir, Durability::Durable).await,
-                    // A bare relative filename, whose directory is the process's
-                    // current one — not a path this crate holds, nor one it owns.
-                    None => Ok(()),
-                },
+                Ok(()) => Ok(()),
                 Err(e) => {
                     // Best-effort cleanup: if even this fails the target is still
                     // untouched, so the atomicity promise holds regardless — the
@@ -716,6 +701,34 @@ pub trait Storage: ReadStorage {
                     let _ = self.remove_file(&tmp).await;
                     Err(e)
                 }
+            }
+        }
+    }
+
+    /// Replace `path`'s contents with `contents` atomically and durably: no
+    /// observer — concurrent reader or post-crash survivor — ever sees a splice
+    /// of old and new bytes, and once this returns the new contents outlive a
+    /// power loss.
+    ///
+    /// [`replace`](Storage::replace) plus the flushes it leaves to its caller,
+    /// composed through `replace` itself so a backend's override carries: the
+    /// replacement lands, the parent directory is flushed
+    /// [`Durable`](Durability::Durable) to carry the rename through a power
+    /// cut, and on a backend without `atomic_replace` the plainly-written
+    /// bytes are flushed durable too, since there was no rename to fold their
+    /// naming into. The right call for a standalone save; a protocol landing
+    /// many files reaches for `replace` and batches the flushes instead.
+    fn write_atomic(&self, path: &Path, contents: &[u8]) -> impl Future<Output = io::Result<()>> {
+        async move {
+            self.replace(path, contents).await?;
+            if !self.capabilities().atomic_replace {
+                self.sync(path, Durability::Durable).await?;
+            }
+            match parent_dir(path) {
+                Some(dir) => self.sync(dir, Durability::Durable).await,
+                // A bare relative filename, whose directory is the process's
+                // current one — not a path this crate holds, nor one it owns.
+                None => Ok(()),
             }
         }
     }
@@ -766,6 +779,10 @@ impl<S: Storage + ?Sized> Storage for &S {
         (**self).sync(path, need).await
     }
 
+    async fn replace(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
+        (**self).replace(path, contents).await
+    }
+
     async fn write_atomic(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
         (**self).write_atomic(path, contents).await
     }
@@ -814,6 +831,10 @@ impl<S: Storage + ?Sized> Storage for Arc<S> {
 
     async fn sync(&self, path: &Path, need: Durability) -> io::Result<()> {
         (**self).sync(path, need).await
+    }
+
+    async fn replace(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
+        (**self).replace(path, contents).await
     }
 
     async fn write_atomic(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
@@ -1298,6 +1319,49 @@ mod tests {
     }
 
     // ---- the atomic-write protocol ----
+
+    #[test]
+    fn replace_stages_and_barriers_but_never_drains() {
+        // The atomic half alone: temp sibling, one barrier, the rename — and
+        // no durability anywhere, because the flush is the caller's to batch.
+        let root = tmp("replace-protocol");
+        std::fs::write(root.join("doc.md"), "old").unwrap();
+        let fs = crate::fs_faults::RecordingFs::local();
+        block_on(fs.replace(&root.join("doc.md"), b"new")).unwrap();
+
+        use crate::fs_faults::FsEvent;
+        let tmp_name = temp_sibling(&root.join("doc.md"));
+        assert_eq!(
+            fs.events(),
+            vec![
+                FsEvent::Write(tmp_name.clone()),
+                FsEvent::Sync(tmp_name.clone(), Durability::Ordered),
+                FsEvent::Rename(tmp_name, root.join("doc.md")),
+            ]
+        );
+        assert_eq!(std::fs::read_to_string(root.join("doc.md")).unwrap(), "new");
+    }
+
+    #[test]
+    fn write_atomic_is_replace_plus_the_flushes_it_left_behind() {
+        // The composition, pinned: the same staging events, then the parent's
+        // durable flush — so a backend overriding only `replace` changes both.
+        let root = tmp("write-atomic-composed");
+        let fs = crate::fs_faults::RecordingFs::local();
+        block_on(fs.write_atomic(&root.join("doc.md"), b"bytes")).unwrap();
+
+        use crate::fs_faults::FsEvent;
+        let tmp_name = temp_sibling(&root.join("doc.md"));
+        assert_eq!(
+            fs.events(),
+            vec![
+                FsEvent::Write(tmp_name.clone()),
+                FsEvent::Sync(tmp_name.clone(), Durability::Ordered),
+                FsEvent::Rename(tmp_name, root.join("doc.md")),
+                FsEvent::Sync(root.clone(), Durability::Durable),
+            ]
+        );
+    }
 
     // ---- exclusive create ----
 

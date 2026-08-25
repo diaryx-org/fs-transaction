@@ -454,15 +454,17 @@ impl Storage for InMemoryFs {
         Capabilities::IN_MEMORY
     }
 
-    async fn write_atomic(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
+    async fn replace(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
         // The default protocol stages through a temp sibling and a `rename`
         // because *that* is what makes a plain `write` atomic on a real
         // filesystem. Here, a single `write` already is the atomic step — it
         // takes the map's write lock for its entire duration, so no observer
         // ever sees a splice — so replaying the temp-then-rename dance would
         // only litter the map with a `.fstx-tmp` entry no caller asked for.
-        // This is exactly the "backend with a better native path" case the
-        // default documents overriding wholesale.
+        // This is exactly the "backend whose atomic replacement is native"
+        // case the default documents overriding — and overriding *here*, not
+        // `write_atomic`, is what lets every protocol built on `replace`
+        // (`write_atomic`'s composed default included) pick the override up.
         //
         // One faithful difference from `write`: the rename that realizes the
         // default protocol replaces the *entry* at the path, so a link there
@@ -1036,8 +1038,9 @@ mod tests {
             block_on(fs.read_to_string(Path::new("doc.md"))).unwrap(),
             "new"
         );
-        // No `.doc.md.fstx-tmp` sibling should exist — `write_atomic` was
-        // overridden to skip the default's staging dance.
+        // No `.doc.md.fstx-tmp` sibling should exist — `replace` was
+        // overridden to skip the default's staging dance, and `write_atomic`
+        // composes on the override.
         let entries = block_on(fs.read_dir(Path::new(""))).unwrap();
         assert_eq!(entries.len(), 1, "no stray temp-sibling entry: {entries:?}");
     }

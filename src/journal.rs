@@ -459,10 +459,13 @@ async fn replay<FS: Storage>(
     match op {
         // Whole-file writes are idempotent by nature: writing the intended bytes
         // again reaches the same state whether or not the crash beat this op.
+        // `replace`, on apply's own terms: the durability is the recovery's
+        // one batched flush, not the file's.
         FileOp::Write { path, bytes } => {
             let full = root.join(path);
             ensure_parent(fs, &full, touched).await?;
-            fs.write_atomic(&full, bytes).await?;
+            fs.replace(&full, bytes).await?;
+            crate::change::record_write_debt(fs, &full, touched);
         }
         // Idempotent for the same reason a `Write` is — with the bytes fetched
         // from the source rather than carried in the journal. That is sound
@@ -480,7 +483,8 @@ async fn replay<FS: Storage>(
                 ))
             })?;
             ensure_parent(fs, &full, touched).await?;
-            fs.write_atomic(&full, &bytes).await?;
+            fs.replace(&full, &bytes).await?;
+            crate::change::record_write_debt(fs, &full, touched);
         }
         // A remove of a file already gone is the state we wanted, not a failure.
         FileOp::Remove { path } => {

@@ -46,12 +46,12 @@
 //! difference is the port's, honestly inherited:
 //!
 //! - A [`write`](OrderedBatch::write) lands through the backend's own
-//!   [`Storage::write_atomic`] — its override included — so a crash shows the
+//!   [`Storage::replace`] — its override included — so a crash shows the
 //!   whole old file or the whole new one wherever the backend can promise
-//!   that, and the documented degrade where it cannot. It also carries
-//!   `write_atomic`'s built-in durability (a parent flush per file): the
-//!   batch's flush economy is for the creates, and a replaced write — a
-//!   bookmark, a header — is the rare op here.
+//!   that, and the documented degrade where it cannot. Its flush rides with
+//!   the tier's, like everything else here: the bytes are barriered inside
+//!   the call, and the entry that publishes them is the directory flush's to
+//!   carry.
 //! - A [`create_new`](OrderedBatch::create_new) is an exclusive create under
 //!   its final name — decision-grade for concurrency (two writers racing to
 //!   one name see one winner), but a crash mid-write can leave the newest
@@ -82,10 +82,11 @@ use crate::path::guard_in_root;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BatchOp {
     /// Write `bytes` to `path`, creating it (and any missing parent directory)
-    /// or replacing it wholesale — through [`Storage::write_atomic`], the
-    /// backend's own protocol, override included, so the atomicity promise is
-    /// exactly the backend's
-    /// ([`atomic_replace`](crate::fs::Capabilities::atomic_replace)).
+    /// or replacing it wholesale — through [`Storage::replace`], the backend's
+    /// own protocol, override included, so the atomicity promise is exactly
+    /// the backend's
+    /// ([`atomic_replace`](crate::fs::Capabilities::atomic_replace)). Its
+    /// durability is the tier's, batched with everything else's.
     Write {
         /// The file to write.
         path: PathBuf,
@@ -226,9 +227,7 @@ impl OrderedBatch {
     /// mean only "no crash shows a later tier without an earlier one" — the
     /// batch itself may vanish with the crash, wholly or from some barrier
     /// on, and for a caller that treats its tree as append-only that is often
-    /// enough, at the cost of one less drain of the device's cache. (The
-    /// saving is the creates': a [`write`](OrderedBatch::write) always pays
-    /// [`Storage::write_atomic`]'s own durable flush, whatever the finality.)
+    /// enough, at the cost of no drain of the device's cache at all.
     ///
     /// On an error the apply stops where it stands and the tree holds a
     /// consistent prefix — see the module docs for exactly what that means
@@ -258,16 +257,17 @@ impl OrderedBatch {
 
 /// Land one tier and flush it to `need`.
 ///
-/// Files first, in staged order; then one flush per created file; then one
-/// flush per directory that gained a name. The directory flushes come last
-/// because they are what publish the tier's *names* — a name must never be
-/// ordered ahead of the bytes it stands for.
+/// Files first, in staged order; then one flush per file that still owes one;
+/// then one flush per directory that gained a name. The directory flushes come
+/// last because they are what publish the tier's *names* — a name must never
+/// be ordered ahead of the bytes it stands for.
 async fn apply_tier<FS: Storage>(
     fs: &FS,
     root: &Path,
     tier: &[BatchOp],
     need: Durability,
 ) -> Result<()> {
+    let atomic_replace = fs.capabilities().atomic_replace;
     // `BTreeSet` for a deterministic flush order — nothing correctness-shaped
     // hangs on it, but a deterministic apply is one a fault-injection test can
     // pin down.
@@ -289,16 +289,18 @@ async fn apply_tier<FS: Storage>(
             }
         }
         match op {
-            // Through the backend's own `write_atomic` — override included.
-            // Re-implementing the temp-then-rename dance here would silently
-            // bypass a backend whose atomic replacement is native (a locked
-            // in-memory swap, a transactional store), and break on any whose
-            // `rename` semantics differ from the dance's assumption. The
-            // price is `write_atomic`'s built-in durability (its own parent
-            // flush, per file) even mid-tier — the batch's flush economy is
-            // for the creates, and a replaced write is the rare op here.
+            // Through the backend's own `replace` — override included, so a
+            // native atomic replacement (a locked in-memory swap, a
+            // transactional store) is honored rather than bypassed. The
+            // bytes are barriered inside the call; the rename-published
+            // entry rides on the tier's directory flush, and a backend that
+            // cannot replace atomically leaves its plainly-written bytes as
+            // an extra debt for the same flush.
             BatchOp::Write { bytes, .. } => {
-                fs.write_atomic(&full, bytes).await?;
+                fs.replace(&full, bytes).await?;
+                if !atomic_replace {
+                    flush.push(full);
+                }
             }
             BatchOp::CreateNew { bytes, .. } => {
                 fs.create_new(&full, bytes).await?;
@@ -306,13 +308,20 @@ async fn apply_tier<FS: Storage>(
             }
         }
     }
-    for path in flush {
-        fs.sync(&path, need).await?;
+    // The tier's whole debt in one pass: files first, then the directories
+    // that publish their names. An `Ordered` tier is barriers throughout; a
+    // `Durable` one is barriers capped by a single drain — the corollary
+    // [`Durability::Ordered`] documents, cashed in.
+    let debts = flush.into_iter().chain(dirs);
+    match need {
+        Durability::Ordered => {
+            for path in debts {
+                fs.sync(&path, Durability::Ordered).await?;
+            }
+            Ok(())
+        }
+        Durability::Durable => Ok(crate::fs::flush_all_durable(fs, debts).await?),
     }
-    for dir in dirs {
-        fs.sync(&dir, need).await?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -378,7 +387,10 @@ mod tests {
                 FsEvent::Sync(root.clone(), Durability::Ordered),
                 FsEvent::Sync(root.join("blobs"), Durability::Ordered),
                 FsEvent::CreateNew(root.join("rev")),
-                FsEvent::Sync(root.join("rev"), Durability::Durable),
+                // The `Durable` tier is barriers capped by one drain — the
+                // corollary, cashed in: the directory flush at the end
+                // carries everything barriered before it.
+                FsEvent::Sync(root.join("rev"), Durability::Ordered),
                 FsEvent::Sync(root.clone(), Durability::Durable),
             ]
         );
@@ -405,26 +417,37 @@ mod tests {
             assert!(
                 fs.events()
                     .iter()
-                    .any(|e| matches!(e, FsEvent::Sync(p, Durability::Durable) if *p == dir)),
+                    .any(|e| matches!(e, FsEvent::Sync(p, _) if *p == dir)),
                 "{} never flushed; events: {:?}",
                 dir.display(),
                 fs.events()
             );
         }
+        // Barriers throughout, capped by the one drain that makes them all
+        // durable — which must therefore come last.
+        assert!(
+            matches!(
+                fs.events().last(),
+                Some(FsEvent::Sync(_, Durability::Durable))
+            ),
+            "events: {:?}",
+            fs.events()
+        );
     }
 
     #[test]
-    fn an_ordered_finality_of_creates_never_drains_the_device() {
+    fn an_ordered_finality_never_drains_the_device() {
         // The cheap contract: consistent, but the tail may go with the crash.
-        // Not one `Durable` request anywhere — a claim the batch can only
-        // make of creates, since a `write` carries `write_atomic`'s own
-        // durable flush whatever the finality.
+        // Not one `Durable` request anywhere — writes included, since a
+        // `replace`'s durability is the tier's to grant, and an `Ordered`
+        // tier grants none.
         let root = tmp("ordered-finality");
         let fs = RecordingFs::local();
         let mut batch = OrderedBatch::new();
         batch.create_new("blobs/a", "a");
         batch.barrier();
         batch.create_new("rev", "names a");
+        batch.write("bookmark", "points at rev");
         block_on(batch.apply(&fs, &root, Durability::Ordered)).unwrap();
 
         assert!(
@@ -437,10 +460,10 @@ mod tests {
     }
 
     #[test]
-    fn a_replaced_write_lands_through_the_backends_write_atomic() {
+    fn a_replaced_write_lands_through_the_backends_replace() {
         // Delegated, not re-implemented: over a backend that leaves the
-        // default in place this is the familiar temp-sibling protocol, its
-        // own durable parent flush included.
+        // default in place this is the familiar temp-sibling staging, and
+        // its durability is the tier's single flush — not a per-file drain.
         let root = tmp("write-durable");
         std::fs::write(root.join("bookmark"), "old").unwrap();
         let fs = RecordingFs::local();
@@ -455,10 +478,6 @@ mod tests {
                 FsEvent::Write(tmp_name.clone()),
                 FsEvent::Sync(tmp_name.clone(), Durability::Ordered),
                 FsEvent::Rename(tmp_name, root.join("bookmark")),
-                // `write_atomic`'s own flush, then the tier's — the second
-                // is redundant here and harmless, and disappears the moment
-                // any other op shares the tier.
-                FsEvent::Sync(root.clone(), Durability::Durable),
                 FsEvent::Sync(root.clone(), Durability::Durable),
             ]
         );
