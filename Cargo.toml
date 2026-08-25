@@ -1,6 +1,6 @@
 [package]
 name = "fs-transaction"
-version = "0.1.0"
+version = "0.2.0"
 description = "Multi-file filesystem transactions that survive a crash: staged change sets, all-or-nothing apply, write-ahead recovery"
 edition = "2024"
 # Edition 2024 needs 1.85, but the crate also uses `if let … && let …`

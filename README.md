@@ -11,7 +11,7 @@ database — nothing here changes how your tree is *read*, only how it is
 
 ```toml
 [dependencies]
-fs-transaction = "0.1"
+fs-transaction = "0.2"
 ```
 
 ```rust
