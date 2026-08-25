@@ -1067,6 +1067,49 @@ mod tests {
     }
 
     #[test]
+    fn a_freshly_made_home_is_flushed_before_the_intent_is_trusted_to_it() {
+        // The commit point is only as durable as the chain of names holding
+        // it: a journal file flushed into a directory whose own entry was
+        // never flushed is one a power cut deletes wholesale — a
+        // half-applied set with no record to roll forward. Every directory
+        // the home's making mints must be flushed durable before the journal
+        // is written.
+        let base = tmp("homed-flush");
+        let home = base.join("nested/journals");
+        let journal = Journal::default().kept_in(&home).unwrap();
+        let root = tmp("homed-flush-root");
+
+        let fs = crate::fs_faults::RecordingFs::local();
+        let mut cs = crate::ChangeSet::new();
+        cs.write("a.md", "a");
+        cs.write("b.md", "b");
+        block_on(journal.apply(&cs, &fs, &root)).unwrap();
+
+        let events = fs.events();
+        let journal_written = events
+            .iter()
+            .position(|e| matches!(e, crate::fs_faults::FsEvent::Write(p) if journal.owns_path(p)))
+            .expect("the journal must be written");
+        for dir in [base, home.parent().unwrap().to_path_buf(), home] {
+            let flushed = events.iter().position(|e| {
+                matches!(e, crate::fs_faults::FsEvent::Sync(p, crate::fs::Durability::Durable)
+                    if *p == dir)
+            });
+            match flushed {
+                Some(at) => assert!(
+                    at < journal_written,
+                    "{} flushed only after the journal was written",
+                    dir.display()
+                ),
+                None => panic!(
+                    "{} never flushed durable; events: {events:?}",
+                    dir.display()
+                ),
+            }
+        }
+    }
+
+    #[test]
     fn the_pre_extraction_magic_still_replays() {
         // A journal written by `prov` before this crate was lifted out of it
         // carries the older stamp. The format is identical, and the only tree

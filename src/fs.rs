@@ -974,6 +974,44 @@ impl SyncGuarantee {
     }
 }
 
+/// Create `dir` and every missing parent, returning the directories whose
+/// entry set the creation changed: each directory made, plus the deepest
+/// pre-existing ancestor, which received the topmost new name. Empty when
+/// `dir` already existed.
+///
+/// The return value is the flush list a caller owes. A directory entry is its
+/// own write, persisting separately from anything under it — so a
+/// `create_dir_all` nobody flushes is a chain of names a power cut can take
+/// back, leaving a durably-flushed file inside a directory that no longer
+/// exists. [`crate::ordered`] flushes the list with each tier and the journal
+/// flushes it before committing intent into a fresh
+/// [home](crate::Journal::kept_in); the walk costs one existence probe per
+/// ancestor, and nothing at all past the first one that already exists.
+pub(crate) async fn create_dir_all_traced<FS: Storage>(
+    fs: &FS,
+    dir: &Path,
+) -> io::Result<Vec<PathBuf>> {
+    let mut changed = Vec::new();
+    let mut cur = Some(dir);
+    while let Some(d) = cur {
+        if fs.try_exists(d).await? {
+            // The deepest ancestor that already exists gains the topmost new
+            // entry — but only if anything is being created at all.
+            if !changed.is_empty() {
+                changed.push(d.to_path_buf());
+            }
+            break;
+        }
+        changed.push(d.to_path_buf());
+        cur = parent_dir(d);
+    }
+    if changed.is_empty() {
+        return Ok(changed);
+    }
+    fs.create_dir_all(dir).await?;
+    Ok(changed)
+}
+
 /// The directory holding `path`, when there is one to name. `Path::parent`
 /// answers `Some("")` for a bare relative filename like `index.md` — the
 /// process's current directory, which this crate neither holds a path to nor owns —

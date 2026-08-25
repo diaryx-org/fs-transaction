@@ -271,11 +271,17 @@ async fn apply_tier<FS: Storage>(
 
     for op in tier {
         let full = root.join(op.path());
-        if let Some(dir) = full.parent() {
-            fs.create_dir_all(dir).await?;
-        }
         if let Some(dir) = parent_dir(&full) {
             dirs.insert(dir.to_path_buf());
+            // Directories the op's path freshly mints are entries of their
+            // own, each persisting separately from the file that prompted
+            // them — so every one of them (and the pre-existing ancestor
+            // that received the topmost new name) joins the tier's flush
+            // list, or a power cut takes the whole chain back out from
+            // under a durably-flushed file.
+            for made in crate::fs::create_dir_all_traced(fs, dir).await? {
+                dirs.insert(made);
+            }
         }
         match op {
             BatchOp::Write { bytes, .. } if atomic_replace => {
@@ -384,12 +390,44 @@ mod tests {
             vec![
                 FsEvent::CreateNew(root.join("blobs/a")),
                 FsEvent::Sync(root.join("blobs/a"), Durability::Ordered),
+                // The root is flushed too: it gained the `blobs` entry, and
+                // a directory entry persists separately from what it names.
+                FsEvent::Sync(root.clone(), Durability::Ordered),
                 FsEvent::Sync(root.join("blobs"), Durability::Ordered),
                 FsEvent::CreateNew(root.join("rev")),
                 FsEvent::Sync(root.join("rev"), Durability::Durable),
                 FsEvent::Sync(root.clone(), Durability::Durable),
             ]
         );
+    }
+
+    #[test]
+    fn a_freshly_minted_directory_chain_is_flushed_link_by_link() {
+        // Every directory the op's path creates is an entry of its own — a
+        // durable file inside a chain of unflushed names is a file a power
+        // cut can orphan. The flush list must hold the whole chain plus the
+        // pre-existing ancestor that received the topmost new name.
+        let root = tmp("chain");
+        let fs = RecordingFs::local();
+        let mut batch = OrderedBatch::new();
+        batch.create_new("a/b/c/blob", "bytes");
+        block_on(batch.apply(&fs, &root, Durability::Durable)).unwrap();
+
+        for dir in [
+            root.clone(),
+            root.join("a"),
+            root.join("a/b"),
+            root.join("a/b/c"),
+        ] {
+            assert!(
+                fs.events()
+                    .iter()
+                    .any(|e| matches!(e, FsEvent::Sync(p, Durability::Durable) if *p == dir)),
+                "{} never flushed; events: {:?}",
+                dir.display(),
+                fs.events()
+            );
+        }
     }
 
     #[test]

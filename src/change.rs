@@ -459,11 +459,18 @@ impl Journal {
         // single document. `write_atomic` flushes it, so a crash finds the
         // journal whole or not at all — never half-written. A journal kept
         // outside the root may be pointed at a directory nothing has made yet
-        // (a cache directory on a fresh machine), so its home is made here;
-        // the root itself needs no such courtesy, since a tree being applied
-        // to exists.
+        // (a cache directory on a fresh machine), so its home is made here —
+        // and every directory the making mints is flushed durable before the
+        // intent is trusted to live there, because a commit point inside a
+        // chain of unflushed names is one a power cut can take back whole:
+        // the journal file durable, the directory naming it gone, and a
+        // half-applied set with no record to roll forward. `write_atomic`
+        // flushes the home itself; the chain above it is owed here. The root
+        // needs no such courtesy, since a tree being applied to exists.
         if let Some(home) = self.home() {
-            fs.create_dir_all(home).await?;
+            for made in crate::fs::create_dir_all_traced(fs, home).await? {
+                fs.sync(&made, crate::fs::Durability::Durable).await?;
+            }
         }
         fs.write_atomic(&journal, &crate::journal::encode(&changes.ops)?)
             .await?;
