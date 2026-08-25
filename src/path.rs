@@ -52,6 +52,18 @@ pub fn escapes_root(path: impl AsRef<Path>) -> bool {
     )
 }
 
+/// Refuse a staged path that would resolve outside the root — the guard both
+/// [`ChangeSet::apply`](crate::ChangeSet::apply) and
+/// [`OrderedBatch::apply`](crate::OrderedBatch::apply) clamp every op through.
+/// Defers to [`escapes_root`], so a caller that guards its *reads* with the
+/// same function clamps both directions to the exact same boundary.
+pub(crate) fn guard_in_root(path: &Path) -> crate::error::Result<()> {
+    if escapes_root(path) {
+        return Err(crate::error::Error::Escape(path.to_path_buf()));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

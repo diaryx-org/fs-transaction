@@ -61,6 +61,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{Error, Result};
 use crate::fs::Storage;
 use crate::journal::Journal;
+use crate::path::guard_in_root;
 
 /// One staged filesystem operation. Paths are **root-relative** — the root
 /// is joined on at [`apply`](ChangeSet::apply) time, so a set is portable
@@ -714,16 +715,6 @@ async fn unwind<FS: Storage>(fs: &FS, undo: Vec<Undo>) -> Result<()> {
         Some(e) => Err(e.into()),
         None => Ok(()),
     }
-}
-
-/// Refuse a staged path that would resolve outside the root. Defers to
-/// [`crate::path::escapes_root`], so a caller that guards its *reads* with the
-/// same function clamps both directions to the exact same boundary.
-fn guard_in_root(path: &Path) -> Result<()> {
-    if crate::path::escapes_root(path) {
-        return Err(Error::Escape(path.to_path_buf()));
-    }
-    Ok(())
 }
 
 /// Create `full`'s parent directory if it is missing. Unconditional (rather than

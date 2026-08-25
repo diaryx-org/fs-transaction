@@ -912,12 +912,30 @@ impl Capabilities {
 /// cheaply is free to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Durability {
-    /// Everything written to the path before this call must land before anything
-    /// written after it. It says nothing about *when*: a crash may still lose
-    /// the lot, only never a suffix without its prefix. This is all
-    /// [`Storage::write_atomic`] needs from its staging flush — the rename must
-    /// not be seen before the bytes it publishes — and on Apple platforms it is
-    /// the difference between a barrier and draining the drive's write cache.
+    /// A barrier: everything this backend was asked to write before this call —
+    /// to the named path *or to any other* — must land before anything written
+    /// after it. It says nothing about *when*: a crash may still lose the lot,
+    /// only never a suffix without its prefix.
+    ///
+    /// The barrier is backend-wide on purpose, not scoped to the one path
+    /// named. [`Storage::write_atomic`] only needs the narrow reading — the
+    /// rename must not be seen before the bytes it publishes — but
+    /// [`crate::ordered`] builds on the wide one: a batch whose second tier
+    /// must never be seen without its first is ordering writes to *different*
+    /// files against each other, and a "barrier" that only ordered a file
+    /// against itself could not say that. Both `fsync` (which completes the
+    /// named writes outright) and Apple's `F_BARRIERFSYNC` (a queue barrier
+    /// the whole device honors) keep the wide promise; a primitive that
+    /// orders only one file's own writes — `sync_file_range` and its kin —
+    /// does not, and a backend with nothing stronger must declare
+    /// [`SyncGuarantee::None`] rather than a barrier it cannot keep. On Apple
+    /// platforms the distinction from [`Durable`](Durability::Durable) is the
+    /// difference between a barrier and draining the drive's write cache.
+    ///
+    /// The wide promise has a corollary both protocols lean on: once any
+    /// *later* write is durably on disk, everything ordered before it is too —
+    /// a barrier followed by one durable flush makes the whole prefix durable,
+    /// without flushing it piece by piece.
     Ordered,
     /// Once the call returns, the bytes survive power loss.
     Durable,
@@ -961,7 +979,7 @@ impl SyncGuarantee {
 /// process's current directory, which this crate neither holds a path to nor owns —
 /// and that empty path is not something a backend can open, so it is folded in
 /// with "no parent" here rather than at each call site.
-fn parent_dir(path: &Path) -> Option<&Path> {
+pub(crate) fn parent_dir(path: &Path) -> Option<&Path> {
     path.parent().filter(|p| !p.as_os_str().is_empty())
 }
 
@@ -969,8 +987,9 @@ fn parent_dir(path: &Path) -> Option<&Path> {
 /// write through before renaming it into place. A dotted, suffixed name in the
 /// target's own directory: dotted and suffixed so it will not collide with a
 /// real file, and a *sibling* so the rename that follows never crosses a
-/// filesystem boundary.
-fn temp_sibling(path: &Path) -> PathBuf {
+/// filesystem boundary. Shared with [`crate::ordered`], whose replaced writes
+/// stage through the same dance minus the final directory flush.
+pub(crate) fn temp_sibling(path: &Path) -> PathBuf {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     path.with_file_name(format!(".{name}.fstx-tmp"))
 }

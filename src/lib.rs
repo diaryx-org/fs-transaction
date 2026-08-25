@@ -14,6 +14,13 @@
 //! database — nothing here changes how the tree is read, only how it is
 //! written.
 //!
+//! All-or-nothing is not the only crash discipline here. Where every
+//! partially-written batch is a *legal* state — an append-only,
+//! content-addressed store — [`OrderedBatch`] provides durability and
+//! ordering without the journal: tiers of writes separated by barriers, a
+//! crash leaving some prefix of them, and no recovery step anywhere. See
+//! [`ordered`] for when each protocol is the right one.
+//!
 //! ```no_run
 //! use fs_transaction::{ChangeSet, StdFs, exec::block_on, recover};
 //! use std::path::Path;
@@ -56,6 +63,7 @@ pub mod error;
 pub mod exec;
 pub mod fs;
 pub mod journal;
+pub mod ordered;
 pub mod path;
 
 #[cfg(test)]
@@ -65,3 +73,4 @@ pub use change::{ChangeSet, FileOp};
 pub use error::{Error, Result};
 pub use fs::{InMemoryFs, ReadStorage, StdFs, Storage};
 pub use journal::{Journal, Recovered, recover};
+pub use ordered::{BatchOp, OrderedBatch};
