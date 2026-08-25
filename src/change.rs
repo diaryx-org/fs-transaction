@@ -451,14 +451,18 @@ impl Journal {
             // only purpose is to hold the old bytes for a rollback that cannot
             // happen here, goes with it.
             //
-            // The flush debt is still owed: a lone write settles its own (via
-            // `write_atomic`) and flushes nothing here, but a lone rename or
-            // remove edits directory entries nothing else will flush, and
-            // `Ok` from this crate means the op outlives a power cut — for a
-            // set of one exactly as for a set of many.
+            // The flush debt is still owed: a lone rename or remove edits
+            // directory entries nothing else will flush, and `Ok` from this
+            // crate means the op outlives a power cut — for a set of one
+            // exactly as for a set of many. The one honest caveat, the same
+            // one `write_atomic` has always had: if the certifying flush
+            // itself fails, the op has landed but `Ok` is withheld, and with
+            // no journal and no undo there is nothing to roll back — the
+            // error is the flush's, and the caller knows the op is at most
+            // applied-but-uncertified.
             let mut touched = BTreeSet::new();
             exec(fs, root, &changes.ops[0], None, &mut touched).await?;
-            return Ok(crate::fs::flush_all_durable(fs, touched).await?);
+            return Ok(crate::fs::flush_all_durable(fs, touched, root).await?);
         }
         // The commit point: durably record the whole intent before touching a
         // single document. `write_atomic` flushes it, so a crash finds the
@@ -482,98 +486,191 @@ impl Journal {
 
         let mut undo: Vec<Undo> = Vec::new();
         let mut touched = BTreeSet::new();
+        let mut cause: Option<Error> = None;
         for op in &changes.ops {
-            let Err(cause) = exec(fs, root, op, Some(&mut undo), &mut touched).await else {
-                continue;
-            };
-            return Err(match unwind_durable(fs, undo, &journal).await {
+            if let Err(e) = exec(fs, root, op, Some(&mut undo), &mut touched).await {
+                cause = Some(e);
+                break;
+            }
+        }
+        // Applied cleanly — now make that mean something across a power cut.
+        // `exec` barriered every name-unstable debt as it ran; what remains
+        // is the stable ones (edited directories, fresh chains), flushed as
+        // barriers capped by one drain of the root, so the whole set survives
+        // before the journal that certifies it is given up. A certification
+        // that *fails* is treated exactly as a failed op — the set rolls
+        // back — because "applied, but perhaps not durable" is neither of
+        // the two endpoints `Ok` and `Err` name.
+        if cause.is_none()
+            && let Err(e) = crate::fs::flush_all_durable(fs, touched, root).await
+        {
+            cause = Some(e.into());
+        }
+        if let Some(cause) = cause {
+            return Err(match unwind_durable(fs, undo, root, &journal).await {
                 // Reverted cleanly and durably: the abort is now a fact a
                 // power cut cannot contradict, so the cause alone is the
                 // answer.
                 Ok(()) => cause,
-                // Could not revert (or could not certify the reversion): the
-                // journal is kept — or may still exist — so recovery rolls
-                // the set forward to the consistent applied state.
+                // Could not revert, or could not certify the reversion: the
+                // journal is kept where possible, so recovery rolls the set
+                // forward to the consistent applied state.
                 Err(rollback) => Error::Torn {
                     cause: cause.to_string(),
                     rollback: rollback.to_string(),
                 },
             });
         }
-        // Applied cleanly — now make that mean something across a power cut.
-        // `write_atomic` settled each write's own debt as it ran; what remains
-        // is everything `exec` collected (renamed and removed entries, flipped
-        // bits, fresh directory chains), flushed here as barriers capped by
-        // one durable sync, so the whole set survives before the journal that
-        // certifies it is given up.
-        crate::fs::flush_all_durable(fs, touched).await?;
         // The deletion itself is deliberately *not* flushed: if a crash
         // resurrects the journal, the ops it names are already durable and
         // replay is idempotent, so the next recovery no-ops through it and
         // clears it — the designed-for state, at the price of at most one
         // StaleJournal prompt.
-        fs.remove_file(&journal).await?;
-        Ok(())
+        match fs.remove_file(&journal).await {
+            Ok(()) => Ok(()),
+            // The set is applied and certified durable; only the journal's
+            // retirement failed. Rolling a *certified* change back over a
+            // delete error would be strictly worse, and a plain `Err` would
+            // claim an abort that did not happen — so this is `Torn`, whose
+            // contract fits exactly: the tree is at a nameable state, and
+            // the surviving journal makes the next recovery an idempotent
+            // no-op replay that clears it.
+            Err(e) => Err(Error::Torn {
+                cause: format!(
+                    "the set applied and was certified durable, but its journal \
+                     could not be retired: {e}"
+                ),
+                rollback: "the surviving journal will be replayed idempotently and \
+                           cleared by the next recovery"
+                    .to_string(),
+            }),
+        }
     }
 }
 
-/// Reverse every recorded op and make the reversion durable, then durably
+/// Reverse every recorded op, certify the reversion durable, then durably
 /// retire `journal` — the abort-side counterpart of the flush `apply` runs on
-/// success.
+/// success, with the unwind folded in.
 ///
-/// The order is the argument. First the unwind itself; then a barrier on
-/// everything it put back; then the journal's deletion; then one durable
-/// flush of the directory that held it, which — by [`Durability::Ordered`]'s
-/// corollary — carries the restored state through with it. Only after all
-/// four is `Err` a promise: the tree is *before* the set, durably, and no
-/// later recovery can roll the aborted set forward, because the journal's
-/// absence is as durable as the state it certified. A failure anywhere in
-/// the sequence leaves the journal (or its ghost) on disk, and the caller
-/// gets [`Error::Torn`] — recovery will complete the set forward, which is a
-/// nameable state, where "aborted, unless the power went out" is not.
+/// Folded in because the barriers must interleave: a step that writes bytes
+/// barriers them *immediately*, while the name it wrote still resolves — a
+/// later step may move it (the reversed order of a rename-then-edit set does
+/// exactly that), and a barrier deferred to the end would be addressed to
+/// nothing and quietly no-op. Directory debts are stable names and batch.
+/// Best-effort like the unwind it absorbs: a step that fails does not abandon
+/// the rest — the more that is put back the better — and the first failure is
+/// what gets reported, with the journal left standing so recovery can roll
+/// the set forward to the nameable applied state.
 ///
-/// [`Durability::Ordered`]: crate::fs::Durability::Ordered
-async fn unwind_durable<FS: Storage>(fs: &FS, undo: Vec<Undo>, journal: &Path) -> Result<()> {
-    // The flush list is computed before the unwind consumes the steps: every
-    // path a reversal writes, every directory whose entries it edits.
-    let mut touched = BTreeSet::new();
-    for step in &undo {
-        match step {
-            // The file existed, so its parent's entry is unchanged; the
-            // rewritten bytes are the debt.
-            Undo::Restore { path, .. } => {
-                touched.insert(path.clone());
+/// The certification order is the argument. Barriers; then, for a
+/// [homed](crate::Journal::kept_in) journal, one drain of the root — the home
+/// may live on another device, whose drain proves nothing about the tree's —
+/// making the restored state a fact; then the journal's deletion; then one
+/// drain of the journal's own directory, making the retirement a fact too.
+/// When the journal lives in the root the two caps collapse into one, placed
+/// after the deletion so it certifies both. Only after all of it is `Err` a
+/// promise: durably before the set, with no journal for a later recovery to
+/// contradict the abort with. A failure *after* the deletion leaves the abort
+/// certified but its retirement not — still [`Error::Torn`]'s territory, and
+/// still nameable: if the deletion survives, recovery finds nothing; if a
+/// power cut takes it back, recovery rolls the set forward.
+async fn unwind_durable<FS: Storage>(
+    fs: &FS,
+    undo: Vec<Undo>,
+    root: &Path,
+    journal: &Path,
+) -> Result<()> {
+    let mut first_error: Option<std::io::Error> = None;
+    let mut dirs: BTreeSet<PathBuf> = BTreeSet::new();
+    for step in undo.into_iter().rev() {
+        let result = match step {
+            Undo::Restore { path, bytes } => {
+                // The parent joins the debt even when a Restore born of an
+                // overwrite left it unchanged: the same variant reverses a
+                // `Remove`, whose reversal *re-creates* the entry, and an
+                // extra barrier on an unchanged directory costs less than
+                // telling the two origins apart.
+                if let Some(dir) = crate::fs::parent_dir(&path) {
+                    dirs.insert(dir.to_path_buf());
+                }
+                match fs.write(&path, &bytes).await {
+                    Ok(()) => fs.sync(&path, crate::fs::Durability::Ordered).await,
+                    e => e,
+                }
             }
-            Undo::Delete { path } | Undo::Relink { path, .. } => {
-                if let Some(dir) = crate::fs::parent_dir(path) {
-                    touched.insert(dir.to_path_buf());
+            // Already absent is already undone — see `Undo::Delete`. Reporting it
+            // would raise `Error::Torn` over the single most ordinary rollback
+            // there is: a write to a new file that failed before creating it.
+            Undo::Delete { path } => {
+                if let Some(dir) = crate::fs::parent_dir(&path) {
+                    dirs.insert(dir.to_path_buf());
+                }
+                match fs.remove_file(&path).await {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    other => other,
                 }
             }
             Undo::Rename { from, to } => {
-                for side in [from, to] {
+                for side in [&from, &to] {
                     if let Some(dir) = crate::fs::parent_dir(side) {
-                        touched.insert(dir.to_path_buf());
+                        dirs.insert(dir.to_path_buf());
                     }
                 }
+                fs.rename(&from, &to).await
             }
-            Undo::SetExecutable { path, .. } => {
-                touched.insert(path.clone());
-            }
-            // A link removed and bytes rewritten: entry and contents both.
-            Undo::RestoreOverLink { path, .. } => {
-                touched.insert(path.clone());
-                if let Some(dir) = crate::fs::parent_dir(path) {
-                    touched.insert(dir.to_path_buf());
+            Undo::SetExecutable { path, executable } => {
+                match fs.set_executable(&path, executable).await {
+                    // The inode, barriered while the name still resolves.
+                    Ok(()) => fs.sync(&path, crate::fs::Durability::Ordered).await,
+                    e => e,
                 }
             }
+            Undo::Relink { path, target } => {
+                if let Some(dir) = crate::fs::parent_dir(&path) {
+                    dirs.insert(dir.to_path_buf());
+                }
+                fs.set_link(&path, &target).await
+            }
+            // The link first, tolerantly (the `set_link` being reversed may
+            // have failed before creating it), and only then the bytes — a
+            // plain write while the link stands would land them in its target,
+            // which is also why a remove that fails for a real reason must
+            // stop the write rather than precede it.
+            Undo::RestoreOverLink { path, bytes } => {
+                if let Some(dir) = crate::fs::parent_dir(&path) {
+                    dirs.insert(dir.to_path_buf());
+                }
+                let removed = match fs.remove_file(&path).await {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    other => other,
+                };
+                match removed {
+                    Ok(()) => match fs.write(&path, &bytes).await {
+                        Ok(()) => fs.sync(&path, crate::fs::Durability::Ordered).await,
+                        e => e,
+                    },
+                    Err(e) => Err(e),
+                }
+            }
+        };
+        if let Err(e) = result
+            && first_error.is_none()
+        {
+            first_error = Some(e);
         }
     }
-    unwind(fs, undo).await?;
-    for path in touched {
-        fs.sync(&path, crate::fs::Durability::Ordered).await?;
+    if let Some(e) = first_error {
+        return Err(e.into());
+    }
+    for dir in dirs {
+        fs.sync(&dir, crate::fs::Durability::Ordered).await?;
+    }
+    let jparent = crate::fs::parent_dir(journal);
+    if jparent != Some(root) {
+        fs.sync(root, crate::fs::Durability::Durable).await?;
     }
     fs.remove_file(journal).await?;
-    match crate::fs::parent_dir(journal) {
+    match jparent {
         Some(dir) => Ok(fs.sync(dir, crate::fs::Durability::Durable).await?),
         None => Ok(()),
     }
@@ -633,7 +730,7 @@ async fn exec<FS: Storage>(
     fs: &FS,
     root: &Path,
     op: &FileOp,
-    undo: Option<&mut Vec<Undo>>,
+    mut undo: Option<&mut Vec<Undo>>,
     touched: &mut BTreeSet<PathBuf>,
 ) -> Result<()> {
     match op {
@@ -654,10 +751,21 @@ async fn exec<FS: Storage>(
             // debt the apply settles once, so ten writes into one directory
             // cost one drain rather than ten.
             fs.replace(&full, bytes).await?;
-            record_write_debt(fs, &full, touched);
+            settle_write_debt(fs, &full, touched).await?;
         }
         FileOp::Rename { from, to } => {
             let (from_full, to_full) = (root.join(from), root.join(to));
+            if let Some(undo) = undo.as_deref_mut() {
+                // The destination may be occupied, and the rename replaces
+                // the occupant — the port contract's load-bearing half. What
+                // it replaces is therefore part of "the tree as it was", and
+                // the rollback owes it back: captured here, *before* the
+                // Rename undo below, so the reversed unwind first moves the
+                // mover home and then restores the displaced occupant into
+                // the vacated name. An empty destination records a tolerant
+                // delete, which the rename-back has already satisfied.
+                capture_replaced(fs, &to_full, undo).await?;
+            }
             ensure_parent(fs, &to_full, touched).await?;
             fs.rename(&from_full, &to_full).await?;
             // Two directory entries changed — the name removed from one
@@ -720,7 +828,7 @@ async fn exec<FS: Storage>(
             }
             ensure_parent(fs, &full, touched).await?;
             fs.replace(&full, &bytes).await?;
-            record_write_debt(fs, &full, touched);
+            settle_write_debt(fs, &full, touched).await?;
         }
         FileOp::SetExecutable { path, executable } => {
             let full = root.join(path);
@@ -740,9 +848,16 @@ async fn exec<FS: Storage>(
                 }
             }
             fs.set_executable(&full, *executable).await?;
-            // A mode is inode metadata, persisting on the flush of the file
-            // itself — the one op whose debt is the path, not its parent.
-            touched.insert(full);
+            // A mode is inode metadata, and the inode is barriered *now*,
+            // while the name still resolves to it — a later op in this very
+            // set may rename or remove the name, and a flush deferred to the
+            // final pass would then be addressed to nothing and quietly
+            // no-op. The parent joins the batched debt instead: a stable
+            // name, and what keeps the final drain owed at all.
+            fs.sync(&full, crate::fs::Durability::Ordered).await?;
+            if let Some(dir) = crate::fs::parent_dir(&full) {
+                touched.insert(dir.to_path_buf());
+            }
         }
         FileOp::SetLink { path, target } => {
             let full = root.join(path);
@@ -787,21 +902,24 @@ async fn exec<FS: Storage>(
     Ok(())
 }
 
-/// What one [`Storage::replace`] leaves for the set's final flush: the parent
-/// entry the rename published — and, on a backend that cannot replace
-/// atomically, the plainly-written bytes themselves, since there was no
-/// staging flush and no rename to fold their naming into.
-pub(crate) fn record_write_debt<FS: Storage>(
+/// Settle what one [`Storage::replace`] leaves behind: the parent entry the
+/// rename published joins the batched debt, and on a backend that cannot
+/// replace atomically the plainly-written bytes are barriered *here* — while
+/// the name still resolves to them, since a later op in the same set may
+/// rename or remove it, and a flush deferred to the final pass would then be
+/// addressed to nothing. The final drain makes the barrier durable.
+pub(crate) async fn settle_write_debt<FS: Storage>(
     fs: &FS,
     full: &Path,
     touched: &mut BTreeSet<PathBuf>,
-) {
+) -> Result<()> {
     if !fs.capabilities().atomic_replace {
-        touched.insert(full.to_path_buf());
+        fs.sync(full, crate::fs::Durability::Ordered).await?;
     }
     if let Some(dir) = crate::fs::parent_dir(full) {
         touched.insert(dir.to_path_buf());
     }
+    Ok(())
 }
 
 /// Refuse a [`FileOp::SetExecutable`] whose path holds a symbolic link.
@@ -866,52 +984,6 @@ async fn capture_replaced<FS: Storage>(fs: &FS, full: &Path, undo: &mut Vec<Undo
         },
     }
     Ok(())
-}
-
-/// Reverse every recorded op, last-applied first. Best-effort: a step that fails
-/// does not abandon the rest — the more that is put back the better — and the
-/// first failure is what gets reported.
-async fn unwind<FS: Storage>(fs: &FS, undo: Vec<Undo>) -> Result<()> {
-    let mut first_error = None;
-    for step in undo.into_iter().rev() {
-        let result = match step {
-            Undo::Restore { path, bytes } => fs.write(&path, &bytes).await,
-            // Already absent is already undone — see `Undo::Delete`. Reporting it
-            // would raise `Error::Torn` over the single most ordinary rollback
-            // there is: a write to a new file that failed before creating it.
-            Undo::Delete { path } => match fs.remove_file(&path).await {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                other => other,
-            },
-            Undo::Rename { from, to } => fs.rename(&from, &to).await,
-            Undo::SetExecutable { path, executable } => fs.set_executable(&path, executable).await,
-            Undo::Relink { path, target } => fs.set_link(&path, &target).await,
-            // The link first, tolerantly (the `set_link` being reversed may
-            // have failed before creating it), and only then the bytes — a
-            // plain write while the link stands would land them in its target,
-            // which is also why a remove that fails for a real reason must
-            // stop the write rather than precede it.
-            Undo::RestoreOverLink { path, bytes } => {
-                let removed = match fs.remove_file(&path).await {
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    other => other,
-                };
-                match removed {
-                    Ok(()) => fs.write(&path, &bytes).await,
-                    Err(e) => Err(e),
-                }
-            }
-        };
-        if let Err(e) = result
-            && first_error.is_none()
-        {
-            first_error = Some(e);
-        }
-    }
-    match first_error {
-        Some(e) => Err(e.into()),
-        None => Ok(()),
-    }
 }
 
 /// Clamp every path a sequence of ops names to the root it will run against.
@@ -1470,9 +1542,11 @@ mod tests {
                 FsEvent::Rename(root.join("a.md"), root.join("sub/b.md")),
                 FsEvent::Remove(root.join("c.md")),
                 // The debt: both touched directories, barriers capped by one
-                // drain, and only then the journal.
-                FsEvent::Sync(root.clone(), crate::fs::Durability::Ordered),
-                FsEvent::Sync(root.join("sub"), crate::fs::Durability::Durable),
+                // drain of the root — the anchor, which always exists, where
+                // whichever debt happened to sort last might not — and only
+                // then the journal.
+                FsEvent::Sync(root.join("sub"), crate::fs::Durability::Ordered),
+                FsEvent::Sync(root.clone(), crate::fs::Durability::Durable),
                 FsEvent::Remove(journal),
             ]
         );
@@ -1523,7 +1597,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_lone_exec_flip_flushes_the_inode_it_edited() {
-        // A mode is inode metadata: the debt is the file itself.
+        // A mode is inode metadata: the inode is barriered while its name
+        // still resolves, and the anchored drain makes the barrier durable.
         let root = tmp("lone-exec-flush");
         std::fs::write(root.join("run.sh"), "#!/bin/sh").unwrap();
         let fs = RecordingFs::local();
@@ -1535,9 +1610,65 @@ mod tests {
             fs.events(),
             vec![
                 FsEvent::SetExecutable(root.join("run.sh"), true),
-                FsEvent::Sync(root.join("run.sh"), crate::fs::Durability::Durable),
+                FsEvent::Sync(root.join("run.sh"), crate::fs::Durability::Ordered),
+                FsEvent::Sync(root.clone(), crate::fs::Durability::Durable),
             ]
         );
+    }
+
+    /// A recording double whose `n`th non-journal write fails — the lever for
+    /// exercising the rollback paths while still reading the event stream.
+    struct FailingRecorder {
+        inner: RecordingFs,
+        writes: std::cell::Cell<usize>,
+        fail_at: usize,
+    }
+    impl crate::fs::ReadStorage for FailingRecorder {
+        async fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+            self.inner.read(path).await
+        }
+        async fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+            self.inner.read_to_string(path).await
+        }
+        async fn read_dir(&self, path: &Path) -> std::io::Result<Vec<crate::fs::DirEntry>> {
+            self.inner.read_dir(path).await
+        }
+        async fn metadata(&self, path: &Path) -> std::io::Result<crate::fs::Metadata> {
+            self.inner.metadata(path).await
+        }
+        async fn read_link(&self, path: &Path) -> std::io::Result<Option<PathBuf>> {
+            self.inner.read_link(path).await
+        }
+    }
+    impl Storage for FailingRecorder {
+        async fn write(&self, path: &Path, contents: &[u8]) -> std::io::Result<()> {
+            if !Journal::default().owns_path(path) {
+                let n = self.writes.get();
+                self.writes.set(n + 1);
+                if n == self.fail_at {
+                    return Err(std::io::Error::other("disk full (test)"));
+                }
+            }
+            self.inner.write(path, contents).await
+        }
+        async fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
+            self.inner.create_dir_all(path).await
+        }
+        async fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+            self.inner.remove_file(path).await
+        }
+        async fn remove_dir_all(&self, path: &Path) -> std::io::Result<()> {
+            self.inner.remove_dir_all(path).await
+        }
+        async fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            self.inner.rename(from, to).await
+        }
+        fn capabilities(&self) -> crate::fs::Capabilities {
+            self.inner.capabilities()
+        }
+        async fn sync(&self, path: &Path, need: crate::fs::Durability) -> std::io::Result<()> {
+            self.inner.sync(path, need).await
+        }
     }
 
     #[test]
@@ -1546,66 +1677,11 @@ mod tests {
         // flushed, the journal's deletion made durable — so a power cut right
         // after the abort cannot resurrect the journal for the next recovery
         // to roll the aborted set forward.
-        use std::cell::Cell;
-
-        struct FailingRecorder {
-            inner: RecordingFs,
-            writes: Cell<usize>,
-            fail_at: usize,
-        }
-        impl crate::fs::ReadStorage for FailingRecorder {
-            async fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
-                self.inner.read(path).await
-            }
-            async fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
-                self.inner.read_to_string(path).await
-            }
-            async fn read_dir(&self, path: &Path) -> std::io::Result<Vec<crate::fs::DirEntry>> {
-                self.inner.read_dir(path).await
-            }
-            async fn metadata(&self, path: &Path) -> std::io::Result<crate::fs::Metadata> {
-                self.inner.metadata(path).await
-            }
-            async fn read_link(&self, path: &Path) -> std::io::Result<Option<PathBuf>> {
-                self.inner.read_link(path).await
-            }
-        }
-        impl Storage for FailingRecorder {
-            async fn write(&self, path: &Path, contents: &[u8]) -> std::io::Result<()> {
-                if !Journal::default().owns_path(path) {
-                    let n = self.writes.get();
-                    self.writes.set(n + 1);
-                    if n == self.fail_at {
-                        return Err(std::io::Error::other("disk full (test)"));
-                    }
-                }
-                self.inner.write(path, contents).await
-            }
-            async fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
-                self.inner.create_dir_all(path).await
-            }
-            async fn remove_file(&self, path: &Path) -> std::io::Result<()> {
-                self.inner.remove_file(path).await
-            }
-            async fn remove_dir_all(&self, path: &Path) -> std::io::Result<()> {
-                self.inner.remove_dir_all(path).await
-            }
-            async fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
-                self.inner.rename(from, to).await
-            }
-            fn capabilities(&self) -> crate::fs::Capabilities {
-                self.inner.capabilities()
-            }
-            async fn sync(&self, path: &Path, need: crate::fs::Durability) -> std::io::Result<()> {
-                self.inner.sync(path, need).await
-            }
-        }
-
         let root = tmp("abort-durable");
         std::fs::write(root.join("existing.md"), "before").unwrap();
         let fs = FailingRecorder {
             inner: RecordingFs::local(),
-            writes: Cell::new(0),
+            writes: std::cell::Cell::new(0),
             fail_at: 1,
         };
         let mut cs = ChangeSet::new();
@@ -1616,15 +1692,17 @@ mod tests {
         assert_eq!(read(&root, "existing.md").as_deref(), Some("before"));
 
         // The tail of the event stream is the abort's certification: restored
-        // state barriered, the journal removed, its directory drained.
+        // bytes barriered the moment they land (while their name still
+        // resolves), the edited directories barriered after, the journal
+        // removed, and its directory drained.
         let journal = Journal::default().path_in(&root);
         let events = fs.inner.events();
         let tail = &events[events.len() - 4..];
         assert_eq!(
             tail,
             &[
-                FsEvent::Sync(root.clone(), crate::fs::Durability::Ordered),
                 FsEvent::Sync(root.join("existing.md"), crate::fs::Durability::Ordered),
+                FsEvent::Sync(root.clone(), crate::fs::Durability::Ordered),
                 FsEvent::Remove(journal),
                 FsEvent::Sync(root.clone(), crate::fs::Durability::Durable),
             ],
@@ -1653,6 +1731,189 @@ mod tests {
             .filter(|e| matches!(e, FsEvent::Sync(_, crate::fs::Durability::Durable)))
             .count();
         assert_eq!(drains, 2, "events: {:?}", fs.events());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_flipped_bit_survives_its_name_being_renamed_away() {
+        // The trap the anchored flush exists for: the flip's debt is a name,
+        // and a later op in the same set moves it. The inode must be
+        // barriered while the name still resolves, and the one drain must
+        // land on a path that still exists — the root — never on whichever
+        // stale name happened to sort last, which `sync` would answer with a
+        // silent no-op.
+        let root = tmp("flip-then-rename");
+        std::fs::write(root.join("z.sh"), "#!/bin/sh").unwrap();
+        let fs = RecordingFs::local();
+        let mut cs = ChangeSet::new();
+        cs.set_executable("z.sh", true);
+        cs.rename("z.sh", "a.sh");
+        block_on(cs.apply(&fs, &root)).unwrap();
+
+        assert!(is_executable(&root, "a.sh"));
+        let journal = Journal::default().path_in(&root);
+        let jtmp = crate::fs::temp_sibling(&journal);
+        assert_eq!(
+            fs.events(),
+            vec![
+                FsEvent::Write(jtmp.clone()),
+                FsEvent::Sync(jtmp.clone(), crate::fs::Durability::Ordered),
+                FsEvent::Rename(jtmp, journal.clone()),
+                FsEvent::Sync(root.clone(), crate::fs::Durability::Durable),
+                FsEvent::SetExecutable(root.join("z.sh"), true),
+                // The inode, while `z.sh` still names it.
+                FsEvent::Sync(root.join("z.sh"), crate::fs::Durability::Ordered),
+                FsEvent::Rename(root.join("z.sh"), root.join("a.sh")),
+                // The cap on the root — which exists — not on the stale name.
+                FsEvent::Sync(root.clone(), crate::fs::Durability::Durable),
+                FsEvent::Remove(journal),
+            ]
+        );
+    }
+
+    /// A recording double whose `sync` fails once, on the `n`th `Durable`
+    /// drain of `anchor` — the smallest lever that reaches the certification
+    /// paths without touching anything else.
+    struct FailNthDrain {
+        inner: RecordingFs,
+        anchor: PathBuf,
+        drains: std::cell::Cell<usize>,
+        fail_at: usize,
+    }
+    impl crate::fs::ReadStorage for FailNthDrain {
+        async fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+            self.inner.read(path).await
+        }
+        async fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+            self.inner.read_to_string(path).await
+        }
+        async fn read_dir(&self, path: &Path) -> std::io::Result<Vec<crate::fs::DirEntry>> {
+            self.inner.read_dir(path).await
+        }
+        async fn metadata(&self, path: &Path) -> std::io::Result<crate::fs::Metadata> {
+            self.inner.metadata(path).await
+        }
+        async fn read_link(&self, path: &Path) -> std::io::Result<Option<PathBuf>> {
+            self.inner.read_link(path).await
+        }
+    }
+    impl Storage for FailNthDrain {
+        async fn write(&self, path: &Path, contents: &[u8]) -> std::io::Result<()> {
+            self.inner.write(path, contents).await
+        }
+        async fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
+            self.inner.create_dir_all(path).await
+        }
+        async fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+            self.inner.remove_file(path).await
+        }
+        async fn remove_dir_all(&self, path: &Path) -> std::io::Result<()> {
+            self.inner.remove_dir_all(path).await
+        }
+        async fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            self.inner.rename(from, to).await
+        }
+        fn capabilities(&self) -> crate::fs::Capabilities {
+            self.inner.capabilities()
+        }
+        async fn sync(&self, path: &Path, need: crate::fs::Durability) -> std::io::Result<()> {
+            if need == crate::fs::Durability::Durable && path == self.anchor.as_path() {
+                let n = self.drains.get();
+                self.drains.set(n + 1);
+                if n == self.fail_at {
+                    return Err(std::io::Error::other("cannot drain (test)"));
+                }
+            }
+            self.inner.sync(path, need).await
+        }
+    }
+
+    #[test]
+    fn an_abort_flushes_the_entry_a_restored_removal_recreates() {
+        // Rolling back a Remove re-creates a directory entry; an abort that
+        // certified only the bytes would let a power cut keep the removal the
+        // caller was told never happened.
+        let root = tmp("abort-remove-entry");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/gone.md"), "kept after all").unwrap();
+
+        let fs = FailingRecorder {
+            inner: RecordingFs::local(),
+            writes: std::cell::Cell::new(0),
+            fail_at: 0,
+        };
+        let mut cs = ChangeSet::new();
+        cs.remove("sub/gone.md");
+        cs.write("doomed.md", "never lands");
+        block_on(cs.apply(&fs, &root)).unwrap_err();
+
+        assert_eq!(
+            read(&root, "sub/gone.md").as_deref(),
+            Some("kept after all")
+        );
+        let events = fs.inner.events();
+        let entry_flushed = events
+            .iter()
+            .position(|e| matches!(e, FsEvent::Sync(p, _) if *p == root.join("sub")));
+        let journal_retired = events
+            .iter()
+            .rposition(|e| matches!(e, FsEvent::Remove(p) if Journal::default().owns_path(p)));
+        match (entry_flushed, journal_retired) {
+            (Some(flush), Some(retire)) => assert!(
+                flush < retire,
+                "the recreated entry must be flushed before the journal goes; events: {events:?}"
+            ),
+            _ => panic!("expected a sub flush and a journal retirement; events: {events:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failed_certification_rolls_the_set_back() {
+        // "Applied, but perhaps not durable" is neither of the two endpoints
+        // Ok and Err name — so a flush that fails is treated exactly as a
+        // failed op, and the caller's Err still means durably-before.
+        let root = tmp("failed-certification");
+        std::fs::write(root.join("existing.md"), "before").unwrap();
+        // Drain #0 is the journal commit's parent flush; #1 is the set's
+        // certifying cap — the one that fails. The abort's own drain (#2)
+        // succeeds, so the rollback certifies cleanly.
+        let fs = FailNthDrain {
+            inner: RecordingFs::local(),
+            anchor: root.clone(),
+            drains: std::cell::Cell::new(0),
+            fail_at: 1,
+        };
+        let mut cs = ChangeSet::new();
+        cs.write("existing.md", "after");
+        cs.write("fresh.md", "fresh");
+        let err = block_on(cs.apply(&fs, &root)).unwrap_err();
+
+        assert!(matches!(err, Error::Io(_)), "a clean rollback: {err:?}");
+        assert_eq!(read(&root, "existing.md").as_deref(), Some("before"));
+        assert_eq!(read(&root, "fresh.md"), None);
+        assert!(
+            !Journal::default().path_in(&root).exists(),
+            "the abort durably retired the journal"
+        );
+    }
+
+    #[test]
+    fn a_failed_rename_set_restores_the_file_the_rename_displaced() {
+        // The destination's occupant is part of "the tree as it was": the
+        // rename replaces it (the port contract's load-bearing half), so the
+        // rollback owes it back — first the mover home, then the victim into
+        // the vacated name.
+        let root = tmp("rollback-rename-victim");
+        std::fs::write(root.join("a.md"), "the mover").unwrap();
+        std::fs::write(root.join("b.md"), "the victim").unwrap();
+
+        let mut cs = ChangeSet::new();
+        cs.rename("a.md", "b.md");
+        cs.write("doomed.md", "never lands");
+        block_on(cs.apply(&FailAtWrite::nth(0), &root)).unwrap_err();
+
+        assert_eq!(read(&root, "a.md").as_deref(), Some("the mover"));
+        assert_eq!(read(&root, "b.md").as_deref(), Some("the victim"));
     }
 
     #[test]

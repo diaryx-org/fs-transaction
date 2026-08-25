@@ -77,14 +77,20 @@ pub enum Error {
     /// refuses. Call [`recover`](crate::recover) first, then retry.
     StaleJournal(PathBuf),
 
-    /// A staged op failed *and* the rollback that should have undone it failed
-    /// too. The one case where the crate cannot say what is on disk — so it says
-    /// exactly that, rather than reporting the original failure as if the tree
-    /// were untouched.
+    /// The apply could not deliver either of its two durable answers. The
+    /// classic case: a staged op failed *and* the rollback that should have
+    /// undone it failed too. Two rarer ones share the shape — a rollback that
+    /// completed but whose certification (or the journal's retirement) could
+    /// not be made durable, and a set that applied and certified cleanly but
+    /// whose journal could not be removed. In every case the crate says
+    /// exactly what it can and cannot promise, rather than reporting a clean
+    /// endpoint it cannot stand behind.
     ///
-    /// The journal is deliberately left in place when this is returned, so the
-    /// next [`recover`](crate::recover) rolls the set *forward* to the applied
-    /// state. Either way the tree lands somewhere nameable.
+    /// The journal is left in place wherever possible, so the next
+    /// [`recover`](crate::recover) resolves the tree — rolling an uncertified
+    /// set *forward* to the applied state, or no-op replaying an applied one
+    /// and clearing the journal. Either way the tree lands somewhere
+    /// nameable.
     Torn {
         /// The failure that triggered the rollback.
         cause: String,

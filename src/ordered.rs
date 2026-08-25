@@ -227,7 +227,10 @@ impl OrderedBatch {
     /// mean only "no crash shows a later tier without an earlier one" — the
     /// batch itself may vanish with the crash, wholly or from some barrier
     /// on, and for a caller that treats its tree as append-only that is often
-    /// enough, at the cost of no drain of the device's cache at all.
+    /// enough, at the cost of not one `Durable` request anywhere. (Whether a
+    /// request is literally a drain is the backend's affair: without
+    /// `barrier-fsync`, `StdFs` answers even `Ordered` with the full flush —
+    /// stronger than asked, as ever.)
     ///
     /// On an error the apply stops where it stands and the tree holds a
     /// consistent prefix — see the module docs for exactly what that means
@@ -258,9 +261,11 @@ impl OrderedBatch {
 /// Land one tier and flush it to `need`.
 ///
 /// Files first, in staged order; then one flush per file that still owes one;
-/// then one flush per directory that gained a name. The directory flushes come
-/// last because they are what publish the tier's *names* — a name must never
-/// be ordered ahead of the bytes it stands for.
+/// then one flush per directory an op landed in (gained a name or not — an
+/// extra barrier on an unchanged directory costs less than proving it
+/// unchanged). The directory flushes come last because they are what publish
+/// the tier's *names* — a name must never be ordered ahead of the bytes it
+/// stands for.
 async fn apply_tier<FS: Storage>(
     fs: &FS,
     root: &Path,
@@ -320,7 +325,7 @@ async fn apply_tier<FS: Storage>(
             }
             Ok(())
         }
-        Durability::Durable => Ok(crate::fs::flush_all_durable(fs, debts).await?),
+        Durability::Durable => Ok(crate::fs::flush_all_durable(fs, debts, root).await?),
     }
 }
 
@@ -423,13 +428,19 @@ mod tests {
                 fs.events()
             );
         }
-        // Barriers throughout, capped by the one drain that makes them all
-        // durable — which must therefore come last.
-        assert!(
-            matches!(
-                fs.events().last(),
-                Some(FsEvent::Sync(_, Durability::Durable))
-            ),
+        // Barriers throughout, capped by exactly one drain that makes them
+        // all durable — which must therefore come last.
+        let drains: Vec<usize> = fs
+            .events()
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e, FsEvent::Sync(_, Durability::Durable)))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(drains.len(), 1, "events: {:?}", fs.events());
+        assert_eq!(
+            drains[0],
+            fs.events().len() - 1,
             "events: {:?}",
             fs.events()
         );

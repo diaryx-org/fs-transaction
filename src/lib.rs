@@ -54,6 +54,12 @@
 //! - **A set is bounded by memory.** Staged bytes and the undo buffer are both
 //!   held in memory for the length of the apply; [`FileOp::CopyFrom`] is the
 //!   escape hatch for a large payload already on disk.
+//! - **A root lives on one filesystem.** The staging renames assume it, and
+//!   so do the batched flushes: a barrier and the drain that caps it prove
+//!   nothing across a device boundary, so a root spanning a mount point is
+//!   outside the crash promises. The one cross-device case the crate itself
+//!   creates — a [journal homed](Journal::kept_in) on another volume — is
+//!   handled with its own drain.
 //! - **Futures are not required to be `Send`.** The port uses native
 //!   `async fn`, so a backend keeps its own future types — which means an
 //!   apply over a non-`Send` backend cannot be `tokio::spawn`ed.

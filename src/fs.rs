@@ -660,7 +660,11 @@ pub trait Storage: ReadStorage {
     /// replacement is native — a locked in-memory swap, a transactional
     /// store — overrides *this* method, and
     /// [`write_atomic`](Storage::write_atomic)'s default composes on top of
-    /// the override.
+    /// the override. An override claiming `atomic_replace` inherits step 2's
+    /// obligation along with the method: its bytes must be ordered ahead of
+    /// whatever publishes them before the call returns, because both
+    /// `write_atomic`'s composed default and the batched protocols add only
+    /// directory flushes afterwards, never a second look at the bytes.
     ///
     /// The temporary is removed on any failure, so a torn attempt leaves the
     /// target exactly as it was and no litter behind. It is a dotted sibling in
@@ -718,6 +722,11 @@ pub trait Storage: ReadStorage {
     /// bytes are flushed durable too, since there was no rename to fold their
     /// naming into. The right call for a standalone save; a protocol landing
     /// many files reaches for `replace` and batches the flushes instead.
+    ///
+    /// A backend that overrode this method wholesale under the old guidance
+    /// should move that override to [`replace`](Storage::replace): the
+    /// crate's own protocols now reach for `replace` directly, and an
+    /// override living only here is bypassed by every one of them.
     fn write_atomic(&self, path: &Path, contents: &[u8]) -> impl Future<Output = io::Result<()>> {
         async move {
             self.replace(path, contents).await?;
@@ -961,12 +970,28 @@ pub enum Durability {
     /// platforms the distinction from [`Durable`](Durability::Durable) is the
     /// difference between a barrier and draining the drive's write cache.
     ///
-    /// The wide promise has a corollary both protocols lean on: once any
-    /// *later* write is durably on disk, everything ordered before it is too —
-    /// a barrier followed by one durable flush makes the whole prefix durable,
-    /// without flushing it piece by piece.
+    /// The wide promise has a corollary the journal protocols lean on: once
+    /// any *later* write is durably on disk, everything ordered before it is
+    /// too — a barrier followed by one durable flush of what that later write
+    /// mutated makes the whole prefix durable, without flushing it piece by
+    /// piece.
     Ordered,
     /// Once the call returns, the bytes survive power loss.
+    ///
+    /// And not the named path's bytes alone: on a backend whose
+    /// [`Ordered`](Durability::Ordered) answers are true barriers rather than
+    /// flushes, a `Durable` answer is contractually a **drain** — everything
+    /// the backend accepted and barriered before this call lands durably with
+    /// it. This is the other half of the barrier's bargain, and it is not
+    /// derivable from ordering alone: a batch that barriers ten paths and
+    /// drains an eleventh has issued no write *after* the barriers for pure
+    /// ordering to hang the ten on. Both primitives this crate ships keep the
+    /// pair honestly — plain `fsync` because every "barrier" was a full flush
+    /// to begin with, `F_FULLFSYNC` because it drains the device's whole
+    /// cache — and a backend that can only drain the named object must answer
+    /// `Ordered` with a flush rather than a barrier, or declare
+    /// [`SyncGuarantee::None`]. The batched-flush protocols in this crate
+    /// (barriers capped by one drain) are licensed by this pairing.
     Durable,
 }
 
@@ -1042,29 +1067,43 @@ pub(crate) async fn create_dir_all_traced<FS: Storage>(
 }
 
 /// Make every path in `paths` durable at the price of one drain: a barrier on
-/// each, then durability asked of the last alone.
+/// each, then one [`Durable`](Durability::Durable) flush of `anchor`.
 ///
-/// This is [`Durability::Ordered`]'s documented corollary, cashed in: once any
-/// later write is durably on disk, everything ordered before it is too — so a
-/// list of barriers capped by one [`Durable`](Durability::Durable) flush makes
-/// the whole list durable, without flushing it piece by piece. On a plain-fsync
-/// backend the barriers were already full flushes and the cap costs nothing
-/// new; on a barrier backend (`barrier-fsync` on Apple) this is the difference
-/// between one drain of the drive's cache and one per path.
+/// This is the barrier-and-drain pairing [`Durability`] documents, cashed in:
+/// on a backend whose `Ordered` answers are full flushes, every barrier here
+/// already made its path durable and the cap adds nothing; on a backend whose
+/// `Ordered` is a true barrier, the `Durable` answer is contractually a drain
+/// that carries everything previously barriered with it. Either way the list
+/// is durable for one drain instead of one per path.
+///
+/// `anchor` — not the last debt — takes the drain, and it must be a path that
+/// **exists** and lives on the same filesystem as the debts: a tree's root, a
+/// journal's home. A debt can be a name a later operation moved or removed
+/// (a flipped file since renamed, a directory on a platform that declines
+/// directory syncs), and [`Storage::sync`] treats a missing path as a
+/// successful no-op — so a cap issued at whichever debt sorts last can
+/// silently issue *nothing*, and the entire batch's durability with it. The
+/// barriers tolerate that (a moved name's inode was barriered while the name
+/// was live, or is covered elsewhere); the one drain must not. A path equal
+/// to `anchor` is skipped in the barrier pass, since the cap covers it, and
+/// an empty `paths` owes nothing at all — the anchor is not flushed for its
+/// own sake.
 pub(crate) async fn flush_all_durable<FS: Storage>(
     fs: &FS,
     paths: impl IntoIterator<Item = PathBuf>,
+    anchor: &Path,
 ) -> io::Result<()> {
-    let mut last: Option<PathBuf> = None;
+    let mut owed = false;
     for path in paths {
-        if let Some(prev) = last.replace(path) {
-            fs.sync(&prev, Durability::Ordered).await?;
+        owed = true;
+        if path != anchor {
+            fs.sync(&path, Durability::Ordered).await?;
         }
     }
-    match last {
-        Some(cap) => fs.sync(&cap, Durability::Durable).await,
-        None => Ok(()),
+    if owed {
+        fs.sync(anchor, Durability::Durable).await?;
     }
+    Ok(())
 }
 
 /// The directory holding `path`, when there is one to name. `Path::parent`
@@ -1344,8 +1383,11 @@ mod tests {
 
     #[test]
     fn write_atomic_is_replace_plus_the_flushes_it_left_behind() {
-        // The composition, pinned: the same staging events, then the parent's
-        // durable flush — so a backend overriding only `replace` changes both.
+        // The composed default's event list, pinned: the same staging events
+        // `replace` alone produces, then the parent's durable flush. (That an
+        // overridden `replace` carries into `write_atomic` is pinned from the
+        // consumer side, by the InMemoryFs write_atomic tests — this double
+        // overrides neither.)
         let root = tmp("write-atomic-composed");
         let fs = crate::fs_faults::RecordingFs::local();
         block_on(fs.write_atomic(&root.join("doc.md"), b"bytes")).unwrap();

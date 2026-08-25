@@ -432,7 +432,7 @@ impl Journal {
         // are flushed — barriers capped by one durable sync — before the
         // journal goes; the deletion itself is not flushed, because a
         // resurrected journal replays idempotently over ops already durable.
-        crate::fs::flush_all_durable(fs, touched).await?;
+        crate::fs::flush_all_durable(fs, touched, root).await?;
         fs.remove_file(&journal).await?;
         Ok(Recovered::Applied(ops.len()))
     }
@@ -465,7 +465,7 @@ async fn replay<FS: Storage>(
             let full = root.join(path);
             ensure_parent(fs, &full, touched).await?;
             fs.replace(&full, bytes).await?;
-            crate::change::record_write_debt(fs, &full, touched);
+            crate::change::settle_write_debt(fs, &full, touched).await?;
         }
         // Idempotent for the same reason a `Write` is — with the bytes fetched
         // from the source rather than carried in the journal. That is sound
@@ -484,7 +484,7 @@ async fn replay<FS: Storage>(
             })?;
             ensure_parent(fs, &full, touched).await?;
             fs.replace(&full, &bytes).await?;
-            crate::change::record_write_debt(fs, &full, touched);
+            crate::change::settle_write_debt(fs, &full, touched).await?;
         }
         // A remove of a file already gone is the state we wanted, not a failure.
         FileOp::Remove { path } => {
@@ -508,7 +508,13 @@ async fn replay<FS: Storage>(
             let full = root.join(path);
             crate::change::guard_not_link(fs, &full).await?;
             fs.set_executable(&full, *executable).await?;
-            touched.insert(full);
+            // The inode barriered while the name still resolves — a later op
+            // in this same journal may rename or remove it — and the parent
+            // batched, on exec's own terms.
+            fs.sync(&full, crate::fs::Durability::Ordered).await?;
+            if let Some(dir) = crate::fs::parent_dir(&full) {
+                touched.insert(dir.to_path_buf());
+            }
         }
         // `set_link` replaces whatever is at the path, so replaying it lands
         // the same link whether the crash beat the op, interrupted it midway
