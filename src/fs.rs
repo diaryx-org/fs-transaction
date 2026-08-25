@@ -1102,21 +1102,22 @@ impl Storage for StdFs {
     }
 
     async fn sync(&self, path: &Path, need: Durability) -> io::Result<()> {
-        // `fsync` is the only flush in the standard library, and it is the strong
-        // one — so both requests are answered with it. Answering `Ordered` more
-        // cheaply means a platform-specific primitive (`F_BARRIERFSYNC` on Apple,
-        // `sync_file_range` on Linux) and the `libc` dependency that comes with
-        // it; a port that wants the cheaper answer can wrap this one and say so
-        // in its own `capabilities`, which is exactly what `SyncGuarantee` is for.
-        let _ = need;
-        sync_path(path)
+        // `sync_all` is the only flush in the standard library, and it is the
+        // strong one — on Apple platforms it is `F_FULLFSYNC`, a drain of the
+        // drive's whole write cache. By default both requests are answered
+        // with it: stronger than `Ordered` asked for, which a backend is
+        // always allowed to be. The `barrier-fsync` feature is the cheaper
+        // answer where one exists — `F_BARRIERFSYNC` on Apple, a queue
+        // barrier the device honors — and `sync_file` below is where the
+        // request-by-request choice lives.
+        sync_path(path, need)
     }
 }
 
-/// Flush exactly `path` — file or directory — so a preceding write or rename to
-/// it is durable. The one place a real OS difference lives, quarantined behind
-/// the port here rather than leaking up into the engine.
-fn sync_path(path: &Path) -> io::Result<()> {
+/// Flush exactly `path` — file or directory — to the strength `need` asks for.
+/// The one place a real OS difference lives, quarantined behind the port here
+/// rather than leaking up into the engine.
+fn sync_path(path: &Path, need: Durability) -> io::Result<()> {
     // A fresh read handle is enough: fsync acts on the inode, not the descriptor,
     // so it flushes writes made through any handle. A path that does not exist (a
     // fallback write that failed before creating it) has nothing to flush and is
@@ -1132,11 +1133,57 @@ fn sync_path(path: &Path) -> io::Result<()> {
         return Ok(());
     }
     match std::fs::File::open(path) {
-        Ok(file) => file.sync_all()?,
+        Ok(file) => sync_file(&file, need)?,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
     Ok(())
+}
+
+/// Flush one open handle to the strength `need` asks for — with the
+/// `barrier-fsync` feature on an Apple platform, the one place `Ordered` is
+/// answered more cheaply than `Durable`.
+#[cfg(all(feature = "barrier-fsync", target_vendor = "apple"))]
+fn sync_file(file: &std::fs::File, need: Durability) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    match need {
+        // A queue barrier: everything issued before it reaches the device
+        // before anything issued after, without waiting for the drive to
+        // drain its cache — which is the entire request `Ordered` makes, and
+        // on these platforms often the difference between microseconds and
+        // milliseconds. Works on files and directories alike.
+        Durability::Ordered => {
+            // SAFETY: `fcntl` with `F_BARRIERFSYNC` takes no argument beyond
+            // the descriptor, and `file` holds that descriptor open for the
+            // whole call.
+            if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) } != -1 {
+                return Ok(());
+            }
+            // A filesystem with no barrier support — a network mount, an
+            // exotic FUSE — refuses the fcntl. Plain `fsync` still keeps the
+            // ordering promise (the named writes reach the device before the
+            // call returns, so nothing later can precede them); it is
+            // `sync_all`'s `F_FULLFSYNC` that would overshoot here.
+            //
+            // SAFETY: as above — a plain fsync of a descriptor `file` keeps
+            // open.
+            if unsafe { libc::fsync(file.as_raw_fd()) } != -1 {
+                return Ok(());
+            }
+            Err(io::Error::last_os_error())
+        }
+        Durability::Durable => file.sync_all(),
+    }
+}
+
+/// Without the feature (or off Apple), both strengths are answered with
+/// `sync_all` — stronger than `Ordered` asked for, which a backend may always
+/// be, never weaker.
+#[cfg(not(all(feature = "barrier-fsync", target_vendor = "apple")))]
+fn sync_file(file: &std::fs::File, need: Durability) -> io::Result<()> {
+    let _ = need;
+    file.sync_all()
 }
 
 #[cfg(test)]
@@ -1264,5 +1311,20 @@ mod tests {
         // reaches only via a file's parent.
         let root = tmp("sync-dir");
         block_on(StdFs.sync(&root, Durability::Durable)).unwrap();
+    }
+
+    #[test]
+    fn sync_answers_both_strengths_on_files_and_directories() {
+        // With `barrier-fsync` on an Apple platform this exercises the
+        // F_BARRIERFSYNC path for `Ordered`; everywhere else it is `sync_all`
+        // twice. Either way both strengths must simply work, on both kinds of
+        // object, because both protocols ask for both.
+        let root = tmp("sync-strengths");
+        let file = root.join("doc.md");
+        std::fs::write(&file, "bytes").unwrap();
+        for need in [Durability::Ordered, Durability::Durable] {
+            block_on(StdFs.sync(&file, need)).unwrap();
+            block_on(StdFs.sync(&root, need)).unwrap();
+        }
     }
 }

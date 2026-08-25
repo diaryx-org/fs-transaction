@@ -13,9 +13,19 @@ license = "MIT OR Apache-2.0"
 keywords = ["filesystem", "transaction", "atomic", "crash-safety", "journal"]
 categories = ["filesystem", "asynchronous"]
 
-# No dependencies, on purpose. A crate whose whole job is to get bytes onto
-# disk correctly should not make you audit anyone else's code to trust it, and
-# should not pull a runtime into a build that already has one. The checksum is
-# hand-rolled FNV-1a and the error type is a hand-written enum for the same
-# reason.
+# No dependencies by default, on purpose. A crate whose whole job is to get
+# bytes onto disk correctly should not make you audit anyone else's code to
+# trust it, and should not pull a runtime into a build that already has one.
+# The checksum is hand-rolled FNV-1a and the error type is a hand-written enum
+# for the same reason. The one opt-in exception is `barrier-fsync`, which buys
+# a cheaper `Durability::Ordered` on Apple platforms at the price of `libc`.
 [dependencies]
+libc = { version = "0.2", optional = true }
+
+[features]
+# Answer `Durability::Ordered` with `F_BARRIERFSYNC` on Apple platforms — a
+# queue barrier — instead of `sync_all`, which is `F_FULLFSYNC` there and
+# drains the drive's entire write cache. Elsewhere (and without the feature)
+# every sync stays the full flush: always correct, since a backend may answer
+# stronger than asked, never weaker.
+barrier-fsync = ["dep:libc"]
