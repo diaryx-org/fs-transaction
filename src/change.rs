@@ -377,34 +377,7 @@ impl Journal {
         // `apply` also lands sets assembled from data it did not author,
         // and a link target that resolves to `../../../etc/passwd` must be refused
         // rather than let an apply write outside the tree it was pointed at.
-        for op in &changes.ops {
-            match op {
-                FileOp::Write { path, .. } | FileOp::Remove { path } => {
-                    guard_in_root(path)?;
-                }
-                FileOp::Rename { from, to } => {
-                    guard_in_root(from)?;
-                    guard_in_root(to)?;
-                }
-                // The source is clamped too: it is read, and a set assembled by a
-                // caller must not be able to pull `../../../etc/passwd` into the
-                // tree any more than it may write out of one.
-                FileOp::CopyFrom { path, source } => {
-                    guard_in_root(path)?;
-                    guard_in_root(source)?;
-                }
-                FileOp::SetExecutable { path, .. } => {
-                    guard_in_root(path)?;
-                }
-                // The link's own path is clamped; its *target* deliberately is
-                // not. Nothing is written through the target — it is recorded,
-                // not resolved — and a link is allowed to point wherever links
-                // point, outside the root included. See [`FileOp::SetLink`].
-                FileOp::SetLink { path, .. } => {
-                    guard_in_root(path)?;
-                }
-            }
-        }
+        guard_ops(&changes.ops)?;
         // Refuse to clobber a journal left by a *previous* interrupted change. Its
         // presence means an earlier mutation crashed mid-apply and has not been
         // recovered; overwriting it with this set's intent would strand the old
@@ -729,6 +702,44 @@ async fn unwind<FS: Storage>(fs: &FS, undo: Vec<Undo>) -> Result<()> {
         Some(e) => Err(e.into()),
         None => Ok(()),
     }
+}
+
+/// Clamp every path a sequence of ops names to the root it will run against.
+///
+/// Shared by [`ChangeSet::apply`], which guards sets assembled from data it
+/// did not author, and by [`Journal::recover`](crate::Journal::recover), whose
+/// input is *always* that: a journal is bytes found on disk, and — homed in a
+/// synced folder, or planted — possibly bytes some other machine wrote. The
+/// checksum authenticates nothing (anyone can recompute FNV-1a), so replay
+/// must refuse an escaping path exactly as the apply that would have written
+/// the journal honestly would have.
+///
+/// The one path deliberately *not* clamped is a [`FileOp::SetLink`] target:
+/// nothing is written through it — it is recorded, not resolved — and a link
+/// is allowed to point wherever links point, outside the root included.
+pub(crate) fn guard_ops(ops: &[FileOp]) -> Result<()> {
+    for op in ops {
+        match op {
+            FileOp::Write { path, .. }
+            | FileOp::Remove { path }
+            | FileOp::SetExecutable { path, .. }
+            | FileOp::SetLink { path, .. } => {
+                guard_in_root(path)?;
+            }
+            FileOp::Rename { from, to } => {
+                guard_in_root(from)?;
+                guard_in_root(to)?;
+            }
+            // The source is clamped too: it is read, and a set assembled by a
+            // caller must not be able to pull `../../../etc/passwd` into the
+            // tree any more than it may write out of one.
+            FileOp::CopyFrom { path, source } => {
+                guard_in_root(path)?;
+                guard_in_root(source)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Create `full`'s parent directory if it is missing. Unconditional (rather than

@@ -322,6 +322,13 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<FileOp>> {
         at: MAGIC.len(),
     };
     let count = cur.take_u64()?;
+    // Each op costs at least its one-byte tag, so a count the body cannot
+    // possibly hold is a lie about the record, not a large journal — and it
+    // must be refused *before* it sizes an allocation, or a crafted header
+    // aborts the process instead of erroring.
+    if count > (cur.bytes.len() - cur.at) as u64 {
+        return Err(corrupt("op count exceeds the journal body"));
+    }
     let mut ops = Vec::with_capacity(count as usize);
     for _ in 0..count {
         let op = match cur.take_u8()? {
@@ -399,6 +406,13 @@ impl Journal {
             Err(e) => return Err(e.into()),
         };
         let ops = decode(&bytes)?;
+        // Clamped to the root on `apply`'s own terms, and with more reason: a
+        // journal is bytes found on disk, not a set this process staged, and
+        // the checksum authenticates nothing. An apply refuses an escaping
+        // path before writing; a replay that did not would be the same escape
+        // through the back door — refused instead, with the journal left in
+        // place like any other journal that cannot be trusted.
+        crate::change::guard_ops(&ops)?;
         for op in &ops {
             replay(fs, root, op).await?;
         }
@@ -866,6 +880,46 @@ mod tests {
             .permissions()
             .mode();
         assert_ne!(mode & 0o111, 0, "the bit must be set after recovery");
+    }
+
+    #[test]
+    fn recovery_refuses_a_journal_whose_paths_escape_the_root() {
+        // A journal is bytes found on disk, not a set this process staged —
+        // synced from another machine, or planted — and the checksum
+        // authenticates nothing. Replay must clamp to the root exactly as an
+        // apply would, or the escape guard has a back door.
+        let root = tmp("recover-escape");
+        let outside = root.join("../fstx-escaped-by-recovery.md");
+        let _ = std::fs::remove_file(&outside);
+        let ops = vec![FileOp::Write {
+            path: "../fstx-escaped-by-recovery.md".into(),
+            bytes: b"escaped".to_vec(),
+        }];
+        std::fs::write(Journal::default().path_in(&root), encode(&ops).unwrap()).unwrap();
+
+        let err = block_on(recover(&StdFs, &root)).unwrap_err();
+
+        assert!(matches!(err, crate::Error::Escape(_)), "{err:?}");
+        assert!(!outside.exists(), "nothing may land outside the root");
+        assert!(
+            Journal::default().path_in(&root).exists(),
+            "a refused journal is left in place, like any that cannot be trusted"
+        );
+    }
+
+    #[test]
+    fn an_impossible_op_count_is_refused_not_allocated() {
+        // A crafted header claiming u64::MAX ops must surface as Corrupt —
+        // sizing a Vec by it aborts the process on capacity overflow, which
+        // is a denial of service handed to whoever can write the journal.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+        let checksum = fnv1a(&bytes);
+        bytes.extend_from_slice(&checksum.to_le_bytes());
+
+        let err = decode(&bytes).unwrap_err();
+        assert!(err.to_string().contains("op count"), "{err}");
     }
 
     #[test]
