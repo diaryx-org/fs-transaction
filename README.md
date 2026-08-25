@@ -1,8 +1,9 @@
 # fs-transaction
 
 Multi-file filesystem transactions that survive a crash. Stage a set of writes,
-renames, removals and copies; apply them all-or-nothing; and if the power goes
-out halfway through, finish the job on the next run.
+renames, removals, copies, execute-bit flips and symbolic links; apply them
+all-or-nothing; and if the power goes out halfway through, finish the job on
+the next run.
 
 The files stay ordinary files. This is not a virtual filesystem and not a
 database — nothing here changes how your tree is *read*, only how it is
@@ -53,6 +54,39 @@ Both endpoints are consistent. They are simply different consistent states, and
 the crate does not pretend a lost-power change never happened when its intent
 was already durably on disk.
 
+## Ordered batches: the other crash discipline
+
+All-or-nothing is the right guarantee when a half-applied set is *illegal*.
+Some trees are built the other way: an append-only, content-addressed store
+declares every partially-written batch legal — blobs that arrived without the
+record naming them are exactly what any interrupted transfer leaves. Buying
+atomicity there pays for a journal to rule out states that were never illegal.
+
+`OrderedBatch` is what such a tree actually needs — durability and ordering,
+without the journal. Tiers of writes separated by barriers: nothing durable
+ever names anything that is not durable yet, a crash leaves some prefix of the
+barriers, and there is no rollback and no recovery step, because every prefix
+is a state the tree already tolerates.
+
+```rust
+use fs_transaction::{OrderedBatch, StdFs, exec::block_on};
+use fs_transaction::fs::Durability;
+use std::path::Path;
+
+fn record(store: &Path) -> fs_transaction::Result<()> {
+    let mut batch = OrderedBatch::new();
+    batch.create_new("blobs/9f86d081", "payload");     // exclusive, write-once
+    batch.barrier();          // nothing below may be seen without everything above
+    batch.create_new("revisions/50d858e0.rev", "the record naming it");
+    block_on(batch.apply(&StdFs, store, Durability::Durable))
+}
+```
+
+`finality` is the strength of the batch's own landing: `Durable` means "this
+returned, it survives a power cut"; `Ordered` means "consistent, but the tail
+may go with the crash" — often enough for an append-only tree, and one less
+drain of the drive's cache.
+
 ## What it does not do
 
 Stated plainly, because a crate in this position should be:
@@ -85,23 +119,42 @@ lying on the backends that do not have one. Every durability member defaults to
 the pessimistic answer, so an adapter that forgets to override one degrades to
 the defensive path instead of to a false promise.
 
-## Journal naming
+## Journal naming and placement
 
-The journal is one transient dotfile at the root, present only between a change
-set's commit point and its completion. It defaults to `.fstx-journal`;
-`Journal::named` takes your own.
+The journal is one transient dotfile, present only between a change set's
+commit point and its completion. It defaults to `.fstx-journal` at the root;
+`Journal::named` takes your own name.
 
 Apply and recovery must agree about that name — if they disagree, nothing fails
 loudly, recovery simply looks where no journal is and leaves the change
 stranded. That is why both operations hang off `Journal` rather than taking the
 name separately.
 
-## Zero dependencies
+For a tree something *syncs* — an iCloud or Dropbox folder — the journal must
+not live in the root at all: a sync service cannot tell crash state from
+content, and would carry one machine's journal to machines that never crashed.
+`Journal::kept_in` homes it in an absolute directory you own and nothing
+syncs:
+
+```rust,ignore
+let journal = Journal::named(".myapp-journal")?.kept_in(app_support_dir)?;
+block_on(journal.apply(&cs, &StdFs, root))?;   // ...and later:
+block_on(journal.recover(&StdFs, root))?;       // the same pair, both halves
+```
+
+## Zero dependencies (by default)
 
 A crate whose whole job is getting bytes onto disk correctly should not make
 you audit anyone else's code to trust it, and should not drag a runtime into a
 build that already has one. The checksum is hand-rolled FNV-1a; the error type
 is a hand-written enum.
+
+The one opt-in exception is the `barrier-fsync` feature (which brings in
+`libc`): on Apple platforms it answers `Durability::Ordered` with
+`F_BARRIERFSYNC` — a queue barrier — instead of `F_FULLFSYNC`'s drain of the
+drive's whole write cache. That is the difference between microseconds and
+milliseconds on exactly the calls both protocols make most, and without the
+feature every sync stays the full flush: stronger than asked, never weaker.
 
 ## License
 
