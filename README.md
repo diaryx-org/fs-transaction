@@ -35,6 +35,22 @@ fn rearrange(root: &Path) -> Result<()> {
 }
 ```
 
+## Expect what you read
+
+A set is computed from a reading of the tree,
+and the tree may move between that reading and the apply.
+`expect` stages the reading itself — the bytes a path held,
+or `expect_absent`, its absence —
+and `apply` checks every expectation before writing anything:
+one that no longer holds refuses the whole set with `Error::Drifted`,
+nothing touched, nothing journaled.
+Re-read, restage, retry — optimistic concurrency, without a lock.
+
+```rust,ignore
+change.expect("notes/a.md", bytes_i_read);   // refuse if someone else wrote it
+change.expect_absent("notes/new.md");        // refuse if someone else created it
+```
+
 ## When half-applied is legal
 
 All-or-nothing is for trees where a half-applied change is illegal.

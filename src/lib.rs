@@ -4,7 +4,11 @@
 //! execute-bit flips, and symbolic links as one ordered unit. [`ChangeSet::apply`] lands the whole set or none of it: an
 //! error unwinds every op already applied, and a write-ahead journal makes a
 //! *committed* set recoverable after a process crash or power loss, via
-//! [`recover`].
+//! [`recover`]. A set can also [*expect*](ChangeSet::expect) — stage what the
+//! caller read alongside what it wants written, and have the apply refuse
+//! ([`Error::Drifted`]) before touching anything if something else wrote in
+//! between: optimistic concurrency, for the many-readers case locking can't
+//! reach.
 //!
 //! The journal's file name is [configurable](Journal::named) and defaults to
 //! [`.fstx-journal`](Journal::DEFAULT_NAME). Apply and recovery must agree
@@ -75,7 +79,7 @@ pub mod path;
 #[cfg(test)]
 mod fs_faults;
 
-pub use change::{ChangeSet, FileOp};
+pub use change::{ChangeSet, Expected, FileOp};
 pub use error::{Error, Result};
 pub use fs::{InMemoryFs, ReadStorage, StdFs, Storage};
 pub use journal::{Journal, Recovered, recover};

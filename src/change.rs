@@ -59,6 +59,25 @@
 //! needs. [`ChangeSet::ops`] is that view, and it is the same sequence `apply`
 //! will execute rather than a reconstruction of it.
 //!
+//! ## A set can expect
+//!
+//! A set is computed from a reading of the tree, and the tree may have moved
+//! between that reading and the apply. [`ChangeSet::expect`] stages the
+//! reading itself — the bytes a path held when the caller looked, or
+//! [its absence](ChangeSet::expect_absent) — and `apply` checks every
+//! expectation against the tree as it finds it, after the stale-journal
+//! refusal and before the commit point. One that does not hold refuses the
+//! whole set with [`Error::Drifted`] *before* anything is written, journaled,
+//! or unwound: the caller re-reads, restages, and retries, which is
+//! optimistic concurrency in exactly the compare-and-swap sense.
+//!
+//! Expectations speak of the tree **before** the set runs, so a set may
+//! expect a path absent and then write it. And they are never journaled: the
+//! journal is written only once they have held, so recovery completes an
+//! interrupted set unconditionally rather than re-litigating a question the
+//! commit point already answered — a recovered tree would fail its own set's
+//! expectations by construction, having half-applied them.
+//!
 //! ## Single writer
 //!
 //! A set assumes it is the only thing mutating the tree while it applies. There
@@ -66,6 +85,10 @@
 //! race on the journal, and the [`Error::StaleJournal`] check that guards
 //! against a *previous* interrupted change is a check-then-act, not a mutex. A
 //! caller that needs several writers has to serialize them itself.
+//! [Expectations](ChangeSet::expect) narrow this window rather than close
+//! it — the check is itself a check-then-act, and what it detects is a writer
+//! that raced the gap between the caller's *read* and this apply, which is
+//! the far wider gap in practice.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -185,6 +208,19 @@ impl FileOp {
     }
 }
 
+/// What one [expectation](ChangeSet::expect) says the tree holds at a path,
+/// checked against the tree as it stands when [`apply`](ChangeSet::apply)
+/// begins — before the set writes anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Expected {
+    /// The path holds exactly these bytes, read as the backend reads — which
+    /// is *through* a symbolic link, if one stands there.
+    Bytes(Vec<u8>),
+    /// Nothing is at the path: no file, no directory, and no link — a
+    /// dangling link is an entry, and counts as occupied.
+    Absent,
+}
+
 /// A set of writes staged as one unit, applied all-or-nothing by
 /// [`apply`](ChangeSet::apply).
 ///
@@ -195,6 +231,7 @@ impl FileOp {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChangeSet {
     ops: Vec<FileOp>,
+    expected: Vec<(PathBuf, Expected)>,
 }
 
 impl ChangeSet {
@@ -263,9 +300,41 @@ impl ChangeSet {
         self
     }
 
+    /// Expect `path` (root-relative) to hold exactly `contents` when the set
+    /// applies — the bytes the caller read when it computed this set.
+    ///
+    /// Checked before the commit point; a mismatch (including the file being
+    /// gone) refuses the whole set with [`Error::Drifted`] and nothing is
+    /// written. See the [module docs](self#a-set-can-expect) for when
+    /// expectations are checked and what they do and do not guard against.
+    pub fn expect(&mut self, path: impl Into<PathBuf>, contents: impl Into<Vec<u8>>) -> &mut Self {
+        self.expected
+            .push((path.into(), Expected::Bytes(contents.into())));
+        self
+    }
+
+    /// Expect nothing to be at `path` (root-relative) when the set applies —
+    /// the guard for a create that must not overwrite what a racing writer
+    /// put there first.
+    ///
+    /// An expectation speaks of the tree *before* the set runs, so expecting
+    /// a path absent and then writing that same path is the ordinary use, not
+    /// a contradiction.
+    pub fn expect_absent(&mut self, path: impl Into<PathBuf>) -> &mut Self {
+        self.expected.push((path.into(), Expected::Absent));
+        self
+    }
+
     /// The staged ops, in execution order. The dry-run view.
     pub fn ops(&self) -> &[FileOp] {
         &self.ops
+    }
+
+    /// The staged expectations, in the order staged — the dry-run view's
+    /// other half: what the set demands of the tree, next to what it
+    /// [does](Self::ops) to it.
+    pub fn expected(&self) -> &[(PathBuf, Expected)] {
+        &self.expected
     }
 
     /// The bytes this set will leave at `path`, if it writes it — the *last*
@@ -312,9 +381,11 @@ impl ChangeSet {
         moved.then_some(current)
     }
 
-    /// Whether nothing is staged — [`apply`](ChangeSet::apply) would be a no-op.
+    /// Whether nothing is staged — no ops and no
+    /// [expectations](Self::expect) — so [`apply`](ChangeSet::apply) would be
+    /// a no-op.
     pub fn is_empty(&self) -> bool {
-        self.ops.is_empty()
+        self.ops.is_empty() && self.expected.is_empty()
     }
 
     /// The number of staged ops.
@@ -322,9 +393,12 @@ impl ChangeSet {
         self.ops.len()
     }
 
-    /// Append `other`'s ops after this set's, consuming it.
+    /// Append `other`'s ops after this set's, consuming it. Its expectations
+    /// come along too — they still speak of the pre-apply tree, exactly as
+    /// they did in the set that staged them.
     pub fn extend(&mut self, other: ChangeSet) -> &mut Self {
         self.ops.extend(other.ops);
+        self.expected.extend(other.expected);
         self
     }
 
@@ -392,7 +466,7 @@ impl Journal {
         fs: &FS,
         root: &Path,
     ) -> Result<()> {
-        if changes.ops.is_empty() {
+        if changes.is_empty() {
             return Ok(());
         }
         // Clamp every staged path to the root *before* anything is
@@ -401,7 +475,13 @@ impl Journal {
         // `apply` also lands sets assembled from data it did not author,
         // and a link target that resolves to `../../../etc/passwd` must be refused
         // rather than let an apply write outside the tree it was pointed at.
+        // Expectation paths are clamped on the same terms: they are read, and
+        // a set must no more be able to probe `../../../etc/passwd` than to
+        // write it.
         guard_ops(&changes.ops)?;
+        for (path, _) in &changes.expected {
+            guard_in_root(path)?;
+        }
         // Refuse to clobber a journal left by a *previous* interrupted change. Its
         // presence means an earlier mutation crashed mid-apply and has not been
         // recovered; overwriting it with this set's intent would strand the old
@@ -411,6 +491,17 @@ impl Journal {
         let journal = self.path_in(root);
         if fs.try_exists(&journal).await? {
             return Err(Error::StaleJournal(journal));
+        }
+        // Expectations are checked here and nowhere else: after the
+        // stale-journal refusal, because a tree with an unrecovered change in
+        // it is mid-flight and not yet in any state worth comparing against;
+        // and before the fast path and the commit point alike, so a set of
+        // one is guarded exactly as a set of many. A failure is a refusal,
+        // not an abort — nothing has been written, so there is nothing to
+        // unwind and no flush to owe.
+        check_expected(fs, root, &changes.expected).await?;
+        if changes.ops.is_empty() {
+            return Ok(());
         }
         // A set of one needs no journal. The journal exists to make *several*
         // file operations land as one unit; a lone op is already indivisible on a
@@ -1018,6 +1109,53 @@ pub(crate) fn guard_ops(ops: &[FileOp]) -> Result<()> {
             FileOp::CopyFrom { path, source } => {
                 guard_in_root(path)?;
                 guard_in_root(source)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Check every staged expectation against the tree as it stands, before the
+/// set touches anything.
+///
+/// Bytes are read as the backend reads — through a standing link — while
+/// absence is judged on the *entry*: a dangling link names no bytes but still
+/// occupies the path, and a create that expected absence must not land on top
+/// of it. `read_link` settles the link question (its error is the normal
+/// answer for "no link here", so only a real fault propagates), `try_exists`
+/// settles the rest.
+async fn check_expected<FS: Storage>(
+    fs: &FS,
+    root: &Path,
+    expected: &[(PathBuf, Expected)],
+) -> Result<()> {
+    for (rel, want) in expected {
+        let full = root.join(rel);
+        match want {
+            Expected::Bytes(bytes) => match fs.read(&full).await {
+                Ok(found) if found == *bytes => {}
+                Ok(_) => return Err(Error::Drifted(rel.clone())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(Error::Drifted(rel.clone()));
+                }
+                Err(e) => return Err(e.into()),
+            },
+            Expected::Absent => {
+                let link = match fs.read_link(&full).await {
+                    Ok(link) => link,
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
+                        ) =>
+                    {
+                        None
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                if link.is_some() || fs.try_exists(&full).await? {
+                    return Err(Error::Drifted(rel.clone()));
+                }
             }
         }
     }
@@ -2293,6 +2431,239 @@ mod tests {
         block_on(cs.apply(&StdFs, &root)).unwrap();
         assert_eq!(read(&root, "doc.md").as_deref(), Some("after"));
         assert_eq!(read(&root, "other.md").as_deref(), Some("prior"));
+    }
+
+    #[test]
+    fn an_expectation_that_holds_lets_the_set_apply() {
+        let root = tmp("expect-holds");
+        std::fs::write(root.join("doc.md"), "as read").unwrap();
+        let mut cs = ChangeSet::new();
+        cs.expect("doc.md", "as read");
+        cs.write("doc.md", "rewritten");
+        cs.write("index.md", "points at doc");
+        block_on(cs.apply(&StdFs, &root)).unwrap();
+        assert_eq!(read(&root, "doc.md").as_deref(), Some("rewritten"));
+        assert_eq!(read(&root, "index.md").as_deref(), Some("points at doc"));
+    }
+
+    #[test]
+    fn a_drifted_expectation_refuses_the_set_before_anything_is_written() {
+        // The tree moved between the caller's read and the apply. The whole
+        // set — including ops on paths that did NOT drift — is refused, and
+        // the refusal precedes the commit point: no document touched, no
+        // journal written.
+        let root = tmp("expect-drift");
+        std::fs::write(root.join("doc.md"), "someone else's edit").unwrap();
+        let mut cs = ChangeSet::new();
+        cs.expect("doc.md", "as read");
+        cs.write("doc.md", "rewritten");
+        cs.write("index.md", "points at doc");
+        let err = block_on(cs.apply(&StdFs, &root)).unwrap_err();
+        assert!(
+            matches!(&err, Error::Drifted(p) if p == Path::new("doc.md")),
+            "expected Drifted(doc.md), got {err:?}"
+        );
+        assert_eq!(
+            read(&root, "doc.md").as_deref(),
+            Some("someone else's edit")
+        );
+        assert_eq!(read(&root, "index.md"), None);
+        assert!(!Journal::default().path_in(&root).exists());
+    }
+
+    #[test]
+    fn an_expectation_of_a_missing_file_is_drift_not_io() {
+        // "I read these bytes, and now there is no file at all" is the same
+        // story as "now there are different bytes": something else moved the
+        // tree. The caller gets the retryable answer, not a bare NotFound.
+        let root = tmp("expect-gone");
+        let mut cs = ChangeSet::new();
+        cs.expect("doc.md", "as read");
+        cs.write("doc.md", "rewritten");
+        let err = block_on(cs.apply(&StdFs, &root)).unwrap_err();
+        assert!(
+            matches!(&err, Error::Drifted(p) if p == Path::new("doc.md")),
+            "expected Drifted, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn an_expected_absence_is_drift_when_the_path_is_occupied() {
+        let root = tmp("expect-occupied");
+        std::fs::write(root.join("new.md"), "raced you to it").unwrap();
+        let mut cs = ChangeSet::new();
+        cs.expect_absent("new.md");
+        cs.write("new.md", "mine");
+        let err = block_on(cs.apply(&StdFs, &root)).unwrap_err();
+        assert!(
+            matches!(&err, Error::Drifted(p) if p == Path::new("new.md")),
+            "expected Drifted, got {err:?}"
+        );
+        assert_eq!(read(&root, "new.md").as_deref(), Some("raced you to it"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_dangling_link_counts_as_occupied_for_absence() {
+        // `try_exists` follows links, so a dangling one answers "no" — but the
+        // entry is there, and a create that expected absence must see it.
+        let root = tmp("expect-dangling");
+        std::os::unix::fs::symlink("points-at-nothing.md", root.join("new.md")).unwrap();
+        let mut cs = ChangeSet::new();
+        cs.expect_absent("new.md");
+        cs.write("new.md", "mine");
+        let err = block_on(cs.apply(&StdFs, &root)).unwrap_err();
+        assert!(
+            matches!(&err, Error::Drifted(p) if p == Path::new("new.md")),
+            "expected Drifted, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn expectations_speak_of_the_tree_before_the_set_runs() {
+        // Expecting a path absent and then writing that same path is the
+        // ordinary create guard, not a contradiction — and the second apply
+        // of the very same set drifts, because the first one occupied it.
+        let root = tmp("expect-preimage");
+        let mut cs = ChangeSet::new();
+        cs.expect_absent("new.md");
+        cs.write("new.md", "mine");
+        cs.write("index.md", "names it");
+        block_on(cs.apply(&StdFs, &root)).unwrap();
+        assert_eq!(read(&root, "new.md").as_deref(), Some("mine"));
+
+        let err = block_on(cs.apply(&StdFs, &root)).unwrap_err();
+        assert!(
+            matches!(&err, Error::Drifted(p) if p == Path::new("new.md")),
+            "expected Drifted on the second apply, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_lone_op_is_guarded_exactly_as_a_set_of_many() {
+        // The fast path skips the journal, never the expectations.
+        let root = tmp("expect-fast-path");
+        std::fs::write(root.join("doc.md"), "someone else's edit").unwrap();
+        let mut cs = ChangeSet::new();
+        cs.expect("doc.md", "as read");
+        cs.write("doc.md", "rewritten");
+        assert_eq!(cs.len(), 1, "this test is about the fast path");
+        let err = block_on(cs.apply(&StdFs, &root)).unwrap_err();
+        assert!(
+            matches!(err, Error::Drifted(_)),
+            "expected Drifted, got {err:?}"
+        );
+        assert_eq!(
+            read(&root, "doc.md").as_deref(),
+            Some("someone else's edit")
+        );
+    }
+
+    #[test]
+    fn an_expectation_only_set_checks_without_writing() {
+        // A set of zero ops and one expectation is an assertion about the
+        // tree: Ok when it holds, Drifted when it does not, and no journal
+        // either way.
+        let root = tmp("expect-only");
+        std::fs::write(root.join("doc.md"), "as read").unwrap();
+        let mut cs = ChangeSet::new();
+        cs.expect("doc.md", "as read");
+        assert!(!cs.is_empty(), "an expectation is staged state");
+        block_on(cs.apply(&StdFs, &root)).unwrap();
+
+        std::fs::write(root.join("doc.md"), "moved").unwrap();
+        let err = block_on(cs.apply(&StdFs, &root)).unwrap_err();
+        assert!(
+            matches!(err, Error::Drifted(_)),
+            "expected Drifted, got {err:?}"
+        );
+        assert!(!Journal::default().path_in(&root).exists());
+    }
+
+    #[test]
+    fn a_stale_journal_wins_over_a_drifted_expectation() {
+        // An unrecovered change means the tree is mid-flight — not yet in any
+        // state worth comparing against — so the stale refusal comes first.
+        let root = tmp("expect-stale-first");
+        std::fs::write(root.join("doc.md"), "drifted").unwrap();
+        let prior = vec![FileOp::Write {
+            path: "other.md".into(),
+            bytes: b"prior".to_vec(),
+        }];
+        std::fs::write(
+            Journal::default().path_in(&root),
+            crate::journal::encode(&prior).unwrap(),
+        )
+        .unwrap();
+        let mut cs = ChangeSet::new();
+        cs.expect("doc.md", "as read");
+        cs.write("doc.md", "rewritten");
+        let err = block_on(cs.apply(&StdFs, &root)).unwrap_err();
+        assert!(
+            matches!(err, Error::StaleJournal(_)),
+            "expected StaleJournal, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn recovery_never_rechecks_a_committed_sets_expectations() {
+        // Expectations are not journaled: the commit point asserts they held.
+        // A recovered tree would fail its own set's expectations by
+        // construction — here, the crash landed the very write whose absence
+        // the set expected — and recovery must complete it regardless.
+        let root = tmp("expect-recovery");
+        let mut cs = ChangeSet::new();
+        cs.expect_absent("new.md");
+        cs.write("new.md", "mine");
+        cs.write("index.md", "names it");
+
+        // The journal the real apply committed (its encoding carries no
+        // expectations to recheck), and a crash after the first write.
+        std::fs::write(
+            Journal::default().path_in(&root),
+            crate::journal::encode(cs.ops()).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(root.join("new.md"), "mine").unwrap();
+
+        let outcome = block_on(crate::journal::recover(&StdFs, &root)).unwrap();
+        assert_eq!(outcome, crate::journal::Recovered::Applied(2));
+        assert_eq!(read(&root, "index.md").as_deref(), Some("names it"));
+    }
+
+    #[test]
+    fn an_escaping_expectation_path_is_refused() {
+        // An expectation reads; a set must no more probe outside the root
+        // than write there.
+        let root = tmp("expect-escape");
+        let mut cs = ChangeSet::new();
+        cs.expect("../secret.md", "sniffed");
+        cs.write("doc.md", "cover");
+        let err = block_on(cs.apply(&StdFs, &root)).unwrap_err();
+        assert!(
+            matches!(err, Error::Escape(_)),
+            "expected Escape, got {err:?}"
+        );
+        assert_eq!(read(&root, "doc.md"), None);
+    }
+
+    #[test]
+    fn extend_carries_expectations_along() {
+        let root = tmp("expect-extend");
+        std::fs::write(root.join("doc.md"), "moved").unwrap();
+        let mut guarded = ChangeSet::new();
+        guarded.expect("doc.md", "as read");
+        guarded.write("doc.md", "rewritten");
+        let mut cs = ChangeSet::new();
+        cs.write("index.md", "names it");
+        cs.extend(guarded);
+        assert_eq!(cs.expected().len(), 1);
+        let err = block_on(cs.apply(&StdFs, &root)).unwrap_err();
+        assert!(
+            matches!(err, Error::Drifted(_)),
+            "expected Drifted, got {err:?}"
+        );
+        assert_eq!(read(&root, "index.md"), None);
     }
 
     #[test]

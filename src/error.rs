@@ -1,7 +1,8 @@
 //! What a transaction can fail with.
 //!
 //! The split between the variants is the crate's whole safety story:
-//! [`Io`](Error::Io) and [`Escape`](Error::Escape) are ordinary refusals that
+//! [`Io`](Error::Io), [`Escape`](Error::Escape), and
+//! [`Drifted`](Error::Drifted) are ordinary refusals that
 //! leave the target untouched, the construction-time refusals
 //! ([`InvalidJournalName`](Error::InvalidJournalName),
 //! [`InvalidJournalHome`](Error::InvalidJournalHome),
@@ -35,6 +36,15 @@ pub enum Error {
     /// written or journaled, because a set assembled from untrusted data must
     /// not be able to reach out of the tree it was pointed at.
     Escape(PathBuf),
+
+    /// An [expectation](crate::ChangeSet::expect) the set staged did not hold
+    /// when it was applied: the tree at this path is not what the caller read
+    /// when it computed the set — something else wrote in between. Refused
+    /// before the commit point, so nothing has been written, journaled, or
+    /// unwound; the caller re-reads, restages, and retries. This is drift
+    /// *detection*, not a lock — see [`change`](crate::change) on the single
+    /// writer.
+    Drifted(PathBuf),
 
     /// A [`Journal`](crate::journal::Journal) was asked for under a name that
     /// is not a single path component. Refused at construction, because the
@@ -104,6 +114,12 @@ impl fmt::Display for Error {
         match self {
             Error::Io(e) => write!(f, "io error: {e}"),
             Error::Escape(p) => write!(f, "path escapes the root: {}", p.display()),
+            Error::Drifted(p) => write!(
+                f,
+                "the tree drifted from what the set expected at {}; \
+                 nothing was written — re-read and restage",
+                p.display()
+            ),
             Error::InvalidJournalName(name) => write!(
                 f,
                 "journal name must be a single path component, got {name:?}"
