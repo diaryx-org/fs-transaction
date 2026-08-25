@@ -284,6 +284,31 @@ impl ReadStorage for InMemoryFs {
     // a clone or an export/import round-trip. `Metadata::modified` reports
     // `Unsupported` accordingly — an honest "this backend doesn't know",
     // exactly as it would for a real backend that genuinely lacks the field.
+
+    // `executable` is deliberately left at the trait's default — the decline.
+    // There is no bit behind these bytes, and answering `false` would claim
+    // one; `None` is the honest "no such thing here".
+
+    async fn read_link(&self, path: &Path) -> io::Result<Option<PathBuf>> {
+        // This backend *does* model links, so `Ok(None)` — reserved for the
+        // backend-wide decline — is never its answer: a path holding a link
+        // yields the target, and anything else is an error, exactly as
+        // `readlink` behaves.
+        let normalized = normalize_path(path);
+        if let Some(target) = self.symlinks.read().unwrap().get(&normalized) {
+            return Ok(Some(target.clone()));
+        }
+        let occupied = self.files.read().unwrap().contains_key(&normalized)
+            || self.binary_files.read().unwrap().contains_key(&normalized)
+            || self.directories.read().unwrap().contains(&normalized);
+        if occupied {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("not a symbolic link: {}", path.display()),
+            ));
+        }
+        Err(not_found(path))
+    }
 }
 
 impl Storage for InMemoryFs {
@@ -401,6 +426,22 @@ impl Storage for InMemoryFs {
         } else {
             self.rename_file(&from_norm, &to_norm, from, to).await
         }
+    }
+
+    async fn set_link(&self, path: &Path, target: &Path) -> io::Result<()> {
+        // Replaces whatever is at the path, per the trait's contract: a plain
+        // file gives way to the link, and an existing link is repointed. The
+        // target is recorded as given, never resolved or required to exist —
+        // a dangling link is an honest link.
+        let normalized = normalize_path(path);
+        insert_ancestor_dirs(&mut self.directories.write().unwrap(), &normalized);
+        self.files.write().unwrap().remove(&normalized);
+        self.binary_files.write().unwrap().remove(&normalized);
+        self.symlinks
+            .write()
+            .unwrap()
+            .insert(normalized, normalize_path(target));
+        Ok(())
     }
 
     fn capabilities(&self) -> Capabilities {

@@ -6,7 +6,8 @@
 //! one failure that leaves behind — a `kill -9` or a power cut *between* two of a
 //! set's writes — is what this closes. The mechanism is the classic write-ahead
 //! log, specialized to the one shape a change set takes: a sequence of
-//! whole-file writes, copies, renames, and removes, each self-contained.
+//! whole-file writes, copies, renames, removes, mode flips, and links, each
+//! self-contained.
 //!
 //! ## The protocol
 //!
@@ -206,6 +207,20 @@ pub fn encode(ops: &[FileOp]) -> Result<Vec<u8>> {
                 put_path(&mut buf, path)?;
                 put_path(&mut buf, source)?;
             }
+            FileOp::SetExecutable { path, executable } => {
+                buf.push(4);
+                put_path(&mut buf, path)?;
+                buf.push(u8::from(*executable));
+            }
+            // The target is encoded on `put_path`'s terms — UTF-8 or refused at
+            // the commit point — even though it is a link's text rather than a
+            // file of the tree: a journal must replay identically wherever it
+            // is read, and a mangled target is an invented one.
+            FileOp::SetLink { path, target } => {
+                buf.push(5);
+                put_path(&mut buf, path)?;
+                put_path(&mut buf, target)?;
+            }
         }
     }
     let checksum = fnv1a(&buf);
@@ -253,6 +268,23 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<FileOp>> {
             3 => FileOp::CopyFrom {
                 path: cur.take_path()?,
                 source: cur.take_path()?,
+            },
+            4 => FileOp::SetExecutable {
+                path: cur.take_path()?,
+                // Strictly 0 or 1: any other byte means this is not the
+                // record it claims to be, and a journal that cannot be
+                // trusted is refused, never guessed at.
+                executable: match cur.take_u8()? {
+                    0 => false,
+                    1 => true,
+                    other => {
+                        return Err(corrupt(&format!("invalid executable flag {other}")));
+                    }
+                },
+            },
+            5 => FileOp::SetLink {
+                path: cur.take_path()?,
+                target: cur.take_path()?,
             },
             other => return Err(corrupt(&format!("unknown op tag {other}"))),
         };
@@ -347,6 +379,22 @@ async fn replay<FS: Storage>(fs: &FS, root: &Path, op: &FileOp) -> Result<()> {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e.into()),
             }
+        }
+        // Setting a bit that is already set (or already cleared) reaches the
+        // same state — idempotent by nature, like a whole-file write. On a
+        // backend that models no bit the call no-ops, which is what the op
+        // means there.
+        FileOp::SetExecutable { path, executable } => {
+            fs.set_executable(&root.join(path), *executable).await?;
+        }
+        // `set_link` replaces whatever is at the path, so replaying it lands
+        // the same link whether the crash beat the op, interrupted it midway
+        // (a remove-then-remake backend caught between the two), or came
+        // after it was done.
+        FileOp::SetLink { path, target } => {
+            let full = root.join(path);
+            ensure_parent(fs, &full).await?;
+            fs.set_link(&full, target).await?;
         }
         // The one op that is not naturally idempotent: after it lands, the source
         // is gone and the destination present, so a blind re-rename would fail.
@@ -481,9 +529,38 @@ mod tests {
             FileOp::Remove {
                 path: "gone.md".into(),
             },
+            FileOp::SetExecutable {
+                path: "run.sh".into(),
+                executable: true,
+            },
+            FileOp::SetLink {
+                path: "link.md".into(),
+                target: "../elsewhere.md".into(),
+            },
         ];
         let bytes = encode(&ops).unwrap();
         assert_eq!(decode(&bytes).unwrap(), ops);
+    }
+
+    #[test]
+    fn an_invalid_executable_flag_is_refused_not_guessed() {
+        // The flag is strictly 0 or 1: any other byte means the record is not
+        // what it claims, and a journal that cannot be trusted is refused.
+        let ops = vec![FileOp::SetExecutable {
+            path: "run.sh".into(),
+            executable: true,
+        }];
+        let mut bytes = encode(&ops).unwrap();
+        // The flag is the byte just before the trailing 8-byte checksum.
+        let flag_at = bytes.len() - 8 - 1;
+        assert_eq!(bytes[flag_at], 1);
+        bytes[flag_at] = 7;
+        // Re-stamp the checksum so only the flag is at fault.
+        let body_end = bytes.len() - 8;
+        let sum = fnv1a(&bytes[..body_end]);
+        bytes[body_end..].copy_from_slice(&sum.to_le_bytes());
+        let err = decode(&bytes).unwrap_err();
+        assert!(err.to_string().contains("executable flag"), "{err}");
     }
 
     #[test]
@@ -681,6 +758,43 @@ mod tests {
         // The journal stays, so the next recovery can finish once the blob arrives.
         assert!(Journal::default().path_in(&root).exists());
         assert_eq!(read(&root, "notes.md").as_deref(), Some("damaged bytes"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_rolls_modes_and_links_forward_idempotently() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Crash after the commit point with the link already made and the bit
+        // not yet flipped: replay must redo both without tripping over the
+        // half that had landed.
+        let root = tmp("recover-modes-links");
+        std::fs::write(root.join("run.sh"), "#!/bin/sh").unwrap();
+        std::os::unix::fs::symlink("target.md", root.join("link.md")).unwrap();
+        let ops = vec![
+            FileOp::SetLink {
+                path: "link.md".into(),
+                target: "target.md".into(),
+            },
+            FileOp::SetExecutable {
+                path: "run.sh".into(),
+                executable: true,
+            },
+        ];
+        std::fs::write(Journal::default().path_in(&root), encode(&ops).unwrap()).unwrap();
+
+        let outcome = block_on(recover(&StdFs, &root)).unwrap();
+
+        assert_eq!(outcome, Recovered::Applied(2));
+        assert_eq!(
+            std::fs::read_link(root.join("link.md")).unwrap(),
+            PathBuf::from("target.md")
+        );
+        let mode = std::fs::metadata(root.join("run.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_ne!(mode & 0o111, 0, "the bit must be set after recovery");
     }
 
     #[test]

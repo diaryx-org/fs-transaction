@@ -1,7 +1,7 @@
 //! Crash-atomic filesystem transactions.
 //!
-//! [`ChangeSet`] stages root-relative writes, renames, removals, and copies as
-//! one ordered unit. [`ChangeSet::apply`] lands the whole set or none of it: an
+//! [`ChangeSet`] stages root-relative writes, renames, removals, copies,
+//! execute-bit flips, and symbolic links as one ordered unit. [`ChangeSet::apply`] lands the whole set or none of it: an
 //! error unwinds every op already applied, and a write-ahead journal makes a
 //! *committed* set recoverable after a process crash or power loss, via
 //! [`recover`].

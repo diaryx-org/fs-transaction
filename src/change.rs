@@ -116,6 +116,40 @@ pub enum FileOp {
         /// content-addressed.
         source: PathBuf,
     },
+    /// Make the file at `path` runnable, or not — one bit, not a mode.
+    ///
+    /// Lands through [`Storage::set_executable`], whose default is the honest
+    /// no-op for a backend with no such bit: over such a backend the op
+    /// "applies" as nothing, which is the same nothing the bit's absence
+    /// already means there. Undo is captured through
+    /// [`ReadStorage::executable`](crate::fs::ReadStorage::executable), so a
+    /// bit that was already in the requested state rolls back to itself rather
+    /// than to its opposite.
+    SetExecutable {
+        /// The file whose execute bit is set or cleared.
+        path: PathBuf,
+        /// Whether the file should be runnable afterwards.
+        executable: bool,
+    },
+    /// Place a symbolic link at `path` pointing at `target`, replacing
+    /// whatever is there.
+    ///
+    /// The target is **recorded, never resolved**: it may point outside the
+    /// root, at nothing, or at another link, and staging it writes nothing
+    /// through it — the same terms as [`Storage::set_link`]. What is *not*
+    /// permitted is another op in the same set addressing a path that
+    /// traverses this link: the root guard is lexical, and a set that writes
+    /// through its own fresh link is writing wherever the link points.
+    ///
+    /// Over a backend that models no links the op is refused
+    /// ([`Unsupported`](std::io::ErrorKind::Unsupported)) and the set unwinds:
+    /// unlike an execute bit, a link has no honest substitute.
+    SetLink {
+        /// Where the link itself lives.
+        path: PathBuf,
+        /// What it points at — recorded as given.
+        target: PathBuf,
+    },
 }
 
 impl FileOp {
@@ -123,7 +157,10 @@ impl FileOp {
     /// rename, the victim for a remove. What a dry run lists.
     pub fn path(&self) -> &Path {
         match self {
-            FileOp::Write { path, .. } | FileOp::CopyFrom { path, .. } => path,
+            FileOp::Write { path, .. }
+            | FileOp::CopyFrom { path, .. }
+            | FileOp::SetExecutable { path, .. }
+            | FileOp::SetLink { path, .. } => path,
             FileOp::Rename { to, .. } => to,
             FileOp::Remove { path } => path,
         }
@@ -181,6 +218,29 @@ impl ChangeSet {
         self.ops.push(FileOp::CopyFrom {
             path: path.into(),
             source: source.into(),
+        });
+        self
+    }
+
+    /// Stage making the file at `path` (root-relative) runnable, or not.
+    pub fn set_executable(&mut self, path: impl Into<PathBuf>, executable: bool) -> &mut Self {
+        self.ops.push(FileOp::SetExecutable {
+            path: path.into(),
+            executable,
+        });
+        self
+    }
+
+    /// Stage a symbolic link at `path` (root-relative) pointing at `target`,
+    /// replacing whatever is there.
+    ///
+    /// See [`FileOp::SetLink`] for what the target is and is not: recorded,
+    /// never resolved, and not a door for other ops in the set to write
+    /// through.
+    pub fn set_link(&mut self, path: impl Into<PathBuf>, target: impl Into<PathBuf>) -> &mut Self {
+        self.ops.push(FileOp::SetLink {
+            path: path.into(),
+            target: target.into(),
         });
         self
     }
@@ -332,6 +392,16 @@ impl Journal {
                     guard_in_root(path)?;
                     guard_in_root(source)?;
                 }
+                FileOp::SetExecutable { path, .. } => {
+                    guard_in_root(path)?;
+                }
+                // The link's own path is clamped; its *target* deliberately is
+                // not. Nothing is written through the target — it is recorded,
+                // not resolved — and a link is allowed to point wherever links
+                // point, outside the root included. See [`FileOp::SetLink`].
+                FileOp::SetLink { path, .. } => {
+                    guard_in_root(path)?;
+                }
             }
         }
         // Refuse to clobber a journal left by a *previous* interrupted change. Its
@@ -365,7 +435,18 @@ impl Journal {
         // journal, but it must not slip a write past an *earlier* interrupted
         // change that recovery has yet to roll forward, or recovery would later
         // overwrite what was just written.
-        if changes.ops.len() == 1 && fs.capabilities().atomic_replace {
+        //
+        // A lone `SetLink` is excluded: the port's contract for `set_link` is
+        // "replaces whatever is there", not "in one indivisible step", so on a
+        // backend that replaces by remove-then-remake a crash inside the call
+        // can leave the path holding neither the old file nor the link. That
+        // is a half-applied set of one — the very thing the fast path's
+        // argument says cannot exist — so the op takes the journal, whose
+        // recovery re-runs `set_link` to the applied state.
+        if changes.ops.len() == 1
+            && fs.capabilities().atomic_replace
+            && !matches!(changes.ops[0], FileOp::SetLink { .. })
+        {
             // No undo to record, either. Nothing preceded this op that could need
             // unwinding, and every failure mode leaves the target untouched — so
             // the reflexive read of the very file about to be overwritten, whose
@@ -431,6 +512,19 @@ enum Undo {
     Delete { path: PathBuf },
     /// Move `from` back to `to`.
     Rename { from: PathBuf, to: PathBuf },
+    /// Put the execute bit back the way it was.
+    SetExecutable { path: PathBuf, executable: bool },
+    /// Point the link back at its old target (the path held a link before a
+    /// [`FileOp::SetLink`] repointed it).
+    Relink { path: PathBuf, target: PathBuf },
+    /// Put a regular file's bytes back where a link now stands.
+    ///
+    /// Not a [`Restore`](Undo::Restore): a plain `write` to a path holding a
+    /// link writes *through* it, landing the old bytes in whatever the link
+    /// points at instead of back at the path. The link has to be removed
+    /// first — and tolerantly, since the `set_link` being reversed may have
+    /// failed before creating it.
+    RestoreOverLink { path: PathBuf, bytes: Vec<u8> },
 }
 
 /// Apply one op, optionally recording how to reverse it.
@@ -520,6 +614,58 @@ async fn exec<FS: Storage>(
             ensure_parent(fs, &full).await?;
             fs.write_atomic(&full, &bytes).await?;
         }
+        FileOp::SetExecutable { path, executable } => {
+            let full = root.join(path);
+            if let Some(undo) = undo {
+                // Captured through the read half, so the rollback restores
+                // what *was* — not the blind opposite of what was asked,
+                // which is wrong whenever the bit was already in the
+                // requested state. A backend that declines the question
+                // (`None`) has no bit to restore and the op below will no-op
+                // on it too, so nothing is recorded.
+                if let Some(was) = fs.executable(&full).await? {
+                    undo.push(Undo::SetExecutable {
+                        path: full.clone(),
+                        executable: was,
+                    });
+                }
+            }
+            fs.set_executable(&full, *executable).await?;
+        }
+        FileOp::SetLink { path, target } => {
+            let full = root.join(path);
+            if let Some(undo) = undo {
+                match fs.read_link(&full).await {
+                    // The path held a link: point it back afterwards.
+                    Ok(Some(old_target)) => undo.push(Undo::Relink {
+                        path: full.clone(),
+                        target: old_target,
+                    }),
+                    // The backend models no links at all; `set_link` below
+                    // will refuse, so there is nothing to record — the op
+                    // never applies.
+                    Ok(None) => {}
+                    // Nothing there: the undo is removal, and `Delete`
+                    // removes a link as readily as a file.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        undo.push(Undo::Delete { path: full.clone() });
+                    }
+                    // Not a link — a regular file about to give way to one.
+                    // Its bytes are the undo, restored *after* the link is
+                    // removed (see [`Undo::RestoreOverLink`]); any error
+                    // reading them aborts the op before it touches anything.
+                    Err(_) => {
+                        let old = fs.read(&full).await?;
+                        undo.push(Undo::RestoreOverLink {
+                            path: full.clone(),
+                            bytes: old,
+                        });
+                    }
+                }
+            }
+            ensure_parent(fs, &full).await?;
+            fs.set_link(&full, target).await?;
+        }
     }
     Ok(())
 }
@@ -540,6 +686,23 @@ async fn unwind<FS: Storage>(fs: &FS, undo: Vec<Undo>) -> Result<()> {
                 other => other,
             },
             Undo::Rename { from, to } => fs.rename(&from, &to).await,
+            Undo::SetExecutable { path, executable } => fs.set_executable(&path, executable).await,
+            Undo::Relink { path, target } => fs.set_link(&path, &target).await,
+            // The link first, tolerantly (the `set_link` being reversed may
+            // have failed before creating it), and only then the bytes — a
+            // plain write while the link stands would land them in its target,
+            // which is also why a remove that fails for a real reason must
+            // stop the write rather than precede it.
+            Undo::RestoreOverLink { path, bytes } => {
+                let removed = match fs.remove_file(&path).await {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    other => other,
+                };
+                match removed {
+                    Ok(()) => fs.write(&path, &bytes).await,
+                    Err(e) => Err(e),
+                }
+            }
         };
         if let Err(e) = result
             && first_error.is_none()
@@ -577,7 +740,7 @@ async fn ensure_parent<FS: Storage>(fs: &FS, full: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::exec::block_on;
-    use crate::fs::StdFs;
+    use crate::fs::{ReadStorage, StdFs};
     use crate::fs_faults::{FailAtWrite, FsEvent, RecordingFs};
     use crate::journal::Journal;
 
@@ -708,6 +871,253 @@ mod tests {
         assert!(err.to_string().contains("disk full"), "{err}");
         // The file the set created before failing is gone, not orphaned.
         assert_eq!(read(&root, "fresh.md"), None);
+    }
+
+    #[cfg(unix)]
+    fn is_executable(root: &Path, rel: &str) -> bool {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(root.join(rel))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o111
+            != 0
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sets_and_clears_the_execute_bit() {
+        let root = tmp("exec-bit");
+        std::fs::write(root.join("run.sh"), "#!/bin/sh").unwrap();
+        std::fs::write(root.join("plain.md"), "notes").unwrap();
+
+        let mut cs = ChangeSet::new();
+        cs.set_executable("run.sh", true);
+        cs.set_executable("plain.md", false);
+        block_on(cs.apply(&StdFs, &root)).unwrap();
+
+        assert!(is_executable(&root, "run.sh"));
+        assert!(!is_executable(&root, "plain.md"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_set_restores_the_execute_bit_it_flipped() {
+        let root = tmp("rollback-exec");
+        std::fs::write(root.join("run.sh"), "#!/bin/sh").unwrap();
+        assert!(!is_executable(&root, "run.sh"));
+
+        let mut cs = ChangeSet::new();
+        cs.set_executable("run.sh", true);
+        cs.write("doomed.md", "never lands");
+        let err = block_on(cs.apply(&FailAtWrite::nth(0), &root)).unwrap_err();
+        assert!(err.to_string().contains("disk full"), "{err}");
+
+        assert!(
+            !is_executable(&root, "run.sh"),
+            "the bit must roll back to what was, not stay flipped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_bit_already_in_the_requested_state_rolls_back_to_itself() {
+        // The undo is captured through the read half, not derived as "the
+        // opposite of what was asked" — which is wrong exactly here.
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tmp("rollback-exec-noop");
+        std::fs::write(root.join("run.sh"), "#!/bin/sh").unwrap();
+        let mut perms = std::fs::metadata(root.join("run.sh"))
+            .unwrap()
+            .permissions();
+        perms.set_mode(perms.mode() | 0o100);
+        std::fs::set_permissions(root.join("run.sh"), perms).unwrap();
+
+        let mut cs = ChangeSet::new();
+        cs.set_executable("run.sh", true); // already true
+        cs.write("doomed.md", "never lands");
+        block_on(cs.apply(&FailAtWrite::nth(0), &root)).unwrap_err();
+
+        assert!(
+            is_executable(&root, "run.sh"),
+            "rolling back a no-op flip must not clear a bit the set never set"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lands_a_link_and_reads_nothing_through_it() {
+        let root = tmp("link");
+        let mut cs = ChangeSet::new();
+        // A dangling target, and one pointing outside the root: both are
+        // honest links — recorded, never resolved.
+        cs.set_link("here.md", "nowhere/yet.md");
+        cs.set_link("out.md", "../elsewhere.md");
+        block_on(cs.apply(&StdFs, &root)).unwrap();
+
+        assert_eq!(
+            std::fs::read_link(root.join("here.md")).unwrap(),
+            PathBuf::from("nowhere/yet.md")
+        );
+        assert_eq!(
+            std::fs::read_link(root.join("out.md")).unwrap(),
+            PathBuf::from("../elsewhere.md")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_set_restores_the_file_a_link_replaced() {
+        // The sharp edge `Undo::RestoreOverLink` exists for: a plain write
+        // while the link stands would land the old bytes in the link's
+        // *target*. The rollback must leave a regular file holding them, and
+        // the target untouched.
+        let root = tmp("rollback-link-over-file");
+        std::fs::write(root.join("victim.md"), "the original").unwrap();
+        std::fs::write(root.join("target.md"), "someone else's file").unwrap();
+
+        let mut cs = ChangeSet::new();
+        cs.set_link("victim.md", "target.md");
+        cs.write("doomed.md", "never lands");
+        block_on(cs.apply(&FailAtWrite::nth(0), &root)).unwrap_err();
+
+        let md = std::fs::symlink_metadata(root.join("victim.md")).unwrap();
+        assert!(md.file_type().is_file(), "the link must be gone");
+        assert_eq!(read(&root, "victim.md").as_deref(), Some("the original"));
+        assert_eq!(
+            read(&root, "target.md").as_deref(),
+            Some("someone else's file"),
+            "nothing may be written through the link during rollback"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_set_repoints_a_link_it_had_repointed() {
+        let root = tmp("rollback-relink");
+        std::os::unix::fs::symlink("old-target.md", root.join("link.md")).unwrap();
+
+        let mut cs = ChangeSet::new();
+        cs.set_link("link.md", "new-target.md");
+        cs.write("doomed.md", "never lands");
+        block_on(cs.apply(&FailAtWrite::nth(0), &root)).unwrap_err();
+
+        assert_eq!(
+            std::fs::read_link(root.join("link.md")).unwrap(),
+            PathBuf::from("old-target.md")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_set_removes_a_link_it_had_created() {
+        let root = tmp("rollback-link-fresh");
+        let mut cs = ChangeSet::new();
+        cs.set_link("fresh.md", "anywhere.md");
+        cs.write("doomed.md", "never lands");
+        block_on(cs.apply(&FailAtWrite::nth(0), &root)).unwrap_err();
+
+        assert!(
+            std::fs::symlink_metadata(root.join("fresh.md")).is_err(),
+            "the created link must be gone"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lone_link_takes_the_journal_rather_than_the_fast_path() {
+        // `set_link`'s contract is "replaces", not "replaces indivisibly", so
+        // a set of one link still needs the journal a crash can roll forward —
+        // the fast path's no-half-applied-state argument does not cover it.
+        let root = tmp("lone-link");
+        let fs = RecordingFs::local();
+        let mut cs = ChangeSet::new();
+        cs.set_link("link.md", "target.md");
+        block_on(cs.apply(&fs, &root)).unwrap();
+
+        let journaled = fs
+            .events()
+            .iter()
+            .any(|e| matches!(e, FsEvent::Write(p) if Journal::default().owns_path(p)));
+        assert!(journaled, "events: {:?}", fs.events());
+    }
+
+    #[test]
+    fn an_execute_flip_over_a_backend_with_no_bit_applies_as_nothing() {
+        // The op means "make this runnable", and on a backend where nothing
+        // is runnable there is nothing to do — the honest no-op, not an error.
+        let fs = crate::fs::InMemoryFs::new();
+        block_on(fs.write(Path::new("root/doc.md"), b"hi")).unwrap();
+        let mut cs = ChangeSet::new();
+        cs.set_executable("doc.md", true);
+        cs.write("other.md", "lands");
+        block_on(cs.apply(&fs, Path::new("root"))).unwrap();
+        assert_eq!(
+            block_on(fs.read_to_string(Path::new("root/other.md"))).unwrap(),
+            "lands"
+        );
+    }
+
+    #[test]
+    fn a_link_over_a_backend_without_links_unwinds_the_set() {
+        // Unlike an execute bit, a link has no honest substitute: the backend
+        // refuses, and the refusal aborts the whole set.
+        struct NoLinks(crate::fs::InMemoryFs);
+        impl crate::fs::ReadStorage for NoLinks {
+            async fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+                self.0.read(path).await
+            }
+            async fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+                self.0.read_to_string(path).await
+            }
+            async fn read_dir(&self, path: &Path) -> std::io::Result<Vec<crate::fs::DirEntry>> {
+                self.0.read_dir(path).await
+            }
+            async fn metadata(&self, path: &Path) -> std::io::Result<crate::fs::Metadata> {
+                self.0.metadata(path).await
+            }
+            // `executable` and `read_link` stay at the defaults: the declines.
+        }
+        impl Storage for NoLinks {
+            async fn write(&self, path: &Path, contents: &[u8]) -> std::io::Result<()> {
+                self.0.write(path, contents).await
+            }
+            async fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
+                self.0.create_dir_all(path).await
+            }
+            async fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+                self.0.remove_file(path).await
+            }
+            async fn remove_dir_all(&self, path: &Path) -> std::io::Result<()> {
+                self.0.remove_dir_all(path).await
+            }
+            async fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+                self.0.rename(from, to).await
+            }
+            fn capabilities(&self) -> crate::fs::Capabilities {
+                self.0.capabilities()
+            }
+            // Forwarded because the wrapped backend's atomic replace is its
+            // own single locked write; the default's temp-then-rename would
+            // trip over `InMemoryFs::rename` refusing to clobber.
+            async fn write_atomic(&self, path: &Path, contents: &[u8]) -> std::io::Result<()> {
+                self.0.write_atomic(path, contents).await
+            }
+            // `set_link` stays at the default: the refusal.
+        }
+
+        let fs = NoLinks(crate::fs::InMemoryFs::new());
+        block_on(fs.0.write(Path::new("root/before.md"), b"old")).unwrap();
+        let mut cs = ChangeSet::new();
+        cs.write("before.md", "new");
+        cs.set_link("link.md", "target.md");
+        let err = block_on(cs.apply(&fs, Path::new("root"))).unwrap_err();
+        assert!(err.to_string().contains("symbolic links"), "{err}");
+        assert_eq!(
+            block_on(fs.0.read_to_string(Path::new("root/before.md"))).unwrap(),
+            "old",
+            "the write that preceded the refused link must unwind"
+        );
     }
 
     #[test]

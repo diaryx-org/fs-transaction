@@ -21,6 +21,17 @@ macro_rules! reads_like_stdfs {
             async fn metadata(&self, path: &Path) -> io::Result<Metadata> {
                 StdFs.metadata(path).await
             }
+
+            // Forwarded rather than defaulted: the defaults decline, and a
+            // double that reads like `StdFs` must not claim to model less
+            // than `StdFs` does — undo capture would believe it.
+            async fn executable(&self, path: &Path) -> io::Result<Option<bool>> {
+                StdFs.executable(path).await
+            }
+
+            async fn read_link(&self, path: &Path) -> io::Result<Option<std::path::PathBuf>> {
+                StdFs.read_link(path).await
+            }
         }
     };
 }
@@ -83,6 +94,14 @@ impl Storage for FailAtWrite {
         StdFs.rename(from, to).await
     }
 
+    async fn set_executable(&self, path: &Path, executable: bool) -> io::Result<()> {
+        StdFs.set_executable(path, executable).await
+    }
+
+    async fn set_link(&self, path: &Path, target: &Path) -> io::Result<()> {
+        StdFs.set_link(path, target).await
+    }
+
     fn capabilities(&self) -> Capabilities {
         Capabilities::LOCAL_FS
     }
@@ -99,6 +118,8 @@ pub enum FsEvent {
     Sync(PathBuf, Durability),
     Rename(PathBuf, PathBuf),
     Remove(PathBuf),
+    SetExecutable(PathBuf, bool),
+    SetLink(PathBuf, PathBuf),
 }
 
 #[derive(Debug)]
@@ -157,6 +178,20 @@ impl Storage for RecordingFs {
             .borrow_mut()
             .push(FsEvent::Rename(from.to_path_buf(), to.to_path_buf()));
         StdFs.rename(from, to).await
+    }
+
+    async fn set_executable(&self, path: &Path, executable: bool) -> io::Result<()> {
+        self.log
+            .borrow_mut()
+            .push(FsEvent::SetExecutable(path.to_path_buf(), executable));
+        StdFs.set_executable(path, executable).await
+    }
+
+    async fn set_link(&self, path: &Path, target: &Path) -> io::Result<()> {
+        self.log
+            .borrow_mut()
+            .push(FsEvent::SetLink(path.to_path_buf(), target.to_path_buf()));
+        StdFs.set_link(path, target).await
     }
 
     fn capabilities(&self) -> Capabilities {

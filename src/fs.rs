@@ -84,6 +84,45 @@ pub trait ReadStorage {
             }
         }
     }
+
+    /// Whether the file at `path` can be run — or `None` where that is not a
+    /// thing this backend has.
+    ///
+    /// `None` is the load-bearing answer, and it is *declined*, never guessed:
+    /// a backend that cannot observe the bit — Windows, [`InMemoryFs`], a
+    /// document provider handing over opaque blobs — must not answer `false`,
+    /// because "not executable" and "I do not model this" are different facts,
+    /// and a consumer restoring modes across two machines must be able to tell
+    /// them apart rather than take turns flipping a bit neither can see. The
+    /// default is the decline, so a backend with no opinion is already correct.
+    ///
+    /// Follows symlinks, like [`metadata`](ReadStorage::metadata).
+    fn executable(&self, path: &Path) -> impl Future<Output = io::Result<Option<bool>>> {
+        async move {
+            let _ = path;
+            Ok(None)
+        }
+    }
+
+    /// What the symbolic link at `path` points at, **read rather than
+    /// followed** — or `None` where this backend models no links at all.
+    /// Mirrors [`std::fs::read_link`], with the decline folded in.
+    ///
+    /// `Ok(None)` is reserved for the decline, exactly as
+    /// [`executable`](ReadStorage::executable)'s is: it means *there is no such
+    /// thing here*, it is the default's answer, and an implementation that does
+    /// model links must never give it. Such an implementation answers with the
+    /// target, or with an error where the path holds no link — which is what
+    /// `readlink` already does, and what lets one call settle whether links
+    /// exist at all. Reading the link is what makes recording one safe;
+    /// following it would make the thing at the other end look like a file of
+    /// this tree.
+    fn read_link(&self, path: &Path) -> impl Future<Output = io::Result<Option<PathBuf>>> {
+        async move {
+            let _ = path;
+            Ok(None)
+        }
+    }
 }
 
 /// A borrowed [`ReadStorage`] is itself a [`ReadStorage`] — so an owned backend
@@ -113,6 +152,14 @@ impl<S: ReadStorage + ?Sized> ReadStorage for &S {
 
     async fn try_exists(&self, path: &Path) -> io::Result<bool> {
         (**self).try_exists(path).await
+    }
+
+    async fn executable(&self, path: &Path) -> io::Result<Option<bool>> {
+        (**self).executable(path).await
+    }
+
+    async fn read_link(&self, path: &Path) -> io::Result<Option<PathBuf>> {
+        (**self).read_link(path).await
     }
 }
 
@@ -144,6 +191,14 @@ impl<S: ReadStorage + ?Sized> ReadStorage for Arc<S> {
 
     async fn try_exists(&self, path: &Path) -> io::Result<bool> {
         (**self).try_exists(path).await
+    }
+
+    async fn executable(&self, path: &Path) -> io::Result<Option<bool>> {
+        (**self).executable(path).await
+    }
+
+    async fn read_link(&self, path: &Path) -> io::Result<Option<PathBuf>> {
+        (**self).read_link(path).await
     }
 }
 
@@ -272,6 +327,28 @@ impl ReadStorage for StdFs {
             md.len(),
             md.modified().ok(),
         ))
+    }
+
+    #[cfg(unix)]
+    async fn executable(&self, path: &Path) -> io::Result<Option<bool>> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Any execute bit counts: the question is "can this be run", not
+        // "by whom" — the same one-bit grain `set_executable` writes.
+        let md = std::fs::metadata(path)?;
+        Ok(Some(md.permissions().mode() & 0o111 != 0))
+    }
+
+    // On a platform with no execute bit the trait's default — the decline —
+    // is already the honest answer, so only unix overrides it.
+
+    async fn read_link(&self, path: &Path) -> io::Result<Option<PathBuf>> {
+        // `read_link` reads the link and does not follow it; it errors where
+        // the path holds no link, which is what keeps `Ok(None)` meaning
+        // "this backend has no such thing" — an answer `StdFs` never gives,
+        // on Windows included, where links exist and can be read even though
+        // creating one takes a privilege `set_link` may not have.
+        std::fs::read_link(path).map(Some)
     }
 }
 
@@ -424,6 +501,57 @@ pub trait Storage: ReadStorage {
         async move {
             let _ = (from, to);
             Ok(())
+        }
+    }
+
+    /// Make the file at `path` runnable, or not. One bit, not a mode: nothing
+    /// else about the file changes.
+    ///
+    /// The write half of [`executable`](ReadStorage::executable), and the
+    /// default follows from its decline: a backend whose `executable` answers
+    /// `None` has nothing to set, so doing nothing *is* the honest
+    /// implementation — the same reasoning as
+    /// [`copy_permissions`](Storage::copy_permissions), where a backend with no
+    /// permission model loses nothing by not preserving one. A backend that
+    /// does model the bit overrides both members together; answering one
+    /// without the other would let a change set read a bit it cannot restore,
+    /// or restore one it cannot read.
+    fn set_executable(
+        &self,
+        path: &Path,
+        executable: bool,
+    ) -> impl Future<Output = io::Result<()>> {
+        async move {
+            let _ = (path, executable);
+            Ok(())
+        }
+    }
+
+    /// Place a symbolic link at `path` pointing at `target`, replacing whatever
+    /// is there.
+    ///
+    /// The write half of [`read_link`](ReadStorage::read_link). Nothing here
+    /// opens or resolves `target`: a link may point outside the tree, at
+    /// nothing, or at itself, and the only consequence is an honest symlink
+    /// pointing where symlinks are allowed to point. The replacement addresses
+    /// the entry itself, never the entry's referent — a link at `path` is
+    /// removed and remade rather than written through, or a plain file there
+    /// gives way to the link.
+    ///
+    /// The default *refuses* with [`Unsupported`](io::ErrorKind::Unsupported),
+    /// where [`set_executable`](Storage::set_executable)'s default no-ops —
+    /// the asymmetry is deliberate. An execute bit not modeled costs nothing to
+    /// leave unset; a link not modeled has no honest substitute, because a
+    /// plain file holding the target's text would invent content nothing asked
+    /// to write. A backend with no links must say so, and the caller decides
+    /// what its absence means.
+    fn set_link(&self, path: &Path, target: &Path) -> impl Future<Output = io::Result<()>> {
+        async move {
+            let _ = (path, target);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this backend does not model symbolic links",
+            ))
         }
     }
 
@@ -614,6 +742,14 @@ impl<S: Storage + ?Sized> Storage for &S {
         (**self).copy_permissions(from, to).await
     }
 
+    async fn set_executable(&self, path: &Path, executable: bool) -> io::Result<()> {
+        (**self).set_executable(path, executable).await
+    }
+
+    async fn set_link(&self, path: &Path, target: &Path) -> io::Result<()> {
+        (**self).set_link(path, target).await
+    }
+
     fn capabilities(&self) -> Capabilities {
         (**self).capabilities()
     }
@@ -654,6 +790,14 @@ impl<S: Storage + ?Sized> Storage for Arc<S> {
 
     async fn copy_permissions(&self, from: &Path, to: &Path) -> io::Result<()> {
         (**self).copy_permissions(from, to).await
+    }
+
+    async fn set_executable(&self, path: &Path, executable: bool) -> io::Result<()> {
+        (**self).set_executable(path, executable).await
+    }
+
+    async fn set_link(&self, path: &Path, target: &Path) -> io::Result<()> {
+        (**self).set_link(path, target).await
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -859,6 +1003,54 @@ impl Storage for StdFs {
 
     async fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         std::fs::rename(from, to)
+    }
+
+    #[cfg(unix)]
+    async fn set_executable(&self, path: &Path, executable: bool) -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        let held = permissions.mode();
+        // Every bit the owner's own umask chose stays theirs. This carries one
+        // bit, so it sets one bit: the execute bits follow the read bits, so a
+        // file readable by its group becomes runnable by its group and a
+        // private file stays private.
+        let mode = if executable {
+            held | ((held & 0o444) >> 2)
+        } else {
+            held & !0o111
+        };
+        if mode == held {
+            return Ok(());
+        }
+        permissions.set_mode(mode);
+        std::fs::set_permissions(path, permissions)
+    }
+
+    // On a platform with no execute bit, `set_executable`'s default — doing
+    // nothing — is already correct, so only unix overrides it. `set_link` is
+    // the other way round: Windows has symbolic links and does not hand them
+    // out (creating one wants a privilege an ordinary account lacks), so the
+    // default's refusal is the honest answer there and only unix overrides.
+
+    #[cfg(unix)]
+    async fn set_link(&self, path: &Path, target: &Path) -> io::Result<()> {
+        // Made at a temporary sibling and renamed over the target, the same
+        // shape as `write_atomic` and for the same reason: remove-then-symlink
+        // has a window in which `path` names nothing, and a crash in it loses
+        // the file that was there without leaving the link that was promised.
+        // The rename is the atomic instant; a failure before it leaves the
+        // target exactly as it was, plus at worst one stray dotfile.
+        let tmp = temp_sibling(path);
+        let _ = std::fs::remove_file(&tmp);
+        std::os::unix::fs::symlink(target, &tmp)?;
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(e)
+            }
+        }
     }
 
     async fn copy_permissions(&self, from: &Path, to: &Path) -> io::Result<()> {
