@@ -27,13 +27,20 @@
 //! [`barrier`](OrderedBatch::barrier)s. Within a tier nothing is ordered —
 //! payloads may land in any order, because nothing names them yet. At each
 //! barrier, everything staged so far is ordered ([`Durability::Ordered`])
-//! ahead of everything after it: each tier's files are flushed to the barrier
-//! and each directory that gained an entry is flushed too, since a name in a
-//! directory is its own write and persists separately from the bytes it
-//! names. The final tier is flushed to whatever `finality` the caller asks —
-//! [`Durable`](Durability::Durable) for "this write survives power loss",
-//! [`Ordered`](Durability::Ordered) for "consistent, but the tail may be
-//! lost with the crash that interrupted it".
+//! ahead of everything after it: each tier's files are
+//! [pushed](Durability::Pushed) to the device, each directory that gained an
+//! entry is pushed too — since a name in a directory is its own write and
+//! persists separately from the bytes it names — and then **one** barrier
+//! orders the lot. A barrier speaks for everything the device has been
+//! handed, so a tier of `N` files in `D` directories costs `N + D` pushes
+//! and one barrier, not `N + D` barriers; on a platform where a push is
+//! `fsync(2)` and a barrier is a queue command, that is most of the cost of
+//! landing a large tier. The final tier is pushed and capped to whatever
+//! `finality` the caller asks — [`Durable`](Durability::Durable) for "this
+//! write survives power loss", [`Ordered`](Durability::Ordered) for
+//! "consistent, but the tail may be lost with the crash that interrupted
+//! it", [`Pushed`](Durability::Pushed) for "handed over, and the barrier is
+//! mine to issue".
 //!
 //! A crash therefore leaves **some prefix of the barriers**: every tier
 //! before the interruption whole and durable, the interrupted tier possibly
@@ -42,23 +49,28 @@
 //!
 //! ## What a partial tier can hold
 //!
-//! The two op kinds degrade differently inside the interrupted tier, and the
+//! Nothing orders the files of one tier against each other — that is what
+//! "within a tier nothing is ordered" means, and the pushes do not change
+//! it. So the interrupted tier is not "the first `k` files whole and the
+//! rest absent": **any** of its files may be present, absent, or partial,
+//! independently. The two op kinds degrade differently inside it, and the
 //! difference is the port's, honestly inherited:
 //!
 //! - A [`write`](OrderedBatch::write) lands through the backend's own
 //!   [`Storage::replace`] — its override included — so a crash shows the
 //!   whole old file or the whole new one wherever the backend can promise
-//!   that, and the documented degrade where it cannot. Its flush rides with
-//!   the tier's, like everything else here: the bytes are barriered inside
-//!   the call, and the entry that publishes them is the directory flush's to
-//!   carry.
+//!   that, and the documented degrade where it cannot. That one barrier is
+//!   `replace`'s own, not the tier's: a rename must never overtake the bytes
+//!   it publishes, and no push can say so. The entry that publishes them is
+//!   the tier's directory push to carry.
 //! - A [`create_new`](OrderedBatch::create_new) is an exclusive create under
 //!   its final name — decision-grade for concurrency (two writers racing to
-//!   one name see one winner), but a crash mid-write can leave the newest
-//!   tier's file **torn**. A consumer whose names promise their contents
-//!   (a digest-named blob) must be able to recognize and discard a torn
-//!   file nothing names yet; the barrier guarantees the "nothing names it
-//!   yet" half.
+//!   one name see one winner), but a crash can leave **any number** of the
+//!   interrupted tier's files **torn**, not just the one in flight, since
+//!   nothing orders them and the one barrier that would have was never
+//!   reached. A consumer whose names promise their contents (a digest-named
+//!   blob) must be able to recognize and discard every torn file nothing
+//!   names yet; the barrier guarantees the "nothing names it yet" half.
 //!
 //! ## What this does not do
 //!
@@ -217,9 +229,11 @@ impl OrderedBatch {
     }
 
     /// Execute every staged op against `fs`, rooted at `root`, tier by tier:
-    /// each tier's files and freshly-named directories are flushed
-    /// [`Ordered`](Durability::Ordered) before the next tier begins, and the
-    /// last tier is flushed to `finality`.
+    /// each tier's files and freshly-named directories are
+    /// [pushed](Durability::Pushed) and then ordered
+    /// ([`Ordered`](Durability::Ordered)) by one barrier at the root before
+    /// the next tier begins, and the last tier is pushed and capped to
+    /// `finality`.
     ///
     /// `finality` is the strength of the batch's own landing:
     /// [`Durable`](Durability::Durable) makes "this call returned" mean "this
@@ -227,10 +241,16 @@ impl OrderedBatch {
     /// mean only "no crash shows a later tier without an earlier one" — the
     /// batch itself may vanish with the crash, wholly or from some barrier
     /// on, and for a caller that treats its tree as append-only that is often
-    /// enough, at the cost of not one `Durable` request anywhere. (Whether a
-    /// request is literally a drain is the backend's affair: without
-    /// `barrier-fsync`, `StdFs` answers even `Ordered` with the full flush —
-    /// stronger than asked, as ever.)
+    /// enough, at the cost of not one `Durable` request anywhere.
+    /// [`Pushed`](Durability::Pushed) makes it mean only "every earlier tier
+    /// is ordered ahead of the last, and the last has been handed to the
+    /// device": no barrier closes the batch, so what follows it is not
+    /// ordered after it until the caller issues one — the shape for a
+    /// caller landing a set one batch at a time that will
+    /// [`sync`](Storage::sync) `Ordered` once at the end. (Whether a request
+    /// is literally a push, a barrier, or a drain is the backend's affair:
+    /// without `barrier-fsync`, `StdFs` answers `Ordered` with the full
+    /// flush — stronger than asked, as ever.)
     ///
     /// On an error the apply stops where it stands and the tree holds a
     /// consistent prefix — see the module docs for exactly what that means
@@ -260,12 +280,16 @@ impl OrderedBatch {
 
 /// Land one tier and flush it to `need`.
 ///
-/// Files first, in staged order; then one flush per file that still owes one;
-/// then one flush per directory an op landed in (gained a name or not — an
-/// extra barrier on an unchanged directory costs less than proving it
-/// unchanged). The directory flushes come last because they are what publish
-/// the tier's *names* — a name must never be ordered ahead of the bytes it
-/// stands for.
+/// Files first, in staged order; then one push per file that still owes one;
+/// then one push per directory an op landed in (gained a name or not — an
+/// extra push on an unchanged directory costs less than proving it
+/// unchanged); then one cap at the root, which is where the tier's ordering
+/// actually comes from. Nothing within a tier is ordered, the pushes
+/// included — the cap orders the whole tier against what follows, and a
+/// name published in the tier is ordered ahead of nothing but the next tier.
+/// The directory pushes still come after the files' because the order is
+/// deterministic and the reading is the natural one, not because it buys
+/// anything.
 async fn apply_tier<FS: Storage>(
     fs: &FS,
     root: &Path,
@@ -297,10 +321,12 @@ async fn apply_tier<FS: Storage>(
             // Through the backend's own `replace` — override included, so a
             // native atomic replacement (a locked in-memory swap, a
             // transactional store) is honored rather than bypassed. The
-            // bytes are barriered inside the call; the rename-published
-            // entry rides on the tier's directory flush, and a backend that
-            // cannot replace atomically leaves its plainly-written bytes as
-            // an extra debt for the same flush.
+            // bytes are barriered inside the call — that one is `replace`'s
+            // own, since a rename must never overtake the bytes it
+            // publishes; the rename-published entry rides on the tier's
+            // directory push, and a backend that cannot replace atomically
+            // leaves its plainly-written bytes as an extra debt for the same
+            // pass.
             BatchOp::Write { bytes, .. } => {
                 fs.replace(&full, bytes).await?;
                 if !atomic_replace {
@@ -313,20 +339,14 @@ async fn apply_tier<FS: Storage>(
             }
         }
     }
-    // The tier's whole debt in one pass: files first, then the directories
-    // that publish their names. An `Ordered` tier is barriers throughout; a
-    // `Durable` one is barriers capped by a single drain — the corollary
-    // [`Durability::Ordered`] documents, cashed in.
-    let debts = flush.into_iter().chain(dirs);
-    match need {
-        Durability::Ordered => {
-            for path in debts {
-                fs.sync(&path, Durability::Ordered).await?;
-            }
-            Ok(())
-        }
-        Durability::Durable => Ok(crate::fs::flush_all_durable(fs, debts, root).await?),
-    }
+    // The tier's whole debt in one pass: every file that still owes a flush
+    // and every directory that publishes a name, each handed over, then one
+    // cap at the root that speaks for all of them — a barrier for an
+    // `Ordered` tier, a drain for a `Durable` one. N + D pushes and one
+    // barrier, where a barrier per debt would be N + D barriers: the pairing
+    // [`Durability`] documents, cashed in. A `Pushed` finality caps nothing —
+    // the tier is handed over, and the barrier is the caller's to issue.
+    Ok(crate::fs::flush_all(fs, flush.into_iter().chain(dirs), root, need).await?)
 }
 
 #[cfg(test)]
@@ -371,9 +391,9 @@ mod tests {
 
     #[test]
     fn flushes_each_tier_to_the_barrier_and_the_last_to_finality() {
-        // The protocol, pinned event by event: tier files flush `Ordered`
-        // with their directory after them, and only the last tier sees the
-        // caller's finality.
+        // The protocol, pinned event by event: tier files pushed, their
+        // directories pushed after them, one barrier at the root to order
+        // the lot — and only the last tier sees the caller's finality.
         let root = tmp("events");
         let fs = RecordingFs::local();
         let mut batch = OrderedBatch::new();
@@ -386,19 +406,106 @@ mod tests {
             fs.events(),
             vec![
                 FsEvent::CreateNew(root.join("blobs/a")),
-                FsEvent::Sync(root.join("blobs/a"), Durability::Ordered),
-                // The root is flushed too: it gained the `blobs` entry, and
-                // a directory entry persists separately from what it names.
+                FsEvent::Sync(root.join("blobs/a"), Durability::Pushed),
+                // `blobs` gained the entry; the root gained `blobs`, and owes
+                // a push too — but it is the anchor, so the barrier that
+                // caps the tier is its push as well.
+                FsEvent::Sync(root.join("blobs"), Durability::Pushed),
                 FsEvent::Sync(root.clone(), Durability::Ordered),
-                FsEvent::Sync(root.join("blobs"), Durability::Ordered),
                 FsEvent::CreateNew(root.join("rev")),
-                // The `Durable` tier is barriers capped by one drain — the
-                // corollary, cashed in: the directory flush at the end
-                // carries everything barriered before it.
-                FsEvent::Sync(root.join("rev"), Durability::Ordered),
+                // The `Durable` tier is pushes capped by one drain — the
+                // pairing, cashed in: the drain at the end carries
+                // everything pushed before it.
+                FsEvent::Sync(root.join("rev"), Durability::Pushed),
                 FsEvent::Sync(root.clone(), Durability::Durable),
             ]
         );
+    }
+
+    #[test]
+    fn a_tier_costs_a_push_per_debt_and_one_barrier() {
+        // The saving, pinned by count: a tier of N creates across D
+        // directories is N + D pushes and exactly one barrier, never N + D
+        // barriers. The root is the anchor, so when it is among the D its
+        // push and the barrier are one call.
+        let root = tmp("push-count");
+        std::fs::create_dir_all(root.join("blobs")).unwrap();
+        std::fs::create_dir_all(root.join("ops")).unwrap();
+        let fs = RecordingFs::local();
+        let mut batch = OrderedBatch::new();
+        for i in 0..5 {
+            batch.create_new(format!("blobs/{i}"), "payload");
+        }
+        for i in 0..3 {
+            batch.create_new(format!("ops/{i}"), "op");
+        }
+        batch.barrier();
+        batch.create_new("rev", "names them all");
+        block_on(batch.apply(&fs, &root, Durability::Ordered)).unwrap();
+
+        let syncs = |need: Durability| -> Vec<PathBuf> {
+            fs.events()
+                .iter()
+                .filter_map(|e| match e {
+                    FsEvent::Sync(p, n) if *n == need => Some(p.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        // First tier: 8 files + 2 directories, none of them the root.
+        // Second tier: 1 file; its directory is the root, folded into the
+        // cap. 8 + 2 + 1 = 11 pushes.
+        assert_eq!(syncs(Durability::Pushed).len(), 11, "{:?}", fs.events());
+        // One barrier per tier, both at the root.
+        assert_eq!(
+            syncs(Durability::Ordered),
+            vec![root.clone(), root.clone()],
+            "{:?}",
+            fs.events()
+        );
+        assert!(syncs(Durability::Durable).is_empty(), "{:?}", fs.events());
+        // And the barrier closes its tier: every push of tier one precedes
+        // it, and the first event of tier two follows it.
+        let events = fs.events();
+        let first_barrier = events
+            .iter()
+            .position(|e| matches!(e, FsEvent::Sync(_, Durability::Ordered)))
+            .unwrap();
+        let rev = events
+            .iter()
+            .position(|e| matches!(e, FsEvent::CreateNew(p) if *p == root.join("rev")))
+            .unwrap();
+        assert_eq!(first_barrier, 8 + 8 + 2, "{events:?}");
+        assert_eq!(rev, first_barrier + 1, "{events:?}");
+    }
+
+    #[test]
+    fn a_pushed_finality_hands_the_last_tier_over_and_barriers_nothing() {
+        // The shape for a caller landing a set one batch at a time: every
+        // earlier tier is still barriered, the last is pushed and left for
+        // the caller's own barrier — not one `Ordered` or `Durable` request
+        // after the last tier's creates.
+        let root = tmp("pushed-finality");
+        let fs = RecordingFs::local();
+        let mut batch = OrderedBatch::new();
+        batch.create_new("blobs/a", "a");
+        batch.barrier();
+        batch.create_new("blobs/b", "b");
+        block_on(batch.apply(&fs, &root, Durability::Pushed)).unwrap();
+
+        assert_eq!(
+            fs.events(),
+            vec![
+                FsEvent::CreateNew(root.join("blobs/a")),
+                FsEvent::Sync(root.join("blobs/a"), Durability::Pushed),
+                FsEvent::Sync(root.join("blobs"), Durability::Pushed),
+                FsEvent::Sync(root.clone(), Durability::Ordered),
+                FsEvent::CreateNew(root.join("blobs/b")),
+                FsEvent::Sync(root.join("blobs/b"), Durability::Pushed),
+                FsEvent::Sync(root.join("blobs"), Durability::Pushed),
+            ]
+        );
+        assert_eq!(read(&root, "blobs/b").as_deref(), Some("b"));
     }
 
     #[test]

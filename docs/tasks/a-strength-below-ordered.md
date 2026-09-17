@@ -1,13 +1,20 @@
 ---
 title: "A strength below Ordered: handed over"
 description: A third `Durability` — the bytes pushed to the device and ordered against nothing — so that a tier of N files costs N pushes and one barrier rather than N barriers, and a consumer landing a set can ask for the same
-status: open
+status: done
 created: 2026-09-16
-updated: 2026-09-16
+updated: 2026-09-17
 part_of: "[Tasks](tasks.md)"
 ---
 
 # A strength below Ordered: handed over
+
+**Status.** Done, by `feat(fs)!: a strength below Ordered — Pushed, and a
+tier that pays one barrier` (unreleased at the time of writing). The
+variant is `Durability::Pushed` / `SyncGuarantee::Pushed`; `apply_tier` and
+the shared `flush_all` push every debt and cap once at the root;
+`ordered::tests::a_tier_costs_a_push_per_debt_and_one_barrier` pins the
+count. The version is still Adam's to name.
 
 `Durability` names two strengths, and `Ordered` is the weaker: a barrier,
 everything before it lands before anything after. On Apple platforms with

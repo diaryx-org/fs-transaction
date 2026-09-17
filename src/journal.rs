@@ -429,10 +429,10 @@ impl Journal {
         // Recovery makes the same promise a clean apply does: once the
         // journal is given up, the state it certified survives a power cut.
         // The replayed renames, removals, bits, and fresh directory chains
-        // are flushed — barriers capped by one durable sync — before the
+        // are flushed — pushes capped by one durable sync — before the
         // journal goes; the deletion itself is not flushed, because a
         // resurrected journal replays idempotently over ops already durable.
-        crate::fs::flush_all_durable(fs, touched, root).await?;
+        crate::fs::flush_all(fs, touched, root, crate::fs::Durability::Durable).await?;
         fs.remove_file(&journal).await?;
         Ok(Recovered::Applied(ops.len()))
     }

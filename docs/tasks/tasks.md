@@ -2,7 +2,7 @@
 title: Tasks
 description: Deferred work in fs-transaction — one file each, every one with a done state
 created: 2026-09-16
-updated: 2026-09-16
+updated: 2026-09-17
 contents:
   - "[A strength below Ordered: handed over](a-strength-below-ordered.md)"
 ---

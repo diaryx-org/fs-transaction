@@ -26,6 +26,8 @@ libc = { version = "0.2", optional = true }
 # Answer `Durability::Ordered` with `F_BARRIERFSYNC` on Apple platforms — a
 # queue barrier — instead of `sync_all`, which is `F_FULLFSYNC` there and
 # drains the drive's entire write cache. Elsewhere (and without the feature)
-# every sync stays the full flush: always correct, since a backend may answer
-# stronger than asked, never weaker.
+# every barrier and drain is the full flush: always correct, since a backend
+# may answer stronger than asked, never weaker. `Durability::Pushed` needs no
+# feature: it is plain `fsync(2)` on Apple, declared by hand, and `sync_all`
+# everywhere else.
 barrier-fsync = ["dep:libc"]

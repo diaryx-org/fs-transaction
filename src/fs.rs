@@ -593,12 +593,16 @@ pub trait Storage: ReadStorage {
     /// which of the two it actually meant.
     ///
     /// `need` is the *weakest* guarantee that is still correct at the call site,
-    /// not a wish. [`Durability::Ordered`] asks only that everything written to
-    /// `path` before this call land before anything written after it — enough to
-    /// stop a rename overtaking the bytes it publishes, and on some platforms far
-    /// cheaper than the real thing. [`Durability::Durable`] asks that the bytes
-    /// survive power loss. A backend may always answer with something stronger
-    /// than it was asked for; it may never answer with something weaker.
+    /// not a wish. [`Durability::Pushed`] asks only that `path`'s writes reach
+    /// the device before the call returns, ordered against nothing — the
+    /// down payment a later barrier or drain can then speak for, and what a
+    /// batch pays per file. [`Durability::Ordered`] asks that everything
+    /// handed over before this call land before anything written after it —
+    /// enough to stop a rename overtaking the bytes it publishes, and on some
+    /// platforms far cheaper than the real thing. [`Durability::Durable`]
+    /// asks that the bytes survive power loss. A backend may always answer
+    /// with something stronger than it was asked for; it may never answer
+    /// with something weaker.
     ///
     /// The default is a no-op, which is the *correct* behavior for any backend
     /// whose [`capabilities`](Storage::capabilities) report
@@ -948,12 +952,33 @@ impl Capabilities {
 /// What a caller needs from one [`Storage::sync`] call — the *weakest* guarantee
 /// that is still correct at that point, so that a backend able to serve it
 /// cheaply is free to.
+///
+/// Three strengths, each strictly weaker than the next, and each answerable
+/// by anything at or above it: a backend may always answer stronger than it
+/// was asked, never weaker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Durability {
-    /// A barrier: everything this backend was asked to write before this call —
-    /// to the named path *or to any other* — must land before anything written
-    /// after it. It says nothing about *when*: a crash may still lose the lot,
-    /// only never a suffix without its prefix.
+    /// Handed over: everything written to the named path before this call has
+    /// left the host for the device by the time it returns — out of the page
+    /// cache and into the drive's — ordered against nothing and promised to
+    /// nobody. A crash may lose it, and may keep it in any order relative to
+    /// anything else; what a push buys is that a *later* barrier or drain can
+    /// speak for it, since either orders (or drains) only what has reached
+    /// the device.
+    ///
+    /// That is what makes the batched protocols cheap. A barrier orders
+    /// nothing it has not pushed, so a set of `N` files needs every one of
+    /// them handed over before one barrier can order the lot — `N` pushes
+    /// and one barrier, rather than `N` barriers. On Apple platforms a push is
+    /// `fsync(2)`, which costs about what the write did, against a barrier's
+    /// queue command or a drain's cache flush; elsewhere `fsync` is already
+    /// the whole flush, so the answer is stronger than asked, as ever.
+    Pushed,
+    /// A barrier: everything handed to the device before this call — the
+    /// named path's own writes, and every path an earlier `sync` of any
+    /// strength pushed — must land before anything written after it. It says
+    /// nothing about *when*: a crash may still lose the lot, only never a
+    /// suffix without its prefix.
     ///
     /// The barrier is backend-wide on purpose, not scoped to the one path
     /// named. [`Storage::write_atomic`] only needs the narrow reading — the
@@ -961,14 +986,19 @@ pub enum Durability {
     /// [`crate::ordered`] builds on the wide one: a batch whose second tier
     /// must never be seen without its first is ordering writes to *different*
     /// files against each other, and a "barrier" that only ordered a file
-    /// against itself could not say that. Both `fsync` (which completes the
-    /// named writes outright) and Apple's `F_BARRIERFSYNC` (a queue barrier
-    /// the whole device honors) keep the wide promise; a primitive that
-    /// orders only one file's own writes — `sync_file_range` and its kin —
-    /// does not, and a backend with nothing stronger must declare
-    /// [`SyncGuarantee::None`] rather than a barrier it cannot keep. On Apple
-    /// platforms the distinction from [`Durable`](Durability::Durable) is the
-    /// difference between a barrier and draining the drive's write cache.
+    /// against itself could not say that. Wide, but not omniscient: a barrier
+    /// speaks only for what has reached the device, and a file written and
+    /// never synced is still in the host's page cache, where no barrier can
+    /// see it — which is why every protocol here [pushes](Durability::Pushed)
+    /// each debt before the one barrier that orders them. Both `fsync` (which
+    /// completes the named writes outright) and Apple's `F_BARRIERFSYNC` (a
+    /// queue barrier the whole device honors) keep the promise; a primitive
+    /// that flushes one object and orders nothing — `sync_file_range` and its
+    /// kin — is a push, and a backend with nothing stronger declares
+    /// [`SyncGuarantee::Pushed`] rather than a barrier it cannot keep. On
+    /// Apple platforms the distinction from [`Durable`](Durability::Durable)
+    /// is the difference between a barrier and draining the drive's write
+    /// cache.
     ///
     /// The wide promise has a corollary the journal protocols lean on: once
     /// any *later* write is durably on disk, everything ordered before it is
@@ -981,17 +1011,17 @@ pub enum Durability {
     /// And not the named path's bytes alone: on a backend whose
     /// [`Ordered`](Durability::Ordered) answers are true barriers rather than
     /// flushes, a `Durable` answer is contractually a **drain** — everything
-    /// the backend accepted and barriered before this call lands durably with
+    /// the backend pushed or barriered before this call lands durably with
     /// it. This is the other half of the barrier's bargain, and it is not
-    /// derivable from ordering alone: a batch that barriers ten paths and
-    /// drains an eleventh has issued no write *after* the barriers for pure
+    /// derivable from ordering alone: a batch that pushes ten paths and
+    /// drains an eleventh has issued no write *after* the pushes for pure
     /// ordering to hang the ten on. Both primitives this crate ships keep the
-    /// pair honestly — plain `fsync` because every "barrier" was a full flush
-    /// to begin with, `F_FULLFSYNC` because it drains the device's whole
-    /// cache — and a backend that can only drain the named object must answer
-    /// `Ordered` with a flush rather than a barrier, or declare
-    /// [`SyncGuarantee::None`]. The batched-flush protocols in this crate
-    /// (barriers capped by one drain) are licensed by this pairing.
+    /// pair honestly — plain `fsync` because every push was a full flush to
+    /// begin with, `F_FULLFSYNC` because it drains the device's whole cache —
+    /// and a backend that can only drain the named object must answer
+    /// `Pushed` and `Ordered` with a flush, or declare a lesser
+    /// [`SyncGuarantee`]. The batched-flush protocols in this crate (pushes
+    /// capped by one barrier or one drain) are licensed by this pairing.
     Durable,
 }
 
@@ -999,18 +1029,24 @@ pub enum Durability {
 /// a [`Durability`] request, declared once in [`Capabilities`] rather than
 /// discovered per call.
 ///
-/// Deliberately three-valued rather than the "can this backend flush?" boolean
-/// it replaces, because that question has a common and useful middle answer it
+/// Deliberately graded rather than the "can this backend flush?" boolean it
+/// replaces, because that question has common and useful middle answers it
 /// could not express: a backend that orders writes against each other without
-/// paying for a device-wide cache drain. Offered only `true` and `false`, such a
-/// backend has to either overstate — claiming a durability it does not deliver —
-/// or understate, claiming it cannot flush at all when ordering is precisely
-/// what [`Storage::write_atomic`] asks it for.
+/// paying for a device-wide cache drain, or one that can hand a single
+/// object's writes to the device and order nothing at all. Offered only
+/// `true` and `false`, such a backend has to either overstate — claiming a
+/// durability it does not deliver — or understate, claiming it cannot flush at
+/// all when ordering is precisely what [`Storage::write_atomic`] asks it for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SyncGuarantee {
     /// `sync` does nothing: an in-memory store, or a port with no flush
     /// primitive under it to call.
     None,
+    /// `sync` hands the named object's writes to the device, but orders them
+    /// against nothing else and promises none of them outlives a power cut —
+    /// a per-object flush with no barrier behind it: `sync_file_range`, an
+    /// OPFS access handle's `flush()`.
+    Pushed,
     /// `sync` orders writes against each other, but does not promise any of them
     /// outlives a power cut.
     Ordered,
@@ -1022,7 +1058,10 @@ impl SyncGuarantee {
     /// Whether a backend making this guarantee can honor `need`.
     pub const fn satisfies(self, need: Durability) -> bool {
         match need {
-            Durability::Ordered => !matches!(self, SyncGuarantee::None),
+            Durability::Pushed => !matches!(self, SyncGuarantee::None),
+            Durability::Ordered => {
+                matches!(self, SyncGuarantee::Ordered | SyncGuarantee::Durable)
+            }
             Durability::Durable => matches!(self, SyncGuarantee::Durable),
         }
     }
@@ -1066,42 +1105,50 @@ pub(crate) async fn create_dir_all_traced<FS: Storage>(
     Ok(changed)
 }
 
-/// Make every path in `paths` durable at the price of one drain: a barrier on
-/// each, then one [`Durable`](Durability::Durable) flush of `anchor`.
+/// Flush every path in `paths` to the strength `need` at the price of one
+/// barrier or one drain: a [push](Durability::Pushed) on each, then one
+/// `need` flush of `anchor` that speaks for the lot.
 ///
-/// This is the barrier-and-drain pairing [`Durability`] documents, cashed in:
-/// on a backend whose `Ordered` answers are full flushes, every barrier here
-/// already made its path durable and the cap adds nothing; on a backend whose
-/// `Ordered` is a true barrier, the `Durable` answer is contractually a drain
-/// that carries everything previously barriered with it. Either way the list
-/// is durable for one drain instead of one per path.
+/// This is the push-and-cap pairing [`Durability`] documents, cashed in. A
+/// barrier orders everything the device has been handed, and a drain lands
+/// it — so every debt is handed over first, and the cap does the rest: one
+/// [`Ordered`](Durability::Ordered) orders the whole list ahead of whatever
+/// comes next, one [`Durable`](Durability::Durable) carries the whole list
+/// through a power cut. On a backend whose pushes are full flushes every
+/// push already did the cap's work and the cap adds nothing; on a backend
+/// whose pushes are pushes, the cap is what the pushes were for. Either way
+/// the list costs one barrier or one drain instead of one per path. A `need`
+/// of `Pushed` asks for no cap at all: every path is handed over, the anchor
+/// included only if it is a debt, and nothing orders them.
 ///
-/// `anchor` — not the last debt — takes the drain, and it must be a path that
+/// `anchor` — not the last debt — takes the cap, and it must be a path that
 /// **exists** and lives on the same filesystem as the debts: a tree's root, a
 /// journal's home. A debt can be a name a later operation moved or removed
 /// (a flipped file since renamed, a directory on a platform that declines
 /// directory syncs), and [`Storage::sync`] treats a missing path as a
 /// successful no-op — so a cap issued at whichever debt sorts last can
 /// silently issue *nothing*, and the entire batch's durability with it. The
-/// barriers tolerate that (a moved name's inode was barriered while the name
-/// was live, or is covered elsewhere); the one drain must not. A path equal
-/// to `anchor` is skipped in the barrier pass, since the cap covers it, and
-/// an empty `paths` owes nothing at all — the anchor is not flushed for its
-/// own sake.
-pub(crate) async fn flush_all_durable<FS: Storage>(
+/// pushes tolerate that (a moved name's inode was pushed while the name was
+/// live, or is covered elsewhere); the one cap must not. A path equal to
+/// `anchor` is skipped in the push pass, since the cap covers it, and an
+/// empty `paths` owes nothing at all — the anchor is not flushed for its own
+/// sake.
+pub(crate) async fn flush_all<FS: Storage>(
     fs: &FS,
     paths: impl IntoIterator<Item = PathBuf>,
     anchor: &Path,
+    need: Durability,
 ) -> io::Result<()> {
+    let capped = need != Durability::Pushed;
     let mut owed = false;
     for path in paths {
         owed = true;
-        if path != anchor {
-            fs.sync(&path, Durability::Ordered).await?;
+        if !(capped && path == anchor) {
+            fs.sync(&path, Durability::Pushed).await?;
         }
     }
-    if owed {
-        fs.sync(anchor, Durability::Durable).await?;
+    if capped && owed {
+        fs.sync(anchor, need).await?;
     }
     Ok(())
 }
@@ -1235,11 +1282,12 @@ impl Storage for StdFs {
     async fn sync(&self, path: &Path, need: Durability) -> io::Result<()> {
         // `sync_all` is the only flush in the standard library, and it is the
         // strong one — on Apple platforms it is `F_FULLFSYNC`, a drain of the
-        // drive's whole write cache. By default both requests are answered
-        // with it: stronger than `Ordered` asked for, which a backend is
-        // always allowed to be. The `barrier-fsync` feature is the cheaper
-        // answer where one exists — `F_BARRIERFSYNC` on Apple, a queue
-        // barrier the device honors — and `sync_file` below is where the
+        // drive's whole write cache. Off Apple every request is answered with
+        // it: stronger than `Pushed` or `Ordered` asked for, which a backend
+        // is always allowed to be. On Apple, `Pushed` is the plain `fsync(2)`
+        // the standard library never exposes there, and the `barrier-fsync`
+        // feature is the cheaper answer for `Ordered` — `F_BARRIERFSYNC`, a
+        // queue barrier the device honors. `sync_file` below is where the
         // request-by-request choice lives.
         sync_path(path, need)
     }
@@ -1272,18 +1320,30 @@ fn sync_path(path: &Path, need: Durability) -> io::Result<()> {
 }
 
 /// Flush one open handle to the strength `need` asks for — with the
-/// `barrier-fsync` feature on an Apple platform, the one place `Ordered` is
-/// answered more cheaply than `Durable`.
+/// `barrier-fsync` feature on an Apple platform, the one place all three
+/// strengths are answered differently.
 #[cfg(all(feature = "barrier-fsync", target_vendor = "apple"))]
 fn sync_file(file: &std::fs::File, need: Durability) -> io::Result<()> {
     use std::os::fd::AsRawFd as _;
 
     match need {
+        Durability::Pushed => push_file(file),
         // A queue barrier: everything issued before it reaches the device
         // before anything issued after, without waiting for the drive to
         // drain its cache — which is the entire request `Ordered` makes, and
         // on these platforms often the difference between microseconds and
         // milliseconds. Works on files and directories alike.
+        //
+        // And on a *clean* one: the batched protocols cap a tier with one
+        // barrier at the root, which usually has nothing dirty of its own,
+        // so the design leans on the barrier reaching the device regardless
+        // of the vnode's state. Measured on APFS (M3 Pro, macOS 27,
+        // 2026-09): after a plain `fsync` of a file elsewhere, this fcntl on
+        // a clean directory — or a clean unrelated file — costs ~150 µs, the
+        // barrier's round-trip, where `fsync` of the same clean directory is
+        // a no-op. APFS decides by what has been handed to the device since
+        // the last drain, not by the handle, and elides the barrier only
+        // right after an `F_FULLFSYNC`, when there is nothing left to order.
         Durability::Ordered => {
             // SAFETY: `fcntl` with `F_BARRIERFSYNC` takes no argument beyond
             // the descriptor, and `file` holds that descriptor open for the
@@ -1292,29 +1352,66 @@ fn sync_file(file: &std::fs::File, need: Durability) -> io::Result<()> {
                 return Ok(());
             }
             // A filesystem with no barrier support — a network mount, an
-            // exotic FUSE — refuses the fcntl. Plain `fsync` still keeps the
-            // ordering promise (the named writes reach the device before the
-            // call returns, so nothing later can precede them); it is
-            // `sync_all`'s `F_FULLFSYNC` that would overshoot here.
-            //
-            // SAFETY: as above — a plain fsync of a descriptor `file` keeps
-            // open.
-            if unsafe { libc::fsync(file.as_raw_fd()) } != -1 {
-                return Ok(());
-            }
-            Err(io::Error::last_os_error())
+            // exotic FUSE — refuses the fcntl. Plain `fsync` is the strongest
+            // ordering such a mount offers (the named writes reach it before
+            // the call returns, and there is no drive cache behind it to
+            // reorder them); it is `sync_all`'s `F_FULLFSYNC` that would
+            // overshoot here.
+            push_file(file)
         }
         Durability::Durable => file.sync_all(),
     }
 }
 
-/// Without the feature (or off Apple), both strengths are answered with
-/// `sync_all` — stronger than `Ordered` asked for, which a backend may always
-/// be, never weaker.
-#[cfg(not(all(feature = "barrier-fsync", target_vendor = "apple")))]
+/// On Apple without the feature, `Pushed` is still the plain `fsync(2)` —
+/// the standard library offers no way to ask for it, but the strength is
+/// exactly what a push means and it is the whole saving for a batch of
+/// creates — and the two strengths above it are `sync_all`'s drain, stronger
+/// than `Ordered` asked for, which a backend may always be, never weaker.
+#[cfg(all(not(feature = "barrier-fsync"), target_vendor = "apple"))]
+fn sync_file(file: &std::fs::File, need: Durability) -> io::Result<()> {
+    match need {
+        Durability::Pushed => push_file(file),
+        Durability::Ordered | Durability::Durable => file.sync_all(),
+    }
+}
+
+/// Off Apple, every strength is answered with `sync_all`: `fsync` on the
+/// Unixes, where it is already the whole flush, and `FlushFileBuffers` on
+/// Windows, where it is the only one — stronger than `Pushed` or `Ordered`
+/// asked for, which a backend may always be, never weaker.
+#[cfg(not(target_vendor = "apple"))]
 fn sync_file(file: &std::fs::File, need: Durability) -> io::Result<()> {
     let _ = need;
     file.sync_all()
+}
+
+/// Plain `fsync(2)` on Apple platforms: hand the handle's dirty pages to the
+/// device and return, without `F_FULLFSYNC`'s drain of the drive's cache. The
+/// standard library's `sync_all` *and* `sync_data` are both the drain there,
+/// so the call is declared here directly — libSystem is already linked, and
+/// one symbol with one integer argument is not a dependency worth a crate.
+/// Retried on `EINTR` as the standard library retries its own flushes.
+#[cfg(target_vendor = "apple")]
+fn push_file(file: &std::fs::File) -> io::Result<()> {
+    use std::ffi::c_int;
+    use std::os::fd::AsRawFd as _;
+
+    unsafe extern "C" {
+        // Sound to call with any integer: an invalid descriptor is `EBADF`,
+        // never undefined behaviour.
+        safe fn fsync(fd: c_int) -> c_int;
+    }
+
+    loop {
+        if fsync(file.as_raw_fd()) != -1 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1346,13 +1443,21 @@ mod tests {
 
     #[test]
     fn a_guarantee_answers_only_the_requests_it_can_keep() {
-        // The whole point of the three-valued guarantee: the middle one can serve
+        // The whole point of the graded guarantee: `Ordered` can serve
         // `write_atomic`'s staging flush without being able to serve its final
-        // one, which a boolean had no way to say.
+        // one, and `Pushed` can serve a tier's per-file push without being
+        // able to serve the barrier that caps it — neither of which a boolean
+        // had any way to say.
+        assert!(!SyncGuarantee::None.satisfies(Durability::Pushed));
         assert!(!SyncGuarantee::None.satisfies(Durability::Ordered));
         assert!(!SyncGuarantee::None.satisfies(Durability::Durable));
+        assert!(SyncGuarantee::Pushed.satisfies(Durability::Pushed));
+        assert!(!SyncGuarantee::Pushed.satisfies(Durability::Ordered));
+        assert!(!SyncGuarantee::Pushed.satisfies(Durability::Durable));
+        assert!(SyncGuarantee::Ordered.satisfies(Durability::Pushed));
         assert!(SyncGuarantee::Ordered.satisfies(Durability::Ordered));
         assert!(!SyncGuarantee::Ordered.satisfies(Durability::Durable));
+        assert!(SyncGuarantee::Durable.satisfies(Durability::Pushed));
         assert!(SyncGuarantee::Durable.satisfies(Durability::Ordered));
         assert!(SyncGuarantee::Durable.satisfies(Durability::Durable));
     }
@@ -1491,15 +1596,16 @@ mod tests {
     }
 
     #[test]
-    fn sync_answers_both_strengths_on_files_and_directories() {
-        // With `barrier-fsync` on an Apple platform this exercises the
-        // F_BARRIERFSYNC path for `Ordered`; everywhere else it is `sync_all`
-        // twice. Either way both strengths must simply work, on both kinds of
-        // object, because both protocols ask for both.
+    fn sync_answers_every_strength_on_files_and_directories() {
+        // On an Apple platform `Pushed` is the hand-declared `fsync(2)`, and
+        // with `barrier-fsync` `Ordered` is the F_BARRIERFSYNC path;
+        // everywhere else it is `sync_all` three times. Either way every
+        // strength must simply work, on both kinds of object, because the
+        // protocols ask for all of them.
         let root = tmp("sync-strengths");
         let file = root.join("doc.md");
         std::fs::write(&file, "bytes").unwrap();
-        for need in [Durability::Ordered, Durability::Durable] {
+        for need in [Durability::Pushed, Durability::Ordered, Durability::Durable] {
             block_on(StdFs.sync(&file, need)).unwrap();
             block_on(StdFs.sync(&root, need)).unwrap();
         }

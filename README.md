@@ -80,7 +80,15 @@ fn record(store: &Path) -> fs_transaction::Result<()> {
 The final argument is the strength of the batch's own landing:
 `Durable` survives a power cut once `apply` returns;
 `Ordered` keeps the tree consistent but lets the tail go with the crash
-—often enough, and one less drain of the drive's cache.
+—often enough, and one less drain of the drive's cache;
+`Pushed` hands the last tier to the device and leaves the closing barrier to you,
+for a store that lands its set one batch at a time and syncs once at the end.
+
+A tier of `N` files in `D` directories costs `N + D` pushes and one barrier,
+not `N + D` barriers: each file is handed to the device (`fsync(2)`),
+and one barrier at the root orders the lot ahead of the next tier.
+Nothing orders the files *within* a tier, so a crash can leave any number of an interrupted tier's
+`create_new` files torn — a digest-named store must be able to recognise and discard every one of them.
 
 ## Backends
 
@@ -121,8 +129,10 @@ block_on(journal.recover(&StdFs, root))?;       // the same pair, both halves
 The `barrier-fsync` feature brings in `libc`:
 on Apple platforms it answers `Durability::Ordered` with `F_BARRIERFSYNC`
 instead of `F_FULLFSYNC`'s drain of the drive's whole write cache.
-Without the feature every sync stays the full flush,
-which can be miliseconds instead of microseconds.
+Without the feature every barrier and drain is the full flush,
+which can be milliseconds instead of microseconds.
+`Durability::Pushed` is plain `fsync(2)` on Apple platforms either way—
+the standard library has no way to ask for it there, so the one symbol is declared by hand.
 I recommend enabling the feature where performance is important on Apple platforms.
 
 ## License

@@ -424,7 +424,7 @@ impl Journal {
     /// there the ops run in order, each recording how to undo itself:
     ///
     /// - **On success**, everything the set dirtied is flushed durable —
-    ///   barriers capped by one drain — and only then is the journal removed:
+    ///   pushes capped by one drain — and only then is the journal removed:
     ///   `Ok` means the change survives a power cut, not merely that it
     ///   happened.
     /// - **On an error** (a full disk, a permission fault), every op already
@@ -553,7 +553,9 @@ impl Journal {
             // applied-but-uncertified.
             let mut touched = BTreeSet::new();
             exec(fs, root, &changes.ops[0], None, &mut touched).await?;
-            return Ok(crate::fs::flush_all_durable(fs, touched, root).await?);
+            return Ok(
+                crate::fs::flush_all(fs, touched, root, crate::fs::Durability::Durable).await?,
+            );
         }
         // The commit point: durably record the whole intent before touching a
         // single document. `write_atomic` flushes it, so a crash finds the
@@ -587,13 +589,14 @@ impl Journal {
         // Applied cleanly — now make that mean something across a power cut.
         // `exec` barriered every name-unstable debt as it ran; what remains
         // is the stable ones (edited directories, fresh chains), flushed as
-        // barriers capped by one drain of the root, so the whole set survives
+        // pushes capped by one drain of the root, so the whole set survives
         // before the journal that certifies it is given up. A certification
         // that *fails* is treated exactly as a failed op — the set rolls
         // back — because "applied, but perhaps not durable" is neither of
         // the two endpoints `Ok` and `Err` name.
         if cause.is_none()
-            && let Err(e) = crate::fs::flush_all_durable(fs, touched, root).await
+            && let Err(e) =
+                crate::fs::flush_all(fs, touched, root, crate::fs::Durability::Durable).await
         {
             cause = Some(e.into());
         }
@@ -815,7 +818,7 @@ enum Undo {
 /// is dropped. A write's rename-published entry (its bytes are barriered by
 /// [`Storage::replace`] itself); a rename's or remove's edited entries; an
 /// execute-bit flip's inode; a fresh directory chain. Deferring the lot to
-/// one barrier-capped flush is what makes ten writes into a directory cost
+/// one drain-capped flush is what makes ten writes into a directory cost
 /// one drain, not ten.
 async fn exec<FS: Storage>(
     fs: &FS,
@@ -1655,7 +1658,7 @@ mod tests {
     fn a_set_of_renames_and_removes_is_flushed_before_the_journal_is_dropped() {
         // `Ok` means the change survives a power cut. Renames and removes
         // edit directory entries no per-op call flushes, so the apply must
-        // settle that debt — barriers capped by one durable sync — before it
+        // settle that debt — pushes capped by one durable sync — before it
         // gives up the journal that certifies the set.
         let root = tmp("flush-before-drop");
         std::fs::write(root.join("a.md"), "a").unwrap();
@@ -1679,11 +1682,11 @@ mod tests {
                 // The ops.
                 FsEvent::Rename(root.join("a.md"), root.join("sub/b.md")),
                 FsEvent::Remove(root.join("c.md")),
-                // The debt: both touched directories, barriers capped by one
+                // The debt: both touched directories, pushes capped by one
                 // drain of the root — the anchor, which always exists, where
                 // whichever debt happened to sort last might not — and only
                 // then the journal.
-                FsEvent::Sync(root.join("sub"), crate::fs::Durability::Ordered),
+                FsEvent::Sync(root.join("sub"), crate::fs::Durability::Pushed),
                 FsEvent::Sync(root.clone(), crate::fs::Durability::Durable),
                 FsEvent::Remove(journal),
             ]
