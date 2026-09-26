@@ -10,6 +10,8 @@ repository = "https://github.com/diaryx-org/fs-transaction"
 homepage = "https://github.com/diaryx-org/fs-transaction"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
+# The Verus proofs model the crate; they are not part of it.
+exclude = ["verify/"]
 keywords = ["filesystem", "transaction", "atomic", "crash-safety", "journal"]
 categories = ["filesystem", "asynchronous"]
 
