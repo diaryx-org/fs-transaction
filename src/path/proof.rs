@@ -1,25 +1,27 @@
-//! `src/path.rs`: `normalize` and `escapes_root`.
+//! The proof that [`fold`](super::fold) — the loop inside
+//! [`normalize`](super::normalize) and [`escapes_root`](super::escapes_root) —
+//! does what their documentation says. Compiled only by Verus
+//! (`verus_keep_ghost`); an ordinary build never sees this module.
 //!
-//! A path is modeled as the sequence of components `Path::components` yields.
-//! A `Normal` component's name is an opaque token, because the algorithm only
-//! ever asks which variant a component is. The functions below are the
-//! production loop transcribed onto that sequence. What they are proved
-//! against is not the loop itself: it is a *meaning* for a path, `lex`, which
-//! walks names from a starting directory and fails if it climbs above the
-//! root.
+//! A path is modeled as the sequence of components `Path::components` yields,
+//! with each `Normal` component named by its position. `fold` is proved to
+//! compute [`normalize`] over that sequence. `normalize` is then proved
+//! against a *meaning* for a path, [`lex`]: a walk of names from a starting
+//! directory that fails if it climbs above the root.
 //!
-//! The trusted step is `std`'s. Production builds a `PathBuf` from the
-//! components and `escapes_root` parses it back with `components()`. For a
-//! well-formed sequence with no `CurDir`, that round trip gives back the same
-//! sequence, and that is assumed here rather than proved.
+//! The trusted step is `std`'s: that `Path::components` yields a
+//! [`well_formed`] sequence (a prefix only first, a root only first or right
+//! behind it), and that the unverified shell around `fold` hands it the
+//! components' kinds and maps the indices it keeps back to those components.
 
 use vstd::prelude::*;
+use super::Kind;
 
 verus! {
 
-/// One `std::path::Component`, with `Normal`'s name reduced to a token.
+/// One `std::path::Component`, with a `Normal` name reduced to a token.
 #[derive(PartialEq, Eq, Clone, Copy)]
-pub enum Comp {
+pub(crate) enum Comp {
     Prefix,
     Root,
     Cur,
@@ -27,27 +29,27 @@ pub enum Comp {
     Normal(u64),
 }
 
-pub open spec fn is_head(c: Comp) -> bool {
+pub(crate) open spec fn is_head(c: Comp) -> bool {
     c is Prefix || c is Root
 }
 
 /// The shape `Path::components` guarantees: a `Prefix` only first, and a
 /// `Root` only first or directly after the `Prefix`.
-pub open spec fn well_formed(p: Seq<Comp>) -> bool {
+pub(crate) open spec fn well_formed(p: Seq<Comp>) -> bool {
     &&& forall|i: int| 0 <= i < p.len() && (#[trigger] p[i]) is Prefix ==> i == 0
     &&& forall|i: int|
         0 <= i < p.len() && (#[trigger] p[i]) is Root ==> (i == 0 || (i == 1 && p[0] is Prefix))
 }
 
 /// A relative path: no `Prefix` and no `Root` anywhere in it.
-pub open spec fn relative(p: Seq<Comp>) -> bool {
+pub(crate) open spec fn relative(p: Seq<Comp>) -> bool {
     forall|i: int| 0 <= i < p.len() ==> !is_head(#[trigger] p[i])
 }
 
 // ---- the algorithm, as a spec ----
 
 /// One turn of `normalize`'s loop.
-pub open spec fn step(out: Seq<Comp>, c: Comp) -> Seq<Comp> {
+pub(crate) open spec fn step(out: Seq<Comp>, c: Comp) -> Seq<Comp> {
     match c {
         Comp::Cur => out,
         Comp::Parent => if out.len() > 0 && out.last() is Normal {
@@ -59,7 +61,7 @@ pub open spec fn step(out: Seq<Comp>, c: Comp) -> Seq<Comp> {
     }
 }
 
-pub open spec fn normalize(p: Seq<Comp>) -> Seq<Comp>
+pub(crate) open spec fn normalize(p: Seq<Comp>) -> Seq<Comp>
     decreases p.len(),
 {
     if p.len() == 0 {
@@ -69,7 +71,7 @@ pub open spec fn normalize(p: Seq<Comp>) -> Seq<Comp>
     }
 }
 
-pub open spec fn escapes(p: Seq<Comp>) -> bool {
+pub(crate) open spec fn escapes(p: Seq<Comp>) -> bool {
     let n = normalize(p);
     n.len() > 0 && (n[0] is Parent || n[0] is Root || n[0] is Prefix)
 }
@@ -79,7 +81,7 @@ pub open spec fn escapes(p: Seq<Comp>) -> bool {
 /// Walk `p` from the directory `cwd`, a stack of names under the root.
 /// `None` means the walk climbed above the root at some point, or met a
 /// component that is not relative.
-pub open spec fn lex(cwd: Seq<u64>, p: Seq<Comp>) -> Option<Seq<u64>>
+pub(crate) open spec fn lex(cwd: Seq<u64>, p: Seq<Comp>) -> Option<Seq<u64>>
     decreases p.len(),
 {
     if p.len() == 0 {
@@ -98,7 +100,7 @@ pub open spec fn lex(cwd: Seq<u64>, p: Seq<Comp>) -> Option<Seq<u64>>
 }
 
 /// The names a sequence of `Normal` components spells.
-pub open spec fn names(p: Seq<Comp>) -> Seq<u64>
+pub(crate) open spec fn names(p: Seq<Comp>) -> Seq<u64>
     decreases p.len(),
 {
     if p.len() == 0 {
@@ -109,7 +111,7 @@ pub open spec fn names(p: Seq<Comp>) -> Seq<u64>
 }
 
 /// Normal form: no `.`; any head first; then only `..`s; then only names.
-pub open spec fn normal_form(p: Seq<Comp>) -> bool {
+pub(crate) open spec fn normal_form(p: Seq<Comp>) -> bool {
     &&& well_formed(p)
     &&& forall|i: int| 0 <= i < p.len() ==> !((#[trigger] p[i]) is Cur)
     &&& forall|i: int, j: int| #![trigger p[i], p[j]] 0 <= i < j < p.len() && p[i] is Normal ==> p[j] is Normal
@@ -132,7 +134,7 @@ proof fn lemma_well_formed_prefix(p: Seq<Comp>)
 
 /// Normalizing a path adds no head it did not have: a relative path stays
 /// relative.
-pub proof fn lemma_normalize_relative(p: Seq<Comp>)
+pub(crate) proof fn lemma_normalize_relative(p: Seq<Comp>)
     requires
         relative(p),
     ensures
@@ -154,7 +156,7 @@ pub proof fn lemma_normalize_relative(p: Seq<Comp>)
 
 /// **Normal form.** Whatever a well-formed path was, `normalize` returns one
 /// with no `.`, its head (if any) first, then its surviving `..`s, then names.
-pub proof fn lemma_normal_form(p: Seq<Comp>)
+pub(crate) proof fn lemma_normal_form(p: Seq<Comp>)
     requires
         well_formed(p),
     ensures
@@ -217,7 +219,7 @@ proof fn lemma_normal_form_prefix(q: Seq<Comp>)
 
 /// **Idempotence.** A path in normal form is its own normalization, so
 /// normalizing twice is normalizing once.
-pub proof fn lemma_idempotent_on_normal_form(q: Seq<Comp>)
+pub(crate) proof fn lemma_idempotent_on_normal_form(q: Seq<Comp>)
     requires
         normal_form(q),
     ensures
@@ -237,7 +239,7 @@ pub proof fn lemma_idempotent_on_normal_form(q: Seq<Comp>)
     }
 }
 
-pub proof fn lemma_idempotent(p: Seq<Comp>)
+pub(crate) proof fn lemma_idempotent(p: Seq<Comp>)
     requires
         well_formed(p),
     ensures
@@ -265,7 +267,7 @@ proof fn lemma_lex_push(cwd: Seq<u64>, q: Seq<Comp>, c: Comp)
 
 /// **Meaning is preserved.** From any starting directory, a relative path and
 /// its normalization reach the same place, or both climb out of the root.
-pub proof fn lemma_meaning_preserved(cwd: Seq<u64>, p: Seq<Comp>)
+pub(crate) proof fn lemma_meaning_preserved(cwd: Seq<u64>, p: Seq<Comp>)
     requires
         relative(p),
     ensures
@@ -349,7 +351,7 @@ proof fn lemma_lex_normal_form(q: Seq<Comp>)
 }
 
 /// A walk that has climbed out stays out.
-pub proof fn lemma_lex_none_absorbs(cwd: Seq<u64>, p: Seq<Comp>, k: int)
+pub(crate) proof fn lemma_lex_none_absorbs(cwd: Seq<u64>, p: Seq<Comp>, k: int)
     requires
         0 <= k <= p.len(),
         lex(cwd, p.take(k)) is None,
@@ -395,7 +397,7 @@ proof fn lemma_first_survives(p: Seq<Comp>)
 /// **`escapes_root` is exactly right.** A well-formed path escapes if and only
 /// if it is not relative, or its walk from the root climbs above the root at
 /// some point — at its end, or anywhere before.
-pub proof fn theorem_escapes_root(p: Seq<Comp>)
+pub(crate) proof fn theorem_escapes_root(p: Seq<Comp>)
     requires
         well_formed(p),
     ensures
@@ -448,51 +450,64 @@ proof fn examples() {
     assert(!escapes(q));
 }
 
-// ---- the production code, transcribed ----
+// ---- from the kinds `fold` reads to the components the spec speaks of ----
 
-/// `normalize`, as `src/path.rs` writes it.
-pub fn exec_normalize(path: &Vec<Comp>) -> (out: Vec<Comp>)
-    ensures
-        out@ == normalize(path@),
-{
-    let mut out: Vec<Comp> = Vec::new();
-    let mut i: usize = 0;
-    while i < path.len()
-        invariant
-            i <= path.len(),
-            out@ == normalize(path@.take(i as int)),
-        decreases path.len() - i,
-    {
-        let component = path[i];
-        assert(path@.take(i as int + 1).drop_last() =~= path@.take(i as int));
-        assert(path@.take(i as int + 1).last() == component);
-        match component {
-            Comp::Cur => {},
-            Comp::Parent => {
-                if out.len() > 0 && matches!(out[out.len() - 1], Comp::Normal(_)) {
-                    out.pop();
-                } else {
-                    out.push(component);
-                }
-            },
-            other => {
-                out.push(other);
-            },
-        }
-        i += 1;
+/// Component `i`, named by its position when it is a name.
+pub(crate) open spec fn to_comp(k: Kind, i: int) -> Comp {
+    match k {
+        Kind::Prefix => Comp::Prefix,
+        Kind::Root => Comp::Root,
+        Kind::Cur => Comp::Cur,
+        Kind::Parent => Comp::Parent,
+        Kind::Normal => Comp::Normal(i as u64),
     }
-    assert(path@.take(path.len() as int) =~= path@);
-    out
 }
 
-/// `escapes_root`, as `src/path.rs` writes it — reading the first component of
-/// the normalized path (the `PathBuf` round trip is the trusted step).
-pub fn exec_escapes_root(path: &Vec<Comp>) -> (b: bool)
+pub(crate) open spec fn comps(kinds: Seq<Kind>) -> Seq<Comp> {
+    Seq::new(kinds.len(), |i: int| to_comp(kinds[i], i))
+}
+
+/// The components at the indices `fold` kept, in order.
+pub(crate) open spec fn kept_comps(kinds: Seq<Kind>, kept: Seq<usize>) -> Seq<Comp> {
+    Seq::new(kept.len(), |k: int| to_comp(kinds[kept[k] as int], kept[k] as int))
+}
+
+/// Everything one turn of `fold`'s loop needs: the spec takes one more step,
+/// and pushing, popping, and peeking at the kept indices do to the kept
+/// components what they say.
+pub(crate) proof fn lemma_fold_turn(kinds: Seq<Kind>, kept: Seq<usize>, i: int)
+    requires
+        0 <= i < kinds.len() <= usize::MAX,
+        forall|k: int| 0 <= k < kept.len() ==> kept[k] < i,
     ensures
-        b == escapes(path@),
+        normalize(comps(kinds).take(i + 1)) == step(
+            normalize(comps(kinds).take(i)),
+            to_comp(kinds[i], i),
+        ),
+        kept_comps(kinds, kept.push(i as usize)) == kept_comps(kinds, kept).push(
+            to_comp(kinds[i], i),
+        ),
+        kept.len() > 0 ==> kept_comps(kinds, kept.drop_last()) == kept_comps(
+            kinds,
+            kept,
+        ).drop_last(),
+        kept.len() > 0 ==> (kept_comps(kinds, kept).last() is Normal <==> kinds[kept.last() as int] is Normal),
 {
-    let n = exec_normalize(path);
-    n.len() > 0 && matches!(n[0], Comp::Parent | Comp::Root | Comp::Prefix)
+    assert(comps(kinds).take(i + 1).drop_last() =~= comps(kinds).take(i));
+    assert(comps(kinds).take(i + 1).last() == to_comp(kinds[i], i));
+    assert(kept_comps(kinds, kept.push(i as usize)) =~= kept_comps(kinds, kept).push(
+        to_comp(kinds[i], i),
+    ));
+    if kept.len() > 0 {
+        assert(kept_comps(kinds, kept.drop_last()) =~= kept_comps(kinds, kept).drop_last());
+    }
+}
+
+pub(crate) proof fn lemma_take_all(kinds: Seq<Kind>)
+    ensures
+        comps(kinds).take(kinds.len() as int) == comps(kinds),
+{
+    assert(comps(kinds).take(kinds.len() as int) =~= comps(kinds));
 }
 
 } // verus!

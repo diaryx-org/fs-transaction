@@ -68,6 +68,12 @@
 //!   `async fn`, so a backend keeps its own future types — which means an
 //!   apply over a non-`Send` backend cannot be `tokio::spawn`ed.
 
+#![cfg_attr(verus_keep_ghost, feature(proc_macro_hygiene))]
+
+#[cfg(verus_keep_ghost)]
+#[allow(unused_imports)]
+use vstd::prelude::*;
+
 pub mod change;
 pub mod error;
 pub mod exec;

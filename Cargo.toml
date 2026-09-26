@@ -33,3 +33,7 @@ libc = { version = "0.2", optional = true }
 # feature: it is plain `fsync(2)` on Apple, declared by hand, and `sync_all`
 # everywhere else.
 barrier-fsync = ["dep:libc"]
+
+# Verus sets `verus_keep_ghost` when it verifies the crate; see src/path.rs.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_keep_ghost)'] }

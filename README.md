@@ -135,6 +135,18 @@ which can be milliseconds instead of microseconds.
 the standard library has no way to ask for it there, so the one symbol is declared by hand.
 I recommend enabling the feature where performance is important on Apple platforms.
 
+## Verified
+
+The root guard — `normalize` and `escapes_root` — is proved correct with [Verus](https://github.com/verus-lang/verus),
+in place: the specs sit on the code that runs,
+and the proofs sit beside it in a module only Verus compiles.
+An ordinary build sees none of it and gains no dependency.
+With a Verus release on `PATH`:
+
+```sh
+verus src/lib.rs --crate-type=lib --crate-name fs_transaction --edition=2024 --no-cheating
+```
+
 ## License
 
 MIT or Apache-2.0, at your option.
