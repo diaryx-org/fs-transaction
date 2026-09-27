@@ -150,9 +150,16 @@ An ordinary build sees none of it and gains no dependency.
   over the tree before or after any op, halfway through one, or halfway through a rollback —
   reaches exactly the tree the apply would have.
 - **Replay.** The code `recover` runs to roll a journal forward is proved to do exactly what that theorem says replay does.
+- **Rollback.** The code `apply` runs for a journaled set is proved error-atomic:
+  when an op or the certification fails and the rollback succeeds,
+  every path the set names is as it was before the set began —
+  entry for entry, permissions included, unless the set flips an execute bit,
+  in which case what each path holds.
 
 What the proofs take on trust is in one file, `src/port.rs`:
-each storage call the executor makes, with the port contract as its spec.
+each storage call the executor makes, with the port contract as its spec,
+and what the proofs assume about paths — that the paths a set names are not nested,
+and that it names none of the crate's own scratch files.
 A test fails if anything is taken on trust anywhere else.
 With a Verus release on `PATH`:
 
