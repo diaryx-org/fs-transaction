@@ -25,6 +25,11 @@
 //!   there before the set moves something to it.
 //! - **`read_link` answers truly.** Whether a path holds a link is what
 //!   `read_link` says, where it says anything.
+//!
+//! The journal's encoding is verified against this file too: the few standard
+//! library calls it makes — `to_le_bytes`, `from_le_bytes`, a path's UTF-8
+//! text and back — are wrapped at the end, with their documentation as their
+//! spec.
 
 // The model names files by `PathBuf`, and spec code cannot follow the deref
 // from `&PathBuf` to `&Path`, so the wrappers take the owned type's reference.
@@ -39,6 +44,8 @@ use crate::fs::Storage;
 #[cfg(verus_keep_ghost)]
 use vstd::prelude::*;
 
+#[cfg(verus_keep_ghost)]
+use crate::journal::proof::{le, unle};
 #[cfg(verus_keep_ghost)]
 pub(crate) use crate::replayable::proof::{Content, Fs, Op, entry};
 
@@ -65,6 +72,9 @@ pub(crate) uninterp spec fn at(root: &Path, rel: PathBuf) -> int;
 
 /// A link's target, as what the link holds.
 pub(crate) uninterp spec fn tid(target: PathBuf) -> int;
+
+/// A path's text as UTF-8, where it has one.
+pub(crate) uninterp spec fn utf8(p: PathBuf) -> Option<Seq<u8>>;
 
 /// Whether file `a` is a directory above file `b`.
 pub(crate) uninterp spec fn ancestor(a: int, b: int) -> bool;
@@ -641,4 +651,72 @@ pub(crate) fn torn(cause: Error, rollback: Error) -> Error {
         cause: cause.to_string(),
         rollback: rollback.to_string(),
     }
+}
+
+// ---- the journal's encoding ----
+//
+// What `journal::encode` and `journal::decode` ask of the standard library,
+// with its documentation as the spec.
+
+/// [`u64::to_le_bytes`].
+#[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
+#[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r@ == le(x)))]
+pub(crate) fn le_bytes(x: u64) -> [u8; 8] {
+    x.to_le_bytes()
+}
+
+/// [`u64::from_le_bytes`], of a slice of eight.
+#[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    requires
+        b@.len() == 8,
+    ensures
+        r == unle(b@),
+))]
+pub(crate) fn from_le_bytes(b: &[u8]) -> u64 {
+    u64::from_le_bytes(b.try_into().unwrap())
+}
+
+/// A path's text as UTF-8 bytes, where it has one: [`Path::to_str`].
+#[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    ensures
+        r is Some <==> utf8(*p) is Some,
+        r is Some ==> utf8(*p) == Some(r->Some_0@),
+))]
+pub(crate) fn text(p: &PathBuf) -> Option<&[u8]> {
+    p.to_str().map(str::as_bytes)
+}
+
+/// The path whose text `b` is, where `b` is UTF-8 — the very path, since a
+/// path is its text.
+#[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    ensures
+        forall|p: PathBuf| #[trigger] utf8(p) == Some(b@) ==> r == Some(p),
+))]
+pub(crate) fn path_of_text(b: &[u8]) -> Option<PathBuf> {
+    std::str::from_utf8(b).ok().map(PathBuf::from)
+}
+
+/// The error for a journal that cannot be trusted.
+#[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
+pub(crate) fn corrupt(what: &str) -> Error {
+    Error::Corrupt(what.to_string())
+}
+
+#[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
+pub(crate) fn bad_flag(flag: u8) -> Error {
+    Error::Corrupt(format!("invalid executable flag {flag}"))
+}
+
+#[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
+pub(crate) fn bad_tag(tag: u8) -> Error {
+    Error::Corrupt(format!("unknown op tag {tag}"))
+}
+
+/// The error for a path the journal cannot write down.
+#[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
+pub(crate) fn non_utf8_path(p: &PathBuf) -> Error {
+    Error::NonUtf8Path(p.clone())
 }

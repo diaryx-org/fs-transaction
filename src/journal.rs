@@ -77,6 +77,9 @@ use crate::replayable::proof::{replay_step, replay_upto};
 #[cfg(verus_keep_ghost)]
 use vstd::prelude::*;
 
+#[cfg(verus_keep_ghost)]
+pub(crate) mod proof;
+
 /// Where a change set's write-ahead journal lives — and, because they must
 /// agree about it, both halves of the protocol that depends on the answer.
 ///
@@ -253,7 +256,10 @@ impl Default for Journal {
 /// version (`1`). A file that does not start with this is not a journal this
 /// crate wrote — or is one from an incompatible future version — and is refused
 /// rather than guessed at.
-const MAGIC: &[u8; 8] = b"FSTXJRN1";
+// The lifetime is spelled out because Verus asks for it.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[allow(clippy::redundant_static_lifetimes)]
+const MAGIC: &'static [u8; 8] = b"FSTXJRN1";
 
 /// The magic this crate stamped before it was lifted out of `prov`, where it
 /// was named after a project older still. Accepted on read and never written.
@@ -262,129 +268,280 @@ const MAGIC: &[u8; 8] = b"FSTXJRN1";
 /// would strand the one tree that can be carrying such a journal: a workspace
 /// interrupted mid-apply by the crash that is the whole reason a journal
 /// outlives its change. There is nothing to roll that forward but this.
-const LEGACY_MAGIC: &[u8; 8] = b"COLOJRN1";
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[allow(clippy::redundant_static_lifetimes)]
+const LEGACY_MAGIC: &'static [u8; 8] = b"COLOJRN1";
 
 /// Serialize a change set's ops into journal bytes: `MAGIC`, the op count, each
 /// op, then a checksum over everything preceding it.
 pub fn encode(ops: &[FileOp]) -> Result<Vec<u8>> {
-    let mut buf = Vec::with_capacity(64);
-    buf.extend_from_slice(MAGIC);
-    buf.extend_from_slice(&(ops.len() as u64).to_le_bytes());
-    for op in ops {
-        match op {
-            FileOp::Write { path, bytes } => {
-                buf.push(0);
-                put_path(&mut buf, path)?;
-                put_bytes(&mut buf, bytes);
-            }
-            FileOp::Rename { from, to } => {
-                buf.push(1);
-                put_path(&mut buf, from)?;
-                put_path(&mut buf, to)?;
-            }
-            FileOp::Remove { path } => {
-                buf.push(2);
-                put_path(&mut buf, path)?;
-            }
-            // Two paths, no payload — the point of the op. See [`FileOp::CopyFrom`]
-            // for why journaling a *reference* is still deterministic to replay.
-            FileOp::CopyFrom { path, source } => {
-                buf.push(3);
-                put_path(&mut buf, path)?;
-                put_path(&mut buf, source)?;
-            }
-            FileOp::SetExecutable { path, executable } => {
-                buf.push(4);
-                put_path(&mut buf, path)?;
-                buf.push(u8::from(*executable));
-            }
-            // The target is encoded on `put_path`'s terms — UTF-8 or refused at
-            // the commit point — even though it is a link's text rather than a
-            // file of the tree: a journal must replay identically wherever it
-            // is read, and a mangled target is an invented one.
-            FileOp::SetLink { path, target } => {
-                buf.push(5);
-                put_path(&mut buf, path)?;
-                put_path(&mut buf, target)?;
-            }
-        }
-    }
-    let checksum = fnv1a(&buf);
-    buf.extend_from_slice(&checksum.to_le_bytes());
-    Ok(buf)
+    encode_ops(ops)
 }
 
 /// Parse journal bytes back into ops, verifying the magic and the checksum. A
 /// mismatch is an [`Error::Corrupt`] — a journal that cannot be trusted is
 /// refused, never partially replayed.
 pub fn decode(bytes: &[u8]) -> Result<Vec<FileOp>> {
-    let corrupt = |what: &str| Error::Corrupt(what.to_string());
+    decode_ops(bytes)
+}
 
-    let stamp = bytes.get(..MAGIC.len());
-    if bytes.len() < MAGIC.len() + 8 + 8
-        || !matches!(stamp, Some(m) if m == MAGIC || m == LEGACY_MAGIC)
+/// [`encode`], verified: the bytes are the journal of `ops`, which
+/// [`decode_ops`] reads back as `ops`.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    ensures
+        r is Ok ==> proof::journal(MAGIC@, ops@) == Some(r->Ok_0@),
+))]
+fn encode_ops(ops: &[FileOp]) -> Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(64);
+    buf.extend_from_slice(MAGIC);
+    buf.extend_from_slice(&port::le_bytes(ops.len() as u64));
+    #[cfg(verus_keep_ghost)]
+    proof_decl! {
+        let ghost head = buf@;
+        assert(ops@.take(0) =~= Seq::<FileOp>::empty());
+        assert(head + Seq::<u8>::empty() =~= head);
+    }
+    let mut i: usize = 0;
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        invariant
+            i <= ops@.len(),
+            head == MAGIC@ + proof::le(ops@.len() as u64),
+            proof::enc_ops(ops@.take(i as int)) is Some,
+            buf@ == head + proof::enc_ops(ops@.take(i as int))->Some_0,
+        decreases ops@.len() - i,
+    ))]
+    while i < ops.len() {
+        #[cfg(verus_keep_ghost)]
+        proof_decl! {
+            let ghost pre = buf@;
+            assert(ops@.take(i + 1).drop_last() =~= ops@.take(i as int));
+            assert(ops@.take(i + 1).last() == ops@[i as int]);
+        }
+        put_op(&mut buf, &ops[i])?;
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert(head + proof::enc_ops(ops@.take(i + 1))->Some_0 =~= pre + proof::enc_op(ops@[i as int])->Some_0);
+        }
+        i += 1;
+    }
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        assert(ops@.take(ops@.len() as int) =~= ops@);
+    }
+    let checksum = fnv1a(&buf);
+    buf.extend_from_slice(&port::le_bytes(checksum));
+    Ok(buf)
+}
+
+/// **The round trip.** What [`encode_ops`] writes, [`decode_ops`] reads back
+/// — never refusing it — as the same ops. `None` only where the set names a
+/// path that is not UTF-8, which the journal cannot write down.
+#[cfg(verus_keep_ghost)]
+#[allow(dead_code)]
+#[verus_verify]
+#[verus_spec(r =>
+    ensures
+        r matches Some(read) ==> proof::same_ops(read@, ops@),
+)]
+fn reread(ops: &[FileOp]) -> Option<Vec<FileOp>> {
+    let bytes = match encode_ops(ops) {
+        Ok(bytes) => bytes,
+        Err(_) => return None,
+    };
+    proof_with! {Ghost(ops@)}
+    let read = decode_ops(&bytes);
+    match read {
+        Ok(read) => Some(read),
+        Err(_) => {
+            proof! { assert(false); }
+            None
+        }
+    }
+}
+
+/// Append one op's record.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    ensures
+        r is Ok ==> proof::enc_op(*op) is Some && final(buf)@ == old(buf)@ + proof::enc_op(*op)->Some_0,
+))]
+fn put_op(buf: &mut Vec<u8>, op: &FileOp) -> Result<()> {
+    #[cfg(verus_keep_ghost)]
+    proof_decl! {
+        let ghost pre = buf@;
+    }
+    match op {
+        FileOp::Write { path, bytes } => {
+            put_head(buf, 0, path)?;
+            put_bytes(buf, bytes);
+        }
+        FileOp::Rename { from, to } => {
+            put_head(buf, 1, from)?;
+            put_path(buf, to)?;
+        }
+        FileOp::Remove { path } => {
+            put_head(buf, 2, path)?;
+        }
+        // Two paths, no payload — the point of the op. See [`FileOp::CopyFrom`]
+        // for why journaling a *reference* is still deterministic to replay.
+        FileOp::CopyFrom { path, source } => {
+            put_head(buf, 3, path)?;
+            put_path(buf, source)?;
+        }
+        FileOp::SetExecutable { path, executable } => {
+            put_head(buf, 4, path)?;
+            buf.push(*executable as u8);
+        }
+        // The target is encoded on `put_path`'s terms — UTF-8 or refused at
+        // the commit point — even though it is a link's text rather than a
+        // file of the tree: a journal must replay identically wherever it
+        // is read, and a mangled target is an invented one.
+        FileOp::SetLink { path, target } => {
+            put_head(buf, 5, path)?;
+            put_path(buf, target)?;
+        }
+    }
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        let head = seq![proof::tag(*op)] + proof::field(port::utf8(proof::first(*op))->Some_0);
+        let rest = buf@.subrange((pre.len() + head.len()) as int, buf@.len() as int);
+        assert(buf@ =~= pre + (head + rest));
+        match *op {
+            FileOp::Remove { .. } => assert(rest =~= Seq::<u8>::empty()),
+            FileOp::SetExecutable { .. } => assert(rest =~= seq![proof::flag(*op)]),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Append an op's tag and first path.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    ensures
+        r is Ok ==> port::utf8(*path) is Some
+            && final(buf)@ == old(buf)@ + (seq![tag] + proof::field(port::utf8(*path)->Some_0)),
+))]
+#[allow(clippy::ptr_arg)]
+fn put_head(buf: &mut Vec<u8>, tag: u8, path: &PathBuf) -> Result<()> {
+    buf.push(tag);
+    let r = put_path(buf, path);
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        if r is Ok {
+            assert(buf@ =~= old(buf)@ + (seq![tag] + proof::field(port::utf8(*path)->Some_0)));
+        }
+    }
+    r
+}
+
+/// [`decode`], verified: the bytes [`encode_ops`] wrote for a set are read
+/// back as that set.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    with Ghost(written): Ghost<Seq<FileOp>>
+    ensures
+        proof::journal(MAGIC@, written) == Some(bytes@) ==> r is Ok && proof::same_ops(r->Ok_0@, written),
+))]
+fn decode_ops(bytes: &[u8]) -> Result<Vec<FileOp>> {
+    #[cfg(verus_keep_ghost)]
+    proof_decl! {
+        let ghost wf = proof::journal(MAGIC@, written) == Some(bytes@);
+        let ghost n = written.len();
+        let ghost body = proof::body(MAGIC@, written)->Some_0;
+        let ghost e = proof::enc_ops(written)->Some_0;
+        if wf {
+            proof::lemma_enc_len(written);
+            proof::lemma_le(n as u64);
+            proof::lemma_le(proof::fnv(body));
+            assert(bytes@.subrange(0, 8) =~= MAGIC@);
+        }
+    }
+    if bytes.len() < MAGIC.len() + 8 + 8 || !(stamped(bytes, MAGIC) || stamped(bytes, LEGACY_MAGIC))
     {
-        return Err(corrupt("not a journal (bad header)"));
+        return Err(port::corrupt("not a journal (bad header)"));
     }
     let body_end = bytes.len() - 8;
-    let stored = u64::from_le_bytes(bytes[body_end..].try_into().unwrap());
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        if wf {
+            assert(n < 0x1_0000_0000_0000_0000int);
+            assert(bytes@.subrange(body_end as int, bytes@.len() as int) =~= proof::le(proof::fnv(body)));
+            assert(bytes@.subrange(0, body_end as int) =~= body);
+        }
+    }
+    let stored = port::from_le_bytes(&bytes[body_end..]);
     if fnv1a(&bytes[..body_end]) != stored {
-        return Err(corrupt("checksum mismatch"));
+        return Err(port::corrupt("checksum mismatch"));
     }
 
     let mut cur = Cursor {
         bytes: &bytes[..body_end],
         at: MAGIC.len(),
     };
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        if wf {
+            assert(cur.bytes@.subrange(8, 16) =~= proof::le(n as u64));
+        }
+    }
     let count = cur.take_u64()?;
     // Each op costs at least its one-byte tag, so a count the body cannot
     // possibly hold is a lie about the record, not a large journal — and it
     // must be refused *before* it sizes an allocation, or a crafted header
     // aborts the process instead of erroring.
     if count > (cur.bytes.len() - cur.at) as u64 {
-        return Err(corrupt("op count exceeds the journal body"));
+        return Err(port::corrupt("op count exceeds the journal body"));
     }
     let mut ops = Vec::with_capacity(count as usize);
-    for _ in 0..count {
-        let op = match cur.take_u8()? {
-            0 => FileOp::Write {
-                path: cur.take_path()?,
-                bytes: cur.take_bytes()?.to_vec(),
-            },
-            1 => FileOp::Rename {
-                from: cur.take_path()?,
-                to: cur.take_path()?,
-            },
-            2 => FileOp::Remove {
-                path: cur.take_path()?,
-            },
-            3 => FileOp::CopyFrom {
-                path: cur.take_path()?,
-                source: cur.take_path()?,
-            },
-            4 => FileOp::SetExecutable {
-                path: cur.take_path()?,
-                // Strictly 0 or 1: any other byte means this is not the
-                // record it claims to be, and a journal that cannot be
-                // trusted is refused, never guessed at.
-                executable: match cur.take_u8()? {
-                    0 => false,
-                    1 => true,
-                    other => {
-                        return Err(corrupt(&format!("invalid executable flag {other}")));
-                    }
-                },
-            },
-            5 => FileOp::SetLink {
-                path: cur.take_path()?,
-                target: cur.take_path()?,
-            },
-            other => return Err(corrupt(&format!("unknown op tag {other}"))),
-        };
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        if wf {
+            proof::lemma_read_none(written);
+        }
+    }
+    let mut k: u64 = 0;
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        invariant
+            k <= count,
+            cur.at <= cur.bytes@.len(),
+            cur.bytes@.len() < 0x1_0000_0000_0000_0000int,
+            wf == (proof::journal(MAGIC@, written) == Some(bytes@)),
+            wf ==> count == written.len() && proof::body(MAGIC@, written) == Some(cur.bytes@)
+                && proof::enc_ops(written) is Some
+                && proof::read_so_far(written, cur.at as int, k as int, ops@),
+        decreases count - k,
+    ))]
+    while k < count {
+        #[cfg(verus_keep_ghost)]
+        proof_decl! {
+            let ghost want = written[k as int];
+            let ghost done = ops@;
+            if wf {
+                proof::lemma_next_record(MAGIC@, written, cur.at as int, k as int, done);
+            }
+        }
+        #[cfg(verus_keep_ghost)]
+        proof_with! {Ghost(want)}
+        let op = cur.take_op()?;
         ops.push(op);
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            if wf {
+                proof::lemma_read_one(written, k as int, done, op);
+            }
+        }
+        k += 1;
+    }
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        if wf {
+            proof::lemma_read_all(MAGIC@, written, cur.at as int, ops@);
+        }
     }
     if cur.at != cur.bytes.len() {
-        return Err(corrupt("trailing bytes after the last op"));
+        return Err(port::corrupt("trailing bytes after the last op"));
     }
     Ok(ops)
 }
@@ -681,70 +838,270 @@ async fn replay<FS: Storage>(
 
 // ---- encoding helpers ----
 
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(
+    ensures
+        final(buf)@ == old(buf)@ + proof::field(bytes@),
+))]
 fn put_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
-    buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    buf.extend_from_slice(&port::le_bytes(bytes.len() as u64));
     buf.extend_from_slice(bytes);
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        assert(final(buf)@ =~= old(buf)@ + proof::field(bytes@));
+    }
 }
 
 /// Encode a root-relative path as UTF-8, so a journal written on one platform
 /// replays identically on another. A path that is not UTF-8 is refused at the
 /// commit point rather than mangled into one that is.
-fn put_path(buf: &mut Vec<u8>, path: &Path) -> Result<()> {
-    let s = path
-        .to_str()
-        .ok_or_else(|| Error::NonUtf8Path(path.to_path_buf()))?;
-    put_bytes(buf, s.as_bytes());
-    Ok(())
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    ensures
+        r is Ok ==> port::utf8(*path) is Some && final(buf)@ == old(buf)@ + proof::field(port::utf8(*path)->Some_0),
+))]
+#[allow(clippy::ptr_arg)]
+fn put_path(buf: &mut Vec<u8>, path: &PathBuf) -> Result<()> {
+    match port::text(path) {
+        Some(s) => {
+            put_bytes(buf, s);
+            Ok(())
+        }
+        None => Err(port::non_utf8_path(path)),
+    }
+}
+
+/// Whether `bytes` begins with `magic`.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    requires
+        bytes@.len() >= 8,
+    ensures
+        r == (bytes@.subrange(0, 8) == magic@),
+))]
+fn stamped(bytes: &[u8], magic: &[u8; 8]) -> bool {
+    let mut j: usize = 0;
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        invariant
+            j <= 8,
+            bytes@.len() >= 8,
+            forall|x: int| 0 <= x < j ==> bytes@[x] == magic@[x],
+        decreases 8 - j,
+    ))]
+    while j < 8 {
+        if bytes[j] != magic[j] {
+            #[cfg(verus_keep_ghost)]
+            proof! { assert(bytes@.subrange(0, 8)[j as int] != magic@[j as int]); }
+            return false;
+        }
+        j += 1;
+    }
+    #[cfg(verus_keep_ghost)]
+    proof! { assert(bytes@.subrange(0, 8) =~= magic@); }
+    true
+}
+
+/// An owned copy of a payload.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r@ == bytes@))]
+fn owned(bytes: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(bytes.len());
+    v.extend_from_slice(bytes);
+    v
 }
 
 /// A forward-only reader over the journal body, bounds-checking every take so a
 /// truncated or malformed record surfaces as an error rather than a panic.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 struct Cursor<'a> {
     bytes: &'a [u8],
     at: usize,
 }
 
-impl Cursor<'_> {
-    fn short() -> Error {
-        Error::Corrupt("unexpected end of data".into())
-    }
-
-    fn take(&mut self, n: usize) -> Result<&[u8]> {
-        let end = self.at.checked_add(n).ok_or_else(Self::short)?;
-        let slice = self.bytes.get(self.at..end).ok_or_else(Self::short)?;
+impl<'a> Cursor<'a> {
+    #[cfg_attr(verus_keep_ghost, verus_verify)]
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            old(self).at <= old(self).bytes@.len(),
+        ensures
+            final(self).bytes@ == old(self).bytes@,
+            final(self).at <= final(self).bytes@.len(),
+            final(self).bytes@.len() <= usize::MAX,
+            r is Ok <==> n <= old(self).bytes@.len() - old(self).at,
+            r is Ok ==> r->Ok_0@ == old(self).bytes@.subrange(old(self).at as int, old(self).at + n)
+                && final(self).at == old(self).at + n,
+    ))]
+    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        if n > self.bytes.len() - self.at {
+            return Err(port::corrupt("unexpected end of data"));
+        }
+        let end = self.at + n;
+        let slice = &self.bytes[self.at..end];
         self.at = end;
         Ok(slice)
     }
 
+    #[cfg_attr(verus_keep_ghost, verus_verify)]
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            old(self).at <= old(self).bytes@.len(),
+        ensures
+            final(self).bytes@ == old(self).bytes@,
+            final(self).at <= final(self).bytes@.len(),
+            r is Ok <==> old(self).at < old(self).bytes@.len(),
+            r is Ok ==> r->Ok_0 == old(self).bytes@[old(self).at as int] && final(self).at == old(self).at + 1,
+    ))]
     fn take_u8(&mut self) -> Result<u8> {
         Ok(self.take(1)?[0])
     }
 
+    #[cfg_attr(verus_keep_ghost, verus_verify)]
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            old(self).at <= old(self).bytes@.len(),
+        ensures
+            final(self).bytes@ == old(self).bytes@,
+            final(self).at <= final(self).bytes@.len(),
+            r is Ok ==> final(self).bytes@.len() <= usize::MAX,
+            r is Ok <==> old(self).at + 8 <= old(self).bytes@.len(),
+            r is Ok ==> r->Ok_0 == proof::unle(old(self).bytes@.subrange(old(self).at as int, old(self).at + 8))
+                && final(self).at == old(self).at + 8,
+    ))]
     fn take_u64(&mut self) -> Result<u64> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+        Ok(port::from_le_bytes(self.take(8)?))
     }
 
-    fn take_bytes(&mut self) -> Result<&[u8]> {
-        let len = self.take_u64()? as usize;
-        self.take(len)
+    #[cfg_attr(verus_keep_ghost, verus_verify)]
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            old(self).at <= old(self).bytes@.len(),
+        ensures
+            final(self).bytes@ == old(self).bytes@,
+            final(self).at <= final(self).bytes@.len(),
+            proof::field_at(old(self).bytes@, old(self).at as int) is Some ==> r is Ok
+                && r->Ok_0@ == proof::field_at(old(self).bytes@, old(self).at as int)->Some_0
+                && final(self).at == old(self).at + 8 + r->Ok_0@.len(),
+    ))]
+    fn take_bytes(&mut self) -> Result<&'a [u8]> {
+        let len = self.take_u64()?;
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            if proof::field_at(old(self).bytes@, old(self).at as int) is Some {
+                assert(len as int <= self.bytes@.len() - self.at);
+            }
+        }
+        self.take(len as usize)
     }
 
+    #[cfg_attr(verus_keep_ghost, verus_verify)]
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            old(self).at <= old(self).bytes@.len(),
+        ensures
+            final(self).bytes@ == old(self).bytes@,
+            final(self).at <= final(self).bytes@.len(),
+            forall|p: std::path::PathBuf| proof::field_at(old(self).bytes@, old(self).at as int) is Some
+                && #[trigger] port::utf8(p) == proof::field_at(old(self).bytes@, old(self).at as int)
+                ==> r is Ok && r->Ok_0 == p
+                && final(self).at == old(self).at + 8 + proof::field_at(old(self).bytes@, old(self).at as int)->Some_0.len(),
+    ))]
     fn take_path(&mut self) -> Result<PathBuf> {
         let bytes = self.take_bytes()?;
-        let s = std::str::from_utf8(bytes).map_err(|_| Error::Corrupt("non-UTF-8 path".into()))?;
-        Ok(PathBuf::from(s))
+        match port::path_of_text(bytes) {
+            Some(path) => Ok(path),
+            None => Err(port::corrupt("non-UTF-8 path")),
+        }
+    }
+
+    /// Read one op's record.
+    #[cfg_attr(verus_keep_ghost, verus_verify)]
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        with Ghost(want): Ghost<FileOp>
+        requires
+            old(self).at <= old(self).bytes@.len(),
+            old(self).bytes@.len() < 0x1_0000_0000_0000_0000int,
+        ensures
+            final(self).bytes@ == old(self).bytes@,
+            final(self).at <= final(self).bytes@.len(),
+            proof::holds_at(old(self).bytes@, old(self).at as int, want) ==> r is Ok && proof::same_op(r->Ok_0, want)
+                && final(self).at == old(self).at + proof::enc_op(want)->Some_0.len(),
+    ))]
+    fn take_op(&mut self) -> Result<FileOp> {
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            if proof::holds_at(self.bytes@, self.at as int, want) {
+                proof::lemma_record(self.bytes@, self.at as int, want);
+            }
+        }
+        Ok(match self.take_u8()? {
+            0 => {
+                let path = self.take_path()?;
+                let bytes = owned(self.take_bytes()?);
+                FileOp::Write { path, bytes }
+            }
+            1 => {
+                let from = self.take_path()?;
+                let to = self.take_path()?;
+                FileOp::Rename { from, to }
+            }
+            2 => {
+                let path = self.take_path()?;
+                FileOp::Remove { path }
+            }
+            3 => {
+                let path = self.take_path()?;
+                let source = self.take_path()?;
+                FileOp::CopyFrom { path, source }
+            }
+            4 => {
+                let path = self.take_path()?;
+                // Strictly 0 or 1: any other byte means this is not the
+                // record it claims to be, and a journal that cannot be
+                // trusted is refused, never guessed at.
+                let executable = match self.take_u8()? {
+                    0 => false,
+                    1 => true,
+                    other => return Err(port::bad_flag(other)),
+                };
+                FileOp::SetExecutable { path, executable }
+            }
+            5 => {
+                let path = self.take_path()?;
+                let target = self.take_path()?;
+                FileOp::SetLink { path, target }
+            }
+            other => return Err(port::bad_tag(other)),
+        })
     }
 }
 
 /// FNV-1a, 64-bit — a small, deterministic, dependency-free checksum. It guards
 /// against bit-rot in a journal read back after a crash; it is not, and need not
 /// be, cryptographic.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == proof::fnv(data@)))]
 fn fnv1a(data: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325;
-    for &byte in data {
-        hash ^= u64::from(byte);
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut i: usize = 0;
+    #[cfg(verus_keep_ghost)]
+    proof! { assert(data@.take(0) =~= Seq::<u8>::empty()); }
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        invariant
+            i <= data@.len(),
+            hash == proof::fnv(data@.take(i as int)),
+        decreases data@.len() - i,
+    ))]
+    while i < data.len() {
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert(data@.take(i + 1).drop_last() =~= data@.take(i as int));
+        }
+        hash ^= u64::from(data[i]);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        i += 1;
     }
+    #[cfg(verus_keep_ghost)]
+    proof! { assert(data@.take(data@.len() as int) =~= data@); }
     hash
 }
 
