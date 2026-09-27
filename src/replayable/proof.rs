@@ -128,39 +128,149 @@ pub(crate) open spec fn admissible(ops: Seq<SOp>) -> bool {
 }
 
 
+// ---- the rule on the tree's own identities ----
+//
+// The checker compares paths by a key that lowers case and normalizes. The
+// tree has its own notion of which paths are one file, and the checker's key
+// can only be coarser: two spellings of one file get one key. Below, a file is
+// an `int`, and the rule restated over files — without the nesting clause,
+// which the flat model of the tree below has no use for — follows from the
+// checker's rule whenever the checker's keys are a function of the files.
+
+pub(crate) struct FOp {
+    pub(crate) act: Act,
+    pub(crate) path: int,
+    pub(crate) other: int,
+}
+
+pub(crate) open spec fn fmentions(op: FOp, x: int) -> bool {
+    op.path == x || (two(op.act) && op.other == x)
+}
+
+pub(crate) open spec fn fflips(op: FOp, x: int) -> bool {
+    op.act is SetExecutable && op.path == x
+}
+
+pub(crate) open spec fn fwrites_only(op: FOp, x: int) -> bool {
+    match op.act {
+        Act::Write => op.path == x,
+        Act::CopyFrom => op.path == x && op.other != x,
+        _ => false,
+    }
+}
+
+pub(crate) open spec fn fkeeps_file(op: FOp, x: int) -> bool {
+    fwrites_only(op, x) || fflips(op, x)
+}
+
+pub(crate) open spec fn fleaves(op: FOp, x: int) -> bool {
+    match op.act {
+        Act::Remove => op.path == x,
+        Act::Rename => op.path == x && op.other != x,
+        _ => false,
+    }
+}
+
+pub(crate) open spec fn fonly_copies_from(op: FOp, s: int) -> bool {
+    op.act is CopyFrom && op.other == s && op.path != s
+}
+
+/// The rule's clauses for ops `i` and `k`, over files.
+pub(crate) open spec fn flat_ok(ops: Seq<FOp>, i: int, k: int) -> bool {
+    let (a, b) = (ops[i], ops[k]);
+    match a.act {
+        Act::Rename => {
+            let (f, t) = (a.path, a.other);
+            &&& !(k == i && f == t)
+            &&& !(k < i && fmentions(b, f) && !fflips(b, f))
+            &&& !(k > i && fmentions(b, f))
+            &&& !(k < i && fmentions(b, t))
+            &&& !(k > i && fmentions(b, t) && !fkeeps_file(b, t))
+        },
+        Act::SetExecutable => !(k > i && fmentions(b, a.path) && !fkeeps_file(b, a.path) && !fleaves(
+            b,
+            a.path,
+        )),
+        Act::CopyFrom => {
+            &&& !(k == i && a.path == a.other)
+            &&& !(k != i && fmentions(b, a.other) && !fonly_copies_from(b, a.other))
+        },
+        _ => true,
+    }
+}
+
+pub(crate) open spec fn flat_admissible(ops: Seq<FOp>) -> bool {
+    forall|i: int, k: int| 0 <= i < ops.len() && 0 <= k < ops.len() ==> #[trigger] flat_ok(ops, i, k)
+}
+
+/// The checker's keys for `ops` are `key` of their files.
+pub(crate) open spec fn keyed(coarse: Seq<SOp>, fine: Seq<FOp>, key: spec_fn(int) -> Seq<usize>) -> bool {
+    &&& coarse.len() == fine.len()
+    &&& forall|i: int| 0 <= i < fine.len() ==> {
+        &&& (#[trigger] coarse[i]).act == fine[i].act
+        &&& coarse[i].path == key(fine[i].path)
+        &&& two(fine[i].act) ==> coarse[i].other == key(fine[i].other)
+    }
+}
+
+/// **The checker's keys are safe to be coarse.** If they are any function of
+/// the files, a set the checker accepts obeys the rule over the files: every
+/// clause that fires on two files that are one also fires on their one key.
+pub(crate) proof fn lemma_rule_on_files(coarse: Seq<SOp>, fine: Seq<FOp>, key: spec_fn(int) -> Seq<usize>)
+    requires
+        admissible(coarse),
+        keyed(coarse, fine, key),
+    ensures
+        flat_admissible(fine),
+{
+    assert forall|i: int, k: int| 0 <= i < fine.len() && 0 <= k < fine.len() implies #[trigger] flat_ok(fine, i, k) by {
+        assert(pair_refusal(coarse, i, k) is None);
+        let (a, b) = (coarse[i], coarse[k]);
+        let (fa, fb) = (fine[i], fine[k]);
+        assert(a.act == fa.act && a.path == key(fa.path));
+        assert(b.act == fb.act && b.path == key(fb.path));
+        if two(fa.act) {
+            assert(a.other == key(fa.other));
+        }
+        if two(fb.act) {
+            assert(b.other == key(fb.other));
+        }
+    }
+}
+
 // ---- what the tree holds, and what an apply and a replay do to it ----
 //
-// A tree is modeled by its contents: each path's file bytes or link target,
-// or nothing. Paths are the rule's keys, so two keys are two files — the
-// identity the rule assumes. Execute bits and permissions are not modeled:
-// an execute-bit flip is a read here (it needs a file, and replay skips it
-// where there is none), which is all the rule depends on.
+// A tree is modeled by what each file holds: bytes, a link's target, or a
+// directory — or nothing. Execute bits and permissions are not modeled here:
+// an execute-bit flip is a read (it needs a file or directory, and replay
+// skips it where there is none), which is all the rule depends on.
 
 pub(crate) enum Content {
     File(Seq<u8>),
-    Link(Seq<u8>),
+    Link(int),
+    Dir,
 }
 
-pub(crate) type Fs = Map<Seq<usize>, Content>;
+pub(crate) type Fs = Map<int, Content>;
 
 /// An op with its payload: the bytes a write lands, the target a link names.
 pub(crate) struct Op {
     pub(crate) act: Act,
-    pub(crate) path: Seq<usize>,
-    pub(crate) other: Seq<usize>,
+    pub(crate) path: int,
+    pub(crate) other: int,
     pub(crate) bytes: Seq<u8>,
-    pub(crate) target: Seq<u8>,
+    pub(crate) target: int,
 }
 
-pub(crate) open spec fn sop(op: Op) -> SOp {
-    SOp { act: op.act, path: op.path, other: op.other }
+pub(crate) open spec fn fop(op: Op) -> FOp {
+    FOp { act: op.act, path: op.path, other: op.other }
 }
 
-pub(crate) open spec fn sops(ops: Seq<Op>) -> Seq<SOp> {
-    Seq::new(ops.len(), |i: int| sop(ops[i]))
+pub(crate) open spec fn fops(ops: Seq<Op>) -> Seq<FOp> {
+    Seq::new(ops.len(), |i: int| fop(ops[i]))
 }
 
-pub(crate) open spec fn entry(s: Fs, p: Seq<usize>) -> Option<Content> {
+pub(crate) open spec fn entry(s: Fs, p: int) -> Option<Content> {
     if s.contains_key(p) {
         Some(s[p])
     } else {
@@ -168,64 +278,108 @@ pub(crate) open spec fn entry(s: Fs, p: Seq<usize>) -> Option<Content> {
     }
 }
 
-pub(crate) open spec fn is_file(s: Fs, p: Seq<usize>) -> bool {
+pub(crate) open spec fn is_file(s: Fs, p: int) -> bool {
     s.contains_key(p) && s[p] is File
 }
 
+pub(crate) open spec fn is_dir(s: Fs, p: int) -> bool {
+    s.contains_key(p) && s[p] is Dir
+}
+
+pub(crate) open spec fn is_link(s: Fs, p: int) -> bool {
+    s.contains_key(p) && s[p] is Link
+}
+
+/// What `try_exists` answers where no link stands: a file or a directory.
+pub(crate) open spec fn present(s: Fs, p: int) -> bool {
+    s.contains_key(p) && !(s[p] is Link)
+}
+
 /// What `exec` does to the tree when the op succeeds. A removed or displaced
-/// entry moved aside has left the tree; a rename's source is a file, since a
-/// journaled set that renames a link is refused.
+/// entry moved aside has left the tree; a rename's source is not a link,
+/// since a journaled set that renames one is refused; nothing replaces a
+/// directory.
 pub(crate) open spec fn step(s: Fs, op: Op) -> Option<Fs> {
     match op.act {
-        Act::Write => Some(s.insert(op.path, Content::File(op.bytes))),
-        Act::CopyFrom => if is_file(s, op.other) {
+        Act::Write => if is_dir(s, op.path) {
+            None
+        } else {
+            Some(s.insert(op.path, Content::File(op.bytes)))
+        },
+        Act::CopyFrom => if is_file(s, op.other) && !is_dir(s, op.path) {
             Some(s.insert(op.path, s[op.other]))
         } else {
             None
         },
-        Act::Remove => if s.contains_key(op.path) {
+        Act::Remove => if s.contains_key(op.path) && !is_dir(s, op.path) {
             Some(s.remove(op.path))
         } else {
             None
         },
-        Act::Rename => if is_file(s, op.path) && op.path != op.other {
+        Act::Rename => if present(s, op.path) && op.path != op.other && !is_dir(s, op.other) {
             Some(s.remove(op.path).insert(op.other, s[op.path]))
         } else {
             None
         },
-        Act::SetExecutable => if is_file(s, op.path) {
+        Act::SetExecutable => if present(s, op.path) {
             Some(s)
         } else {
             None
         },
-        Act::SetLink => Some(s.insert(op.path, Content::Link(op.target))),
+        Act::SetLink => if is_dir(s, op.path) {
+            None
+        } else {
+            Some(s.insert(op.path, Content::Link(op.target)))
+        },
     }
 }
 
-/// What `journal::replay` does to the tree. `try_exists` follows links, so
-/// only a file counts as present.
+/// What `journal::replay` does to the tree. Where it reads a path through a
+/// link — `try_exists`, `read` — the answer depends on the link's referent,
+/// which is outside the tree; that is modeled as failure, and the theorem
+/// shows replay never does it.
 pub(crate) open spec fn replay_step(s: Fs, op: Op) -> Option<Fs> {
     match op.act {
-        Act::Write => Some(s.insert(op.path, Content::File(op.bytes))),
-        Act::CopyFrom => if is_file(s, op.other) {
+        Act::Write => if is_dir(s, op.path) {
+            None
+        } else {
+            Some(s.insert(op.path, Content::File(op.bytes)))
+        },
+        Act::CopyFrom => if is_file(s, op.other) && !is_dir(s, op.path) {
             Some(s.insert(op.path, s[op.other]))
         } else {
             None
         },
-        Act::Remove => Some(s.remove(op.path)),
-        Act::Rename => if is_file(s, op.path) {
-            Some(s.remove(op.path).insert(op.other, s[op.path]))
-        } else if is_file(s, op.other) {
+        Act::Remove => if is_dir(s, op.path) {
+            None
+        } else {
+            Some(s.remove(op.path))
+        },
+        Act::Rename => if is_link(s, op.path) {
+            None
+        } else if present(s, op.path) {
+            if is_dir(s, op.other) {
+                None
+            } else {
+                Some(s.remove(op.path).insert(op.other, s[op.path]))
+            }
+        } else if is_link(s, op.other) {
+            None
+        } else if present(s, op.other) {
             Some(s)
         } else {
             None
         },
-        Act::SetExecutable => if s.contains_key(op.path) && s[op.path] is Link {
+        Act::SetExecutable => if is_link(s, op.path) {
             None
         } else {
             Some(s)
         },
-        Act::SetLink => Some(s.insert(op.path, Content::Link(op.target))),
+        Act::SetLink => if is_dir(s, op.path) {
+            None
+        } else {
+            Some(s.insert(op.path, Content::Link(op.target)))
+        },
     }
 }
 
@@ -265,7 +419,7 @@ pub(crate) open spec fn replay_upto(u: Fs, ops: Seq<Op>, k: nat) -> Option<Fs>
 /// mover in, or back; a link's path, on a backend that replaces by remove and
 /// remake. Every other step — a rename, a move aside, a removal, a flip — is
 /// one call that happens or does not.
-pub(crate) open spec fn torn_path(op: Op) -> Option<Seq<usize>> {
+pub(crate) open spec fn torn_path(op: Op) -> Option<int> {
     match op.act {
         Act::Write | Act::CopyFrom | Act::SetLink => Some(op.path),
         Act::Rename => Some(op.other),
@@ -273,11 +427,12 @@ pub(crate) open spec fn torn_path(op: Op) -> Option<Seq<usize>> {
     }
 }
 
-/// What a write's target can hold, torn: what it held, or some file.
+/// What a torn path can hold: what it held, or — since no op makes a
+/// directory — anything but a directory; for a write, some file.
 pub(crate) open spec fn torn_ok(op: Op, now: Option<Content>, before: Option<Content>) -> bool {
-    match op.act {
-        Act::Write | Act::CopyFrom => now == before || (now is Some && now->Some_0 is File),
-        _ => true,
+    now == before || match op.act {
+        Act::Write | Act::CopyFrom => now is Some && now->Some_0 is File,
+        _ => !(now matches Some(Content::Dir)),
     }
 }
 
@@ -288,7 +443,7 @@ pub(crate) open spec fn crash_state(s0: Fs, ops: Seq<Op>, j: nat, u: Fs) -> bool
     let sj = apply_upto(s0, ops, j)->Some_0;
     if j < ops.len() && torn_path(ops[j as int]) is Some {
         let d = torn_path(ops[j as int])->Some_0;
-        &&& forall|p: Seq<usize>| p != d ==> #[trigger] entry(u, p) == entry(sj, p)
+        &&& forall|p: int| p != d ==> #[trigger] entry(u, p) == entry(sj, p)
         &&& torn_ok(ops[j as int], entry(u, d), entry(sj, d))
     } else {
         u == sj
@@ -297,11 +452,11 @@ pub(crate) open spec fn crash_state(s0: Fs, ops: Seq<Op>, j: nat, u: Fs) -> bool
 
 // ---- proofs ----
 
-pub(crate) open spec fn writes(op: Op, p: Seq<usize>) -> bool {
+pub(crate) open spec fn writes(op: Op, p: int) -> bool {
     op.path == p || (op.act is Rename && op.other == p)
 }
 
-pub(crate) open spec fn total(op: Op, p: Seq<usize>) -> bool {
+pub(crate) open spec fn total(op: Op, p: int) -> bool {
     op.path == p && (op.act is Write || op.act is CopyFrom || op.act is Remove || op.act is SetLink)
 }
 
@@ -317,7 +472,7 @@ pub(crate) open spec fn tc(s0: Fs, op: Op) -> Option<Content> {
 }
 
 /// The last of the first `k` ops that is total at `p`.
-pub(crate) open spec fn last_total(ops: Seq<Op>, k: nat, p: Seq<usize>) -> Option<int>
+pub(crate) open spec fn last_total(ops: Seq<Op>, k: nat, p: int) -> Option<int>
     decreases k,
 {
     if k == 0 {
@@ -329,7 +484,7 @@ pub(crate) open spec fn last_total(ops: Seq<Op>, k: nat, p: Seq<usize>) -> Optio
     }
 }
 
-proof fn lemma_last_total_bounds(ops: Seq<Op>, k: nat, p: Seq<usize>)
+proof fn lemma_last_total_bounds(ops: Seq<Op>, k: nat, p: int)
     ensures
         last_total(ops, k, p) is Some ==> {
             let q = last_total(ops, k, p)->Some_0;
@@ -345,7 +500,7 @@ proof fn lemma_last_total_bounds(ops: Seq<Op>, k: nat, p: Seq<usize>)
 
 /// What replay holds at `p` after `k` ops, by the invariant: what the last
 /// total op there left, or what the crash left.
-pub(crate) open spec fn lastr(u: Fs, s0: Fs, ops: Seq<Op>, k: nat, p: Seq<usize>) -> Option<Content> {
+pub(crate) open spec fn lastr(u: Fs, s0: Fs, ops: Seq<Op>, k: nat, p: int) -> Option<Content> {
     match last_total(ops, k, p) {
         Some(q) => tc(s0, ops[q]),
         None => entry(u, p),
@@ -354,32 +509,32 @@ pub(crate) open spec fn lastr(u: Fs, s0: Fs, ops: Seq<Op>, k: nat, p: Seq<usize>
 
 proof fn lemma_admits(ops: Seq<Op>, i: int, k: int)
     requires
-        admissible(sops(ops)),
+        flat_admissible(fops(ops)),
         0 <= i < ops.len(),
         0 <= k < ops.len(),
     ensures
-        pair_refusal(sops(ops), i, k) is None,
-        sops(ops)[i] == sop(ops[i]),
-        sops(ops)[k] == sop(ops[k]),
+        flat_ok(fops(ops), i, k),
+        fops(ops)[i] == fop(ops[i]),
+        fops(ops)[k] == fop(ops[k]),
 {
 }
 
 proof fn lemma_maps_equal(a: Fs, b: Fs)
     requires
-        forall|p: Seq<usize>| #[trigger] entry(a, p) == entry(b, p),
+        forall|p: int| #[trigger] entry(a, p) == entry(b, p),
     ensures
         a == b,
 {
-    assert forall|p: Seq<usize>| a.contains_key(p) <==> b.contains_key(p) by {
+    assert forall|p: int| a.contains_key(p) <==> b.contains_key(p) by {
         assert(entry(a, p) == entry(b, p));
     }
-    assert forall|p: Seq<usize>| a.contains_key(p) implies #[trigger] a[p] == b[p] by {
+    assert forall|p: int| a.contains_key(p) implies #[trigger] a[p] == b[p] by {
         assert(entry(a, p) == entry(b, p));
     }
     assert(a =~= b);
 }
 
-proof fn lemma_step_frame(s: Fs, op: Op, p: Seq<usize>)
+proof fn lemma_step_frame(s: Fs, op: Op, p: int)
     requires
         step(s, op) is Some,
         !writes(op, p),
@@ -402,7 +557,7 @@ proof fn lemma_apply_prefix(s0: Fs, ops: Seq<Op>, k: nat, n: nat)
 }
 
 /// A path no op in `[k, j)` writes holds after `j` ops what it held after `k`.
-proof fn lemma_unwritten(s0: Fs, ops: Seq<Op>, k: nat, j: nat, p: Seq<usize>)
+proof fn lemma_unwritten(s0: Fs, ops: Seq<Op>, k: nat, j: nat, p: int)
     requires
         k <= j,
         apply_upto(s0, ops, j) is Some,
@@ -424,7 +579,7 @@ proof fn lemma_unwritten(s0: Fs, ops: Seq<Op>, k: nat, j: nat, p: Seq<usize>)
 /// from it.
 proof fn lemma_copy_source(s0: Fs, ops: Seq<Op>, i: int, j: nat)
     requires
-        admissible(sops(ops)),
+        flat_admissible(fops(ops)),
         0 <= i < ops.len(),
         ops[i].act is CopyFrom,
         j <= ops.len(),
@@ -444,9 +599,9 @@ proof fn lemma_copy_source(s0: Fs, ops: Seq<Op>, i: int, j: nat)
 /// What the apply leaves at `p` after `k` ops, when some op before `k` was
 /// total there: what the last one left. Between it and `k`, the rule lets
 /// nothing else change `p`.
-proof fn lemma_apply_last_total(s0: Fs, ops: Seq<Op>, k: nat, p: Seq<usize>)
+proof fn lemma_apply_last_total(s0: Fs, ops: Seq<Op>, k: nat, p: int)
     requires
-        admissible(sops(ops)),
+        flat_admissible(fops(ops)),
         k <= ops.len(),
         apply_upto(s0, ops, k) is Some,
         last_total(ops, k, p) is Some,
@@ -479,16 +634,33 @@ proof fn lemma_apply_last_total(s0: Fs, ops: Seq<Op>, k: nat, p: Seq<usize>)
     }
 }
 
-/// A rename's destination holds a file from the rename on: after it, the
-/// rule lets only writes and flips touch it.
-proof fn lemma_file_after_rename(s0: Fs, ops: Seq<Op>, m: int, k: nat)
+/// What a total op left is never a directory: a copy lands its source's
+/// bytes, and the apply only copies from a file.
+proof fn lemma_tc_not_dir(s0: Fs, ops: Seq<Op>, q: int)
     requires
-        admissible(sops(ops)),
+        flat_admissible(fops(ops)),
+        0 <= q < ops.len(),
+        apply_upto(s0, ops, (q + 1) as nat) is Some,
+    ensures
+        !(tc(s0, ops[q]) matches Some(Content::Dir)),
+{
+    lemma_apply_prefix(s0, ops, q as nat, (q + 1) as nat);
+    if ops[q].act is CopyFrom {
+        lemma_copy_source(s0, ops, q, q as nat);
+    }
+}
+
+/// A rename's destination holds what it moved from the rename on — a file or
+/// a directory, never a link: after it, the rule lets only writes and flips
+/// touch it.
+proof fn lemma_present_after_rename(s0: Fs, ops: Seq<Op>, m: int, k: nat)
+    requires
+        flat_admissible(fops(ops)),
         0 <= m < k <= ops.len(),
         ops[m].act is Rename,
         apply_upto(s0, ops, k) is Some,
     ensures
-        is_file(apply_upto(s0, ops, k)->Some_0, ops[m].other),
+        present(apply_upto(s0, ops, k)->Some_0, ops[m].other),
     decreases k,
 {
     let t = ops[m].other;
@@ -497,7 +669,7 @@ proof fn lemma_file_after_rename(s0: Fs, ops: Seq<Op>, m: int, k: nat)
     let op = ops[k - 1];
     if k - 1 == m {
     } else {
-        lemma_file_after_rename(s0, ops, m, (k - 1) as nat);
+        lemma_present_after_rename(s0, ops, m, (k - 1) as nat);
         if writes(op, t) {
             lemma_admits(ops, m, k - 1);
         } else {
@@ -510,7 +682,7 @@ proof fn lemma_file_after_rename(s0: Fs, ops: Seq<Op>, m: int, k: nat)
 /// nothing name it.
 proof fn lemma_gone_after_rename(s0: Fs, ops: Seq<Op>, m: int, k: nat)
     requires
-        admissible(sops(ops)),
+        flat_admissible(fops(ops)),
         0 <= m < k <= ops.len(),
         ops[m].act is Rename,
         apply_upto(s0, ops, k) is Some,
@@ -526,16 +698,16 @@ proof fn lemma_gone_after_rename(s0: Fs, ops: Seq<Op>, m: int, k: nat)
     lemma_apply_prefix(s0, ops, m as nat, k);
 }
 
-/// A flipped file never becomes a link: after a flip, the rule lets only
+/// A flipped path never becomes a link: after a flip, the rule lets only
 /// writes, flips, removals and renames away touch it.
 proof fn lemma_no_link_after_flip(s0: Fs, ops: Seq<Op>, i: int, k: nat)
     requires
-        admissible(sops(ops)),
+        flat_admissible(fops(ops)),
         0 <= i < k <= ops.len(),
         ops[i].act is SetExecutable,
         apply_upto(s0, ops, k) is Some,
     ensures
-        !(entry(apply_upto(s0, ops, k)->Some_0, ops[i].path) matches Some(Content::Link(_))),
+        !is_link(apply_upto(s0, ops, k)->Some_0, ops[i].path),
     decreases k,
 {
     let p = ops[i].path;
@@ -557,14 +729,14 @@ proof fn lemma_no_link_after_flip(s0: Fs, ops: Seq<Op>, i: int, k: nat)
 /// left there — or, where there was none, what the crash left.
 proof fn lemma_replay_prefix(s0: Fs, ops: Seq<Op>, j: nat, u: Fs, k: nat)
     requires
-        admissible(sops(ops)),
+        flat_admissible(fops(ops)),
         j <= ops.len(),
         apply_upto(s0, ops, ops.len() as nat) is Some,
         crash_state(s0, ops, j, u),
         k <= j,
     ensures
         replay_upto(u, ops, k) is Some,
-        forall|p: Seq<usize>| #[trigger] entry(replay_upto(u, ops, k)->Some_0, p) == lastr(u, s0, ops, k, p),
+        forall|p: int| #[trigger] entry(replay_upto(u, ops, k)->Some_0, p) == lastr(u, s0, ops, k, p),
     decreases k,
 {
     let n = ops.len() as nat;
@@ -582,6 +754,37 @@ proof fn lemma_replay_prefix(s0: Fs, ops: Seq<Op>, j: nat, u: Fs, k: nat)
         // Where the crash left something other than the tree after `j` ops.
         let torn = j < n && torn_path(ops[j as int]) is Some;
         let d = torn_path(ops[j as int])->Some_0;
+        // A total op's path holds, in replay, no directory: before the op,
+        // either what an earlier total op left or — the op being total there
+        // before `j` — what the apply's last total op before `j` left.
+        if total(op, op.path) {
+            let p = op.path;
+            assert(entry(r, p) == lastr(u, s0, ops, km, p));
+            if last_total(ops, km, p) is Some {
+                lemma_last_total_bounds(ops, km, p);
+                let q = last_total(ops, km, p)->Some_0;
+                lemma_apply_prefix(s0, ops, (q + 1) as nat, n);
+                lemma_tc_not_dir(s0, ops, q);
+            } else {
+                assert(last_total(ops, j, p) is Some) by {
+                    lemma_last_total_bounds(ops, j, p);
+                    if last_total(ops, j, p) is None {
+                        assert(!total(ops[km as int], p));
+                    }
+                }
+                lemma_apply_last_total(s0, ops, j, p);
+                lemma_last_total_bounds(ops, j, p);
+                let q = last_total(ops, j, p)->Some_0;
+                lemma_apply_prefix(s0, ops, (q + 1) as nat, n);
+                lemma_tc_not_dir(s0, ops, q);
+                if !(torn && p == d) {
+                    assert(entry(u, p) == entry(sj, p));
+                } else {
+                    assert(torn_ok(ops[j as int], entry(u, d), entry(sj, d)));
+                }
+            }
+            assert(!is_dir(r, p));
+        }
         match op.act {
             Act::CopyFrom => {
                 let src = op.other;
@@ -623,7 +826,7 @@ proof fn lemma_replay_prefix(s0: Fs, ops: Seq<Op>, j: nat, u: Fs, k: nat)
                         assert(entry(u, p) == entry(sj, p));
                     }
                 }
-                assert(!(r.contains_key(p) && r[p] is Link));
+                assert(!is_link(r, p));
                 lemma_replay_prefix_step(u, s0, ops, km, r);
             },
             Act::Rename => {
@@ -645,8 +848,8 @@ proof fn lemma_replay_prefix(s0: Fs, ops: Seq<Op>, j: nat, u: Fs, k: nat)
                 }
                 assert(entry(r, f) == lastr(u, s0, ops, km, f));
                 assert(entry(u, f) == entry(sj, f));
-                assert(!is_file(r, f));
-                // The destination: nothing before, a file at `j`.
+                assert(!r.contains_key(f));
+                // The destination: nothing before, a file or directory at `j`.
                 lemma_last_total_bounds(ops, km, t);
                 assert(last_total(ops, km, t) is None) by {
                     if last_total(ops, km, t) is Some {
@@ -654,7 +857,7 @@ proof fn lemma_replay_prefix(s0: Fs, ops: Seq<Op>, j: nat, u: Fs, k: nat)
                         lemma_admits(ops, km as int, q);
                     }
                 }
-                lemma_file_after_rename(s0, ops, km as int, j);
+                lemma_present_after_rename(s0, ops, km as int, j);
                 assert(entry(r, t) == lastr(u, s0, ops, km, t));
                 if torn && t == d {
                     // What tore it is a later write there: the file it held,
@@ -665,7 +868,7 @@ proof fn lemma_replay_prefix(s0: Fs, ops: Seq<Op>, j: nat, u: Fs, k: nat)
                 } else {
                     assert(entry(u, t) == entry(sj, t));
                 }
-                assert(is_file(r, t));
+                assert(present(r, t));
                 lemma_replay_prefix_step(u, s0, ops, km, r);
             },
             _ => {
@@ -681,19 +884,20 @@ proof fn lemma_replay_prefix_step(u: Fs, s0: Fs, ops: Seq<Op>, km: nat, r: Fs)
     requires
         km < ops.len(),
         replay_upto(u, ops, km) == Some(r),
-        forall|p: Seq<usize>| #[trigger] entry(r, p) == lastr(u, s0, ops, km, p),
+        forall|p: int| #[trigger] entry(r, p) == lastr(u, s0, ops, km, p),
+        total(ops[km as int], ops[km as int].path) ==> !is_dir(r, ops[km as int].path),
         ops[km as int].act is CopyFrom ==> is_file(r, ops[km as int].other) && entry(r, ops[km as int].other) == entry(s0, ops[km as int].other),
-        ops[km as int].act is SetExecutable ==> !(r.contains_key(ops[km as int].path) && r[ops[km as int].path] is Link),
-        ops[km as int].act is Rename ==> !is_file(r, ops[km as int].path) && is_file(r, ops[km as int].other),
+        ops[km as int].act is SetExecutable ==> !is_link(r, ops[km as int].path),
+        ops[km as int].act is Rename ==> !r.contains_key(ops[km as int].path) && present(r, ops[km as int].other),
     ensures
         replay_upto(u, ops, km + 1) is Some,
-        forall|p: Seq<usize>| #[trigger] entry(replay_upto(u, ops, km + 1)->Some_0, p) == lastr(u, s0, ops, km + 1, p),
+        forall|p: int| #[trigger] entry(replay_upto(u, ops, km + 1)->Some_0, p) == lastr(u, s0, ops, km + 1, p),
 {
     let op = ops[km as int];
     let k = km + 1;
     assert(replay_upto(u, ops, k) == replay_step(r, op));
     let r2 = replay_step(r, op)->Some_0;
-    assert forall|p: Seq<usize>| #[trigger] entry(r2, p) == lastr(u, s0, ops, k, p) by {
+    assert forall|p: int| #[trigger] entry(r2, p) == lastr(u, s0, ops, k, p) by {
         assert(entry(r, p) == lastr(u, s0, ops, km, p));
         assert(last_total(ops, k, p) == if total(op, p) { Some(km as int) } else { last_total(ops, km, p) });
     }
@@ -734,7 +938,7 @@ proof fn lemma_replay_suffix(s0: Fs, ops: Seq<Op>, u: Fs, k: nat, m: nat)
 /// apply would have.
 pub(crate) proof fn theorem_replay_recovers(s0: Fs, ops: Seq<Op>, j: nat, u: Fs)
     requires
-        admissible(sops(ops)),
+        flat_admissible(fops(ops)),
         apply_upto(s0, ops, ops.len() as nat) is Some,
         j <= ops.len(),
         crash_state(s0, ops, j, u),
@@ -749,7 +953,7 @@ pub(crate) proof fn theorem_replay_recovers(s0: Fs, ops: Seq<Op>, j: nat, u: Fs)
     let torn = j < n && torn_path(ops[j as int]) is Some;
     let d = torn_path(ops[j as int])->Some_0;
     // Away from the torn path, the replay has caught up with the apply.
-    assert forall|p: Seq<usize>| !(torn && p == d) implies #[trigger] entry(rj, p) == entry(sj, p) by {
+    assert forall|p: int| !(torn && p == d) implies #[trigger] entry(rj, p) == entry(sj, p) by {
         assert(entry(rj, p) == lastr(u, s0, ops, j, p));
         if last_total(ops, j, p) is Some {
             lemma_apply_last_total(s0, ops, j, p);
@@ -763,6 +967,7 @@ pub(crate) proof fn theorem_replay_recovers(s0: Fs, ops: Seq<Op>, j: nat, u: Fs)
         let op = ops[j as int];
         lemma_apply_prefix(s0, ops, j + 1, n);
         let sj1 = apply_upto(s0, ops, j + 1)->Some_0;
+        assert(step(sj, op) is Some);
         if op.act is CopyFrom {
             lemma_admits(ops, j as int, j as int);
             assert(entry(rj, op.other) == entry(sj, op.other));
@@ -771,8 +976,21 @@ pub(crate) proof fn theorem_replay_recovers(s0: Fs, ops: Seq<Op>, j: nat, u: Fs)
             lemma_admits(ops, j as int, j as int);
             assert(entry(rj, op.path) == entry(sj, op.path));
         }
+        // The torn path: what op `j`'s own last total left, or what the crash
+        // left — no directory either way.
+        assert(entry(rj, d) == lastr(u, s0, ops, j, d));
+        if last_total(ops, j, d) is Some {
+            lemma_apply_last_total(s0, ops, j, d);
+            lemma_last_total_bounds(ops, j, d);
+            let q = last_total(ops, j, d)->Some_0;
+            lemma_apply_prefix(s0, ops, (q + 1) as nat, n);
+            lemma_tc_not_dir(s0, ops, q);
+        } else {
+            assert(torn_ok(op, entry(u, d), entry(sj, d)));
+        }
+        assert(!is_dir(rj, d));
         let rj1 = replay_upto(u, ops, j + 1)->Some_0;
-        assert forall|p: Seq<usize>| #[trigger] entry(rj1, p) == entry(sj1, p) by {
+        assert forall|p: int| #[trigger] entry(rj1, p) == entry(sj1, p) by {
             assert(p != d ==> entry(rj, p) == entry(sj, p));
         }
         lemma_maps_equal(rj1, sj1);
