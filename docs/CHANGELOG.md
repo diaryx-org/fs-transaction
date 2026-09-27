@@ -23,6 +23,7 @@ editing their own code would observe.
 ### Breaking
 
 - **change** — refuse sets replay cannot recover, and roll back by moving aside ([`7f553a5`](https://github.com/diaryx-org/fs-transaction/commit/7f553a5dc6720dd12589f051f360cd1e756de816))
+- **replayable** — refuse a set that writes a path and later renames it ([`8f8e1bf`](https://github.com/diaryx-org/fs-transaction/commit/8f8e1bffb5dc70ed0e02a1a73313a8ce4edc026d))
 
 ### Changed
 
@@ -36,6 +37,8 @@ editing their own code would observe.
 - a set that removes files or renames over them now costs one more durable directory flush when it lands, and leaves .name.fstx-aside-N siblings on disk while it applies.
 
 - a rolled-back set restores removed and displaced files with their original permissions instead of the default mode.
+
+- a journaled set that writes a path and later renames it is now refused with Error::Unreplayable.
 
 <!-- git-cliff:end -->
 ## v0.3.0 — 2026-09-17
