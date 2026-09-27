@@ -39,7 +39,7 @@ use crate::fs::Storage;
 use vstd::prelude::*;
 
 #[cfg(verus_keep_ghost)]
-pub(crate) use crate::replayable::proof::{Content, Fs, Op, entry, is_dir, is_link, present};
+pub(crate) use crate::replayable::proof::{Content, Fs, Op, entry};
 
 #[cfg(verus_keep_ghost)]
 verus! {
@@ -72,6 +72,64 @@ pub(crate) uninterp spec fn ancestor(a: int, b: int) -> bool;
 /// an aside.
 pub(crate) uninterp spec fn scratch(x: int) -> bool;
 
+/// What a file holds, as the executor sees it: the recovery theorem's
+/// [`Content`] and, for a file or directory, its mode.
+pub enum Entry {
+    File { bytes: Seq<u8>, mode: int },
+    Link { target: int },
+    Dir { mode: int },
+}
+
+pub(crate) type Tree = Map<int, Entry>;
+
+pub(crate) open spec fn proj(e: Entry) -> Content {
+    match e {
+        Entry::File { bytes, .. } => Content::File(bytes),
+        Entry::Link { target } => Content::Link(target),
+        Entry::Dir { .. } => Content::Dir,
+    }
+}
+
+/// A tree's contents, without modes: what the recovery theorem speaks of.
+pub(crate) open spec fn content(t: Tree) -> Fs {
+    t.map_values(|e: Entry| proj(e))
+}
+
+pub(crate) open spec fn ent(t: Tree, x: int) -> Option<Entry> {
+    if t.contains_key(x) {
+        Some(t[x])
+    } else {
+        None
+    }
+}
+
+/// What a tree's contents hold at `x` is what it holds there, without a mode.
+pub(crate) broadcast proof fn lemma_content(t: Tree, x: int)
+    ensures
+        #[trigger] entry(content(t), x) == match ent(t, x) {
+            Some(e) => Some(proj(e)),
+            None => None::<Content>,
+        },
+{
+}
+
+pub(crate) open spec fn has_file(t: Tree, x: int) -> bool {
+    t.contains_key(x) && t[x] is File
+}
+
+pub(crate) open spec fn has_dir(t: Tree, x: int) -> bool {
+    t.contains_key(x) && t[x] is Dir
+}
+
+pub(crate) open spec fn has_link(t: Tree, x: int) -> bool {
+    t.contains_key(x) && t[x] is Link
+}
+
+/// What `try_exists` answers where no link stands.
+pub(crate) open spec fn has_entry(t: Tree, x: int) -> bool {
+    t.contains_key(x) && !(t[x] is Link)
+}
+
 /// A set of files the executor can be verified on: none above another, none
 /// the crate's own.
 pub(crate) open spec fn sound(keys: Set<int>) -> bool {
@@ -79,19 +137,19 @@ pub(crate) open spec fn sound(keys: Set<int>) -> bool {
     &&& forall|a: int| keys.contains(a) ==> !#[trigger] scratch(a)
 }
 
-/// `a` and `b` agree on every file in `keys`.
-pub(crate) open spec fn agree(keys: Set<int>, a: Fs, b: Fs) -> bool {
-    forall|x: int| keys.contains(x) ==> #[trigger] entry(a, x) == entry(b, x)
+/// `t`'s contents agree with `s` on every file in `keys`.
+pub(crate) open spec fn agree(keys: Set<int>, t: Tree, s: Fs) -> bool {
+    forall|x: int| keys.contains(x) ==> #[trigger] entry(content(t), x) == entry(s, x)
 }
 
 /// Nothing changed but what is at `p`, and scratch.
-pub(crate) open spec fn only_at(old: Fs, new: Fs, p: int) -> bool {
-    forall|x: int| x != p && !scratch(x) ==> #[trigger] entry(new, x) == entry(old, x)
+pub(crate) open spec fn only_at(old: Tree, new: Tree, p: int) -> bool {
+    forall|x: int| x != p && !scratch(x) ==> #[trigger] ent(new, x) == ent(old, x)
 }
 
 /// Nothing changed but what is above `p`.
-pub(crate) open spec fn only_above(old: Fs, new: Fs, p: int) -> bool {
-    forall|x: int| !ancestor(x, p) ==> #[trigger] entry(new, x) == entry(old, x)
+pub(crate) open spec fn only_above(old: Tree, new: Tree, p: int) -> bool {
+    forall|x: int| !ancestor(x, p) ==> #[trigger] ent(new, x) == ent(old, x)
 }
 
 pub(crate) open spec fn two_slot(op: crate::FileOp) -> bool {
@@ -156,22 +214,25 @@ pub(crate) open spec fn models(root: &Path, ops: Seq<crate::FileOp>) -> Seq<Op> 
     Seq::new(ops.len(), |i: int| model(root, ops[i]))
 }
 
-/// Replay reads and writes only the files an op names, so two trees that
-/// agree on those files replay alike there.
-pub(crate) proof fn lemma_replay_congruent(keys: Set<int>, a: Fs, b: Fs, op: Op)
+/// Replay reads and writes only the files an op names, so a tree whose
+/// contents agree with a model there replays like the model there.
+pub(crate) proof fn lemma_replay_congruent(keys: Set<int>, t: Tree, b: Fs, op: Op)
     requires
-        agree(keys, a, b),
+        agree(keys, t, b),
         keys.contains(op.path),
         (op.act is Rename || op.act is CopyFrom) ==> keys.contains(op.other),
     ensures
-        crate::replayable::proof::replay_step(a, op) is Some
+        crate::replayable::proof::replay_step(content(t), op) is Some
             <==> crate::replayable::proof::replay_step(b, op) is Some,
-        crate::replayable::proof::replay_step(a, op) is Some ==> agree(
-            keys,
-            crate::replayable::proof::replay_step(a, op)->Some_0,
-            crate::replayable::proof::replay_step(b, op)->Some_0,
-        ),
+        crate::replayable::proof::replay_step(content(t), op) is Some ==> {
+            let (ra, rb) = (
+                crate::replayable::proof::replay_step(content(t), op)->Some_0,
+                crate::replayable::proof::replay_step(b, op)->Some_0,
+            );
+            forall|x: int| keys.contains(x) ==> #[trigger] entry(ra, x) == entry(rb, x)
+        },
 {
+    let a = content(t);
     assert(entry(a, op.path) == entry(b, op.path));
     if op.act is Rename || op.act is CopyFrom {
         assert(entry(a, op.other) == entry(b, op.other));
@@ -207,7 +268,7 @@ pub(crate) fn note_parent(touched: &mut BTreeSet<PathBuf>, full: &PathBuf) {
 /// Create whatever directories `full` needs, recording them as owed a flush.
 #[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
 #[cfg_attr(verus_keep_ghost, verus_spec(r =>
-    with Tracked(tree): Tracked<&mut Fs>
+    with Tracked(tree): Tracked<&mut Tree>
     ensures
         only_above(*old(tree), *final(tree), fid(*full)),
 ))]
@@ -228,12 +289,13 @@ pub(crate) async fn ensure_parent<FS: Storage>(
 /// Nothing replaces a directory.
 #[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
 #[cfg_attr(verus_keep_ghost, verus_spec(r =>
-    with Tracked(tree): Tracked<&mut Fs>
+    with Tracked(tree): Tracked<&mut Tree>
     ensures
         only_at(*old(tree), *final(tree), fid(*full)),
-        r is Ok ==> !is_dir(*old(tree), fid(*full))
-            && entry(*final(tree), fid(*full)) == Some(Content::File(bytes@)),
-        r is Err ==> entry(*final(tree), fid(*full)) == entry(*old(tree), fid(*full)),
+        r is Ok ==> !has_dir(*old(tree), fid(*full)) && has_file(*final(tree), fid(*full))
+            && final(tree)[fid(*full)]->File_bytes == bytes@
+            && (has_file(*old(tree), fid(*full)) ==> final(tree)[fid(*full)]->File_mode == old(tree)[fid(*full)]->File_mode),
+        r is Err ==> ent(*final(tree), fid(*full)) == ent(*old(tree), fid(*full)),
 ))]
 pub(crate) async fn replace<FS: Storage>(fs: &FS, full: &PathBuf, bytes: &Vec<u8>) -> Result<()> {
     Ok(fs.replace(full, bytes).await?)
@@ -254,10 +316,10 @@ pub(crate) async fn settle_write<FS: Storage>(
 /// A read fails on nothing and on a directory, and reads through a link.
 #[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
 #[cfg_attr(verus_keep_ghost, verus_spec(r =>
-    with Tracked(tree): Tracked<&Fs>
+    with Tracked(tree): Tracked<&Tree>
     ensures
-        r is Ok ==> tree.contains_key(fid(*source)) && !is_dir(*tree, fid(*source))
-            && (tree[fid(*source)] is File ==> r->Ok_0@ == tree[fid(*source)]->File_0),
+        r is Ok ==> tree.contains_key(fid(*source)) && !has_dir(*tree, fid(*source))
+            && (has_file(*tree, fid(*source)) ==> r->Ok_0@ == tree[fid(*source)]->File_bytes),
 ))]
 pub(crate) async fn read_source<FS: Storage>(
     fs: &FS,
@@ -277,11 +339,11 @@ pub(crate) async fn read_source<FS: Storage>(
 /// A directory is not removed.
 #[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
 #[cfg_attr(verus_keep_ghost, verus_spec(r =>
-    with Tracked(tree): Tracked<&mut Fs>
+    with Tracked(tree): Tracked<&mut Tree>
     ensures
         only_at(*old(tree), *final(tree), fid(*full)),
-        r is Ok ==> !is_dir(*old(tree), fid(*full)) && !final(tree).contains_key(fid(*full)),
-        r is Err ==> entry(*final(tree), fid(*full)) == entry(*old(tree), fid(*full)),
+        r is Ok ==> !has_dir(*old(tree), fid(*full)) && !final(tree).contains_key(fid(*full)),
+        r is Err ==> ent(*final(tree), fid(*full)) == ent(*old(tree), fid(*full)),
 ))]
 pub(crate) async fn remove_if_there<FS: Storage>(fs: &FS, full: &PathBuf) -> Result<()> {
     match fs.remove_file(full).await {
@@ -293,9 +355,9 @@ pub(crate) async fn remove_if_there<FS: Storage>(fs: &FS, full: &PathBuf) -> Res
 /// Whether a link stands at `full`.
 #[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
 #[cfg_attr(verus_keep_ghost, verus_spec(r =>
-    with Tracked(tree): Tracked<&Fs>
+    with Tracked(tree): Tracked<&Tree>
     ensures
-        r == is_link(*tree, fid(*full)),
+        r == has_link(*tree, fid(*full)),
 ))]
 pub(crate) async fn holds_link<FS: Storage>(fs: &FS, full: &PathBuf) -> bool {
     matches!(fs.read_link(full).await, Ok(Some(_)))
@@ -305,9 +367,9 @@ pub(crate) async fn holds_link<FS: Storage>(fs: &FS, full: &PathBuf) -> bool {
 /// link, the referent's answer, which the model does not hold.
 #[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
 #[cfg_attr(verus_keep_ghost, verus_spec(r =>
-    with Tracked(tree): Tracked<&Fs>
+    with Tracked(tree): Tracked<&Tree>
     ensures
-        r is Ok && !is_link(*tree, fid(*full)) ==> r->Ok_0 == present(*tree, fid(*full)),
+        r is Ok && !has_link(*tree, fid(*full)) ==> r->Ok_0 == has_entry(*tree, fid(*full)),
 ))]
 pub(crate) async fn exists<FS: Storage>(fs: &FS, full: &PathBuf) -> Result<bool> {
     Ok(fs.try_exists(full).await?)
@@ -317,9 +379,11 @@ pub(crate) async fn exists<FS: Storage>(fs: &FS, full: &PathBuf) -> Result<bool>
 /// still resolves. What a file holds does not change.
 #[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
 #[cfg_attr(verus_keep_ghost, verus_spec(r =>
-    with Tracked(tree): Tracked<&mut Fs>
+    with Tracked(tree): Tracked<&mut Tree>
     ensures
-        *final(tree) == *old(tree),
+        only_at(*old(tree), *final(tree), fid(*full)),
+        content(*final(tree)) == content(*old(tree)),
+        r is Ok ==> has_entry(*old(tree), fid(*full)),
 ))]
 pub(crate) async fn set_executable<FS: Storage>(
     fs: &FS,
@@ -334,11 +398,13 @@ pub(crate) async fn set_executable<FS: Storage>(
 /// may leave the path empty. Nothing replaces a directory.
 #[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
 #[cfg_attr(verus_keep_ghost, verus_spec(r =>
-    with Tracked(tree): Tracked<&mut Fs>
+    with Tracked(tree): Tracked<&mut Tree>
     ensures
         only_at(*old(tree), *final(tree), fid(*full)),
-        r is Ok ==> !is_dir(*old(tree), fid(*full))
-            && entry(*final(tree), fid(*full)) == Some(Content::Link(tid(*target))),
+        r is Ok ==> !has_dir(*old(tree), fid(*full))
+            && ent(*final(tree), fid(*full)) == Some(Entry::Link { target: tid(*target) }),
+        r is Err ==> ent(*final(tree), fid(*full)) == ent(*old(tree), fid(*full))
+            || !final(tree).contains_key(fid(*full)),
 ))]
 pub(crate) async fn set_link<FS: Storage>(fs: &FS, full: &PathBuf, target: &PathBuf) -> Result<()> {
     Ok(fs.set_link(full, target).await?)
@@ -349,16 +415,16 @@ pub(crate) async fn set_link<FS: Storage>(fs: &FS, full: &PathBuf, target: &Path
 /// a directory.
 #[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
 #[cfg_attr(verus_keep_ghost, verus_spec(r =>
-    with Tracked(tree): Tracked<&mut Fs>
+    with Tracked(tree): Tracked<&mut Tree>
     ensures
         forall|x: int| x != fid(*from) && x != fid(*to) && !scratch(x)
             && !ancestor(fid(*from), x) && !ancestor(fid(*to), x)
-            ==> #[trigger] entry(*final(tree), x) == entry(*old(tree), x),
-        r is Ok ==> old(tree).contains_key(fid(*from)) && !is_dir(*old(tree), fid(*to))
+            ==> #[trigger] ent(*final(tree), x) == ent(*old(tree), x),
+        r is Ok ==> old(tree).contains_key(fid(*from)) && !has_dir(*old(tree), fid(*to))
             && (fid(*from) != fid(*to) ==> !final(tree).contains_key(fid(*from)))
-            && entry(*final(tree), fid(*to)) == entry(*old(tree), fid(*from)),
-        r is Err ==> entry(*final(tree), fid(*from)) == entry(*old(tree), fid(*from))
-            && entry(*final(tree), fid(*to)) == entry(*old(tree), fid(*to)),
+            && ent(*final(tree), fid(*to)) == ent(*old(tree), fid(*from)),
+        r is Err ==> ent(*final(tree), fid(*from)) == ent(*old(tree), fid(*from))
+            && ent(*final(tree), fid(*to)) == ent(*old(tree), fid(*to)),
 ))]
 pub(crate) async fn rename<FS: Storage>(fs: &FS, from: &PathBuf, to: &PathBuf) -> Result<()> {
     Ok(fs.rename(from, to).await?)

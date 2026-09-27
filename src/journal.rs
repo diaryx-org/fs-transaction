@@ -469,13 +469,13 @@ pub async fn recover<FS: Storage>(fs: &FS, root: &Path) -> Result<Recovered> {
 /// theorem's `replay_upto` says, whenever it returns `Ok`.
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(r =>
-    with Tracked(tree): Tracked<&mut port::Fs>, Ghost(keys): Ghost<Set<int>>
+    with Tracked(tree): Tracked<&mut port::Tree>, Ghost(keys): Ghost<Set<int>>
     requires
         port::sound(keys),
         forall|i: int| 0 <= i < ops@.len() ==> port::names(root, #[trigger] ops@[i], keys),
     ensures
-        r is Ok && replay_upto(*old(tree), port::models(root, ops@), ops@.len() as nat) is Some ==>
-            port::agree(keys, *final(tree), replay_upto(*old(tree), port::models(root, ops@), ops@.len() as nat)->Some_0),
+        r is Ok && replay_upto(port::content(*old(tree)), port::models(root, ops@), ops@.len() as nat) is Some ==>
+            port::agree(keys, *final(tree), replay_upto(port::content(*old(tree)), port::models(root, ops@), ops@.len() as nat)->Some_0),
 ))]
 async fn replay_all<FS: Storage>(
     fs: &FS,
@@ -489,8 +489,8 @@ async fn replay_all<FS: Storage>(
             i <= ops@.len(),
             port::sound(keys),
             forall|x: int| 0 <= x < ops@.len() ==> port::names(root, #[trigger] ops@[x], keys),
-            replay_upto(*old(tree), port::models(root, ops@), i as nat) is Some ==>
-                port::agree(keys, *tree, replay_upto(*old(tree), port::models(root, ops@), i as nat)->Some_0),
+            replay_upto(port::content(*old(tree)), port::models(root, ops@), i as nat) is Some ==>
+                port::agree(keys, *tree, replay_upto(port::content(*old(tree)), port::models(root, ops@), i as nat)->Some_0),
         decreases ops@.len() - i,
     ))]
     while i < ops.len() {
@@ -499,8 +499,8 @@ async fn replay_all<FS: Storage>(
             let ghost before = *tree;
             let ghost models = port::models(root, ops@);
             assert(models[i as int] == port::model(root, ops@[i as int]));
-            if replay_upto(*old(tree), models, (i + 1) as nat) is Some {
-                port::lemma_replay_congruent(keys, before, replay_upto(*old(tree), models, i as nat)->Some_0, models[i as int]);
+            if replay_upto(port::content(*old(tree)), models, (i + 1) as nat) is Some {
+                port::lemma_replay_congruent(keys, before, replay_upto(port::content(*old(tree)), models, i as nat)->Some_0, models[i as int]);
             }
         }
         #[cfg(verus_keep_ghost)]
@@ -524,13 +524,13 @@ async fn replay_all<FS: Storage>(
 /// every path the set names, whenever it returns `Ok`.
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(r =>
-    with Tracked(tree): Tracked<&mut port::Fs>, Ghost(keys): Ghost<Set<int>>
+    with Tracked(tree): Tracked<&mut port::Tree>, Ghost(keys): Ghost<Set<int>>
     requires
         port::sound(keys),
         port::names(root, *op, keys),
     ensures
-        r is Ok && replay_step(*old(tree), port::model(root, *op)) is Some ==>
-            port::agree(keys, *final(tree), replay_step(*old(tree), port::model(root, *op))->Some_0),
+        r is Ok && replay_step(port::content(*old(tree)), port::model(root, *op)) is Some ==>
+            port::agree(keys, *final(tree), replay_step(port::content(*old(tree)), port::model(root, *op))->Some_0),
 ))]
 async fn replay<FS: Storage>(
     fs: &FS,
@@ -538,6 +538,10 @@ async fn replay<FS: Storage>(
     op: &FileOp,
     touched: &mut std::collections::BTreeSet<PathBuf>,
 ) -> Result<()> {
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        broadcast use port::lemma_content;
+    }
     match op {
         // Whole-file writes are idempotent by nature: writing the intended bytes
         // again reaches the same state whether or not the crash beat this op.
