@@ -187,7 +187,7 @@ fn first_refusal(ops: &[Shape]) -> Result<(), (usize, Refusal)> {
 
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == (a@ == b@)))]
-fn same(a: &Vec<usize>, b: &Vec<usize>) -> bool {
+fn same(a: &[usize], b: &[usize]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -213,7 +213,7 @@ fn same(a: &Vec<usize>, b: &Vec<usize>) -> bool {
 /// Whether `a` is a proper ancestor of `b`.
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == proof::under(a@, b@)))]
-fn strictly_under(a: &Vec<usize>, b: &Vec<usize>) -> bool {
+fn strictly_under(a: &[usize], b: &[usize]) -> bool {
     if a.len() >= b.len() {
         return false;
     }
@@ -240,7 +240,7 @@ fn strictly_under(a: &Vec<usize>, b: &Vec<usize>) -> bool {
 
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == proof::nested(a@, b@)))]
-fn nested(a: &Vec<usize>, b: &Vec<usize>) -> bool {
+fn nested(a: &[usize], b: &[usize]) -> bool {
     strictly_under(a, b) || strictly_under(b, a)
 }
 
@@ -248,22 +248,19 @@ fn nested(a: &Vec<usize>, b: &Vec<usize>) -> bool {
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == proof::two(act)))]
 fn two(act: Act) -> bool {
-    match act {
-        Act::CopyFrom | Act::Rename => true,
-        _ => false,
-    }
+    matches!(act, Act::CopyFrom | Act::Rename)
 }
 
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == proof::mentions(proof::view(op), x@)))]
-fn mentions(op: &Shape, x: &Vec<usize>) -> bool {
+fn mentions(op: &Shape, x: &[usize]) -> bool {
     same(&op.path, x) || (two(op.act) && same(&op.other, x))
 }
 
 /// `op` names `x` only to write it whole.
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == proof::writes_only(proof::view(op), x@)))]
-fn writes_only(op: &Shape, x: &Vec<usize>) -> bool {
+fn writes_only(op: &Shape, x: &[usize]) -> bool {
     match op.act {
         Act::Write => same(&op.path, x),
         Act::CopyFrom => same(&op.path, x) && !same(&op.other, x),
@@ -274,7 +271,7 @@ fn writes_only(op: &Shape, x: &Vec<usize>) -> bool {
 /// `op` names `x` only to flip its execute bit.
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == proof::flips(proof::view(op), x@)))]
-fn flips(op: &Shape, x: &Vec<usize>) -> bool {
+fn flips(op: &Shape, x: &[usize]) -> bool {
     match op.act {
         Act::SetExecutable => same(&op.path, x),
         _ => false,
@@ -284,7 +281,7 @@ fn flips(op: &Shape, x: &Vec<usize>) -> bool {
 /// `op` names `x` only in ways that leave a file there.
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == proof::keeps_file(proof::view(op), x@)))]
-fn keeps_file(op: &Shape, x: &Vec<usize>) -> bool {
+fn keeps_file(op: &Shape, x: &[usize]) -> bool {
     writes_only(op, x)
         || match op.act {
             Act::SetExecutable => same(&op.path, x),
@@ -296,7 +293,7 @@ fn keeps_file(op: &Shape, x: &Vec<usize>) -> bool {
 /// renaming it somewhere else.
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == proof::leaves(proof::view(op), x@)))]
-fn leaves(op: &Shape, x: &Vec<usize>) -> bool {
+fn leaves(op: &Shape, x: &[usize]) -> bool {
     match op.act {
         Act::Remove => same(&op.path, x),
         Act::Rename => same(&op.path, x) && !same(&op.other, x),
@@ -372,7 +369,7 @@ fn pair(ops: &[Shape], i: usize, k: usize) -> Option<Refusal> {
 /// `op` names `s` only to copy from it, somewhere else.
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == proof::only_copies_from(proof::view(op), s@)))]
-fn only_copies_from(op: &Shape, s: &Vec<usize>) -> bool {
+fn only_copies_from(op: &Shape, s: &[usize]) -> bool {
     match op.act {
         Act::CopyFrom => same(&op.other, s) && !same(&op.path, s),
         _ => false,
