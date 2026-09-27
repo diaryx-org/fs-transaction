@@ -1366,11 +1366,11 @@ mod tests {
         );
         resurrect(
             "resurrect-install",
-            &[],
+            &[("staged", "#!/bin/sh")],
             |c| {
-                c.write("staged", "#!/bin/sh");
                 c.set_executable("staged", true);
                 c.rename("staged", "tool");
+                c.write("tool", "#!/bin/sh\nexit 0");
             },
             &["staged", "tool"],
         );

@@ -22,9 +22,11 @@
 //! reading op reads, and accepted otherwise. The rules are in [`pair`]:
 //!
 //! - no path the set names lies inside another;
-//! - a rename's source is written or flipped, if at all, only by ops before
-//!   it, and never used after it; its destination is untouched before it, and
-//!   after it only written or flipped, so it stays a file;
+//! - a rename's source is, before it, at most flipped — never written, since
+//!   replay would write it afresh where the apply wrote into the file that was
+//!   there, and move a file without that file's mode — and never used after
+//!   it; its destination is untouched before it, and after it only written or
+//!   flipped, so it stays a file;
 //! - a file whose execute bit is flipped is, afterwards, only written,
 //!   flipped, removed, or renamed away — never replaced by a link, which
 //!   replay would refuse to flip through;
@@ -42,7 +44,14 @@ use std::path::Path;
 
 use crate::change::FileOp;
 
+#[cfg(verus_keep_ghost)]
+use vstd::prelude::*;
+
+#[cfg(verus_keep_ghost)]
+mod proof;
+
 /// Why a set was refused, and at which op.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Refusal {
     Nested,
@@ -62,7 +71,7 @@ impl Refusal {
             Refusal::Nested => "it names a path inside another path the set names",
             Refusal::RenameInPlace => "it renames a file onto itself",
             Refusal::RenameSourceChangedBefore => {
-                "it renames a path an earlier op did more to than write or flip"
+                "it renames a path an earlier op did more to than flip its execute bit"
             }
             Refusal::RenameSourceUsedAfter => "it renames away from a path a later op uses again",
             Refusal::RenameOntoUsed => "it renames onto a path an earlier op already used",
@@ -100,31 +109,71 @@ fn key(path: &Path, names: &mut BTreeMap<String, usize>) -> Vec<usize> {
 }
 
 fn shape(op: &FileOp, names: &mut BTreeMap<String, usize>) -> Shape {
-    match op {
-        FileOp::Write { path, .. } => Shape::Write(key(path, names)),
-        FileOp::CopyFrom { path, source } => Shape::CopyFrom(key(path, names), key(source, names)),
-        FileOp::Remove { path } => Shape::Remove(key(path, names)),
-        FileOp::Rename { from, to } => Shape::Rename(key(from, names), key(to, names)),
-        FileOp::SetExecutable { path, .. } => Shape::SetExecutable(key(path, names)),
-        FileOp::SetLink { path, .. } => Shape::SetLink(key(path, names)),
+    let (act, path, other) = match op {
+        FileOp::Write { path, .. } => (Act::Write, path, None),
+        FileOp::CopyFrom { path, source } => (Act::CopyFrom, path, Some(source)),
+        FileOp::Remove { path } => (Act::Remove, path, None),
+        FileOp::Rename { from, to } => (Act::Rename, from, Some(to)),
+        FileOp::SetExecutable { path, .. } => (Act::SetExecutable, path, None),
+        FileOp::SetLink { path, .. } => (Act::SetLink, path, None),
+    };
+    Shape {
+        act,
+        path: key(path, names),
+        other: other.map(|p| key(p, names)).unwrap_or_default(),
     }
 }
 
-/// An op with only what the rule reads: which kind it is, and the paths it
-/// names.
-pub(crate) enum Shape {
-    Write(Vec<usize>),
-    CopyFrom(Vec<usize>, Vec<usize>),
-    Remove(Vec<usize>),
-    Rename(Vec<usize>, Vec<usize>),
-    SetExecutable(Vec<usize>),
-    SetLink(Vec<usize>),
+/// Which kind of op.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[derive(Clone, Copy)]
+pub(crate) enum Act {
+    Write,
+    CopyFrom,
+    Remove,
+    Rename,
+    SetExecutable,
+    SetLink,
 }
 
+/// An op with only what the rule reads: which kind it is, and the paths it
+/// names — `path` always (a rename's source, a copy's destination), `other`
+/// for the two kinds that name a second (a rename's destination, a copy's
+/// source).
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+pub(crate) struct Shape {
+    pub(crate) act: Act,
+    pub(crate) path: Vec<usize>,
+    pub(crate) other: Vec<usize>,
+}
+
+/// The first op that breaks the rule, or none.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    ensures
+        r is Ok <==> proof::admissible(proof::views(ops@)),
+))]
 fn first_refusal(ops: &[Shape]) -> Result<(), (usize, Refusal)> {
-    let mut i = 0;
+    let mut i: usize = 0;
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        invariant
+            i <= ops@.len(),
+            forall|x: int, y: int| 0 <= x < i && 0 <= y < ops@.len() ==>
+                (#[trigger] proof::pair_refusal(proof::views(ops@), x, y)) is None,
+        decreases ops@.len() - i,
+    ))]
     while i < ops.len() {
-        let mut k = 0;
+        let mut k: usize = 0;
+        #[cfg_attr(verus_keep_ghost, verus_spec(
+            invariant
+                i < ops@.len(),
+                k <= ops@.len(),
+                forall|x: int, y: int| 0 <= x < i && 0 <= y < ops@.len() ==>
+                    (#[trigger] proof::pair_refusal(proof::views(ops@), x, y)) is None,
+                forall|y: int| 0 <= y < k ==>
+                    (#[trigger] proof::pair_refusal(proof::views(ops@), i as int, y)) is None,
+            decreases ops@.len() - k,
+        ))]
         while k < ops.len() {
             if let Some(refusal) = pair(ops, i, k) {
                 return Err((i, refusal));
@@ -136,84 +185,157 @@ fn first_refusal(ops: &[Shape]) -> Result<(), (usize, Refusal)> {
     Ok(())
 }
 
-fn same(a: &[usize], b: &[usize]) -> bool {
-    a == b
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == (a@ == b@)))]
+fn same(a: &Vec<usize>, b: &Vec<usize>) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut j: usize = 0;
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        invariant
+            j <= a@.len(),
+            a@.len() == b@.len(),
+            forall|x: int| 0 <= x < j ==> a@[x] == b@[x],
+        decreases a@.len() - j,
+    ))]
+    while j < a.len() {
+        if a[j] != b[j] {
+            return false;
+        }
+        j += 1;
+    }
+    #[cfg(verus_keep_ghost)]
+    proof! { assert(a@ =~= b@); }
+    true
 }
 
 /// Whether `a` is a proper ancestor of `b`.
-fn strictly_under(a: &[usize], b: &[usize]) -> bool {
-    a.len() < b.len() && same(a, &b[..a.len()])
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == proof::under(a@, b@)))]
+fn strictly_under(a: &Vec<usize>, b: &Vec<usize>) -> bool {
+    if a.len() >= b.len() {
+        return false;
+    }
+    let mut j: usize = 0;
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        invariant
+            j <= a@.len(),
+            a@.len() < b@.len(),
+            forall|x: int| 0 <= x < j ==> a@[x] == b@[x],
+        decreases a@.len() - j,
+    ))]
+    while j < a.len() {
+        if a[j] != b[j] {
+            #[cfg(verus_keep_ghost)]
+            proof! { assert(b@.take(a@.len() as int)[j as int] != a@[j as int]); }
+            return false;
+        }
+        j += 1;
+    }
+    #[cfg(verus_keep_ghost)]
+    proof! { assert(b@.take(a@.len() as int) =~= a@); }
+    true
 }
 
-fn first(op: &Shape) -> &[usize] {
-    match op {
-        Shape::Write(p)
-        | Shape::CopyFrom(p, _)
-        | Shape::Remove(p)
-        | Shape::Rename(p, _)
-        | Shape::SetExecutable(p)
-        | Shape::SetLink(p) => p,
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == proof::nested(a@, b@)))]
+fn nested(a: &Vec<usize>, b: &Vec<usize>) -> bool {
+    strictly_under(a, b) || strictly_under(b, a)
+}
+
+/// Whether this kind of op names a second path.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == proof::two(act)))]
+fn two(act: Act) -> bool {
+    match act {
+        Act::CopyFrom | Act::Rename => true,
+        _ => false,
     }
 }
 
-fn second(op: &Shape) -> Option<&[usize]> {
-    match op {
-        Shape::CopyFrom(_, s) | Shape::Rename(_, s) => Some(s),
-        _ => None,
-    }
-}
-
-fn mentions(op: &Shape, x: &[usize]) -> bool {
-    same(first(op), x) || matches!(second(op), Some(s) if same(s, x))
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == proof::mentions(proof::view(op), x@)))]
+fn mentions(op: &Shape, x: &Vec<usize>) -> bool {
+    same(&op.path, x) || (two(op.act) && same(&op.other, x))
 }
 
 /// `op` names `x` only to write it whole.
-fn writes_only(op: &Shape, x: &[usize]) -> bool {
-    match op {
-        Shape::Write(p) => same(p, x),
-        Shape::CopyFrom(p, s) => same(p, x) && !same(s, x),
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == proof::writes_only(proof::view(op), x@)))]
+fn writes_only(op: &Shape, x: &Vec<usize>) -> bool {
+    match op.act {
+        Act::Write => same(&op.path, x),
+        Act::CopyFrom => same(&op.path, x) && !same(&op.other, x),
+        _ => false,
+    }
+}
+
+/// `op` names `x` only to flip its execute bit.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == proof::flips(proof::view(op), x@)))]
+fn flips(op: &Shape, x: &Vec<usize>) -> bool {
+    match op.act {
+        Act::SetExecutable => same(&op.path, x),
         _ => false,
     }
 }
 
 /// `op` names `x` only in ways that leave a file there.
-fn keeps_file(op: &Shape, x: &[usize]) -> bool {
-    writes_only(op, x) || matches!(op, Shape::SetExecutable(p) if same(p, x))
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == proof::keeps_file(proof::view(op), x@)))]
+fn keeps_file(op: &Shape, x: &Vec<usize>) -> bool {
+    writes_only(op, x)
+        || match op.act {
+            Act::SetExecutable => same(&op.path, x),
+            _ => false,
+        }
 }
 
 /// `op` names `x` only to take the file away from it: removing it, or
 /// renaming it somewhere else.
-fn leaves(op: &Shape, x: &[usize]) -> bool {
-    match op {
-        Shape::Remove(p) => same(p, x),
-        Shape::Rename(f, t) => same(f, x) && !same(t, x),
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == proof::leaves(proof::view(op), x@)))]
+fn leaves(op: &Shape, x: &Vec<usize>) -> bool {
+    match op.act {
+        Act::Remove => same(&op.path, x),
+        Act::Rename => same(&op.path, x) && !same(&op.other, x),
         _ => false,
     }
 }
 
-fn nested(a: &[usize], b: &[usize]) -> bool {
-    strictly_under(a, b) || strictly_under(b, a)
-}
-
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    ensures r == proof::nested_ops(proof::view(a), proof::view(b)),
+))]
 fn nested_ops(a: &Shape, b: &Shape) -> bool {
-    let (a1, b1) = (first(a), first(b));
-    nested(a1, b1)
-        || matches!(second(a), Some(a2) if nested(a2, b1))
-        || matches!(second(b), Some(b2) if nested(a1, b2))
-        || matches!((second(a), second(b)), (Some(a2), Some(b2)) if nested(a2, b2))
+    nested(&a.path, &b.path)
+        || (two(a.act) && nested(&a.other, &b.path))
+        || (two(b.act) && nested(&a.path, &b.other))
+        || (two(a.act) && two(b.act) && nested(&a.other, &b.other))
 }
 
 /// What op `i` requires of op `k` (which may be itself).
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    requires
+        i < ops@.len(),
+        k < ops@.len(),
+    ensures
+        r == proof::pair_refusal(proof::views(ops@), i as int, k as int),
+))]
 fn pair(ops: &[Shape], i: usize, k: usize) -> Option<Refusal> {
-    let (a, b) = (&ops[i], &ops[k]);
+    let a = &ops[i];
+    let b = &ops[k];
     if nested_ops(a, b) {
         return Some(Refusal::Nested);
     }
-    match a {
-        Shape::Rename(f, t) => {
+    match a.act {
+        Act::Rename => {
+            let (f, t) = (&a.path, &a.other);
             if k == i && same(f, t) {
                 Some(Refusal::RenameInPlace)
-            } else if k < i && mentions(b, f) && !keeps_file(b, f) {
+            } else if k < i && mentions(b, f) && !flips(b, f) {
                 Some(Refusal::RenameSourceChangedBefore)
             } else if k > i && mentions(b, f) {
                 Some(Refusal::RenameSourceUsedAfter)
@@ -225,26 +347,35 @@ fn pair(ops: &[Shape], i: usize, k: usize) -> Option<Refusal> {
                 None
             }
         }
-        Shape::SetExecutable(p) => {
+        Act::SetExecutable => {
+            let p = &a.path;
             if k > i && mentions(b, p) && !keeps_file(b, p) && !leaves(b, p) {
                 Some(Refusal::ExecutableFileChangedAfter)
             } else {
                 None
             }
         }
-        Shape::CopyFrom(p, s) => {
+        Act::CopyFrom => {
+            let (p, s) = (&a.path, &a.other);
             if k == i && same(p, s) {
                 Some(Refusal::CopyOntoItsSource)
-            } else if k != i
-                && mentions(b, s)
-                && !matches!(b, Shape::CopyFrom(p2, s2) if same(s2, s) && !same(p2, s))
-            {
+            } else if k != i && mentions(b, s) && !only_copies_from(b, s) {
                 Some(Refusal::CopySourceChanged)
             } else {
                 None
             }
         }
         _ => None,
+    }
+}
+
+/// `op` names `s` only to copy from it, somewhere else.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == proof::only_copies_from(proof::view(op), s@)))]
+fn only_copies_from(op: &Shape, s: &Vec<usize>) -> bool {
+    match op.act {
+        Act::CopyFrom => same(&op.other, s) && !same(&op.path, s),
+        _ => false,
     }
 }
 
@@ -290,11 +421,11 @@ mod tests {
             }),
             None
         );
-        // Write somewhere, then move it into place, then make it runnable.
+        // Move a file into place, then write it and make it runnable.
         assert_eq!(
             refuses(|c| {
-                c.write("staged", "x");
                 c.rename("staged", "bin/tool");
+                c.write("bin/tool", "x");
                 c.set_executable("bin/tool", true);
             }),
             None
@@ -302,7 +433,6 @@ mod tests {
         // Or make it runnable first: replay finds nothing left to flip.
         assert_eq!(
             refuses(|c| {
-                c.write("staged", "x");
                 c.set_executable("staged", true);
                 c.rename("staged", "bin/tool");
             }),
@@ -347,6 +477,15 @@ mod tests {
                 c.set_link("run", "elsewhere");
             }),
             Some(Refusal::ExecutableFileChangedAfter)
+        );
+        // Replay would write `staged` afresh and move a file without the
+        // mode the apply's write kept.
+        assert_eq!(
+            refuses(|c| {
+                c.write("staged", "x");
+                c.rename("staged", "bin/tool");
+            }),
+            Some(Refusal::RenameSourceChangedBefore)
         );
         assert_eq!(
             refuses(|c| {
