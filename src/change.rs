@@ -608,7 +608,16 @@ impl Journal {
             // applied-but-uncertified.
             let mut touched = BTreeSet::new();
             let mut unrecorded = Rollback::default();
-            exec(fs, root, 0, &changes.ops[0], false, &mut unrecorded, &mut touched).await?;
+            exec(
+                fs,
+                root,
+                0,
+                &changes.ops[0],
+                false,
+                &mut unrecorded,
+                &mut touched,
+            )
+            .await?;
             return Ok(
                 crate::fs::flush_all(fs, touched, root, crate::fs::Durability::Durable).await?,
             );
@@ -1730,7 +1739,11 @@ pub(crate) async fn settle_write_debt<FS: Storage>(
         },
         r is Err ==> final(undo)@ == old(undo)@ && final(h).s == old(h).s,
 ))]
-async fn capture_replaced<FS: Storage>(fs: &FS, full: &PathBuf, undo: &mut Vec<Undo>) -> Result<()> {
+async fn capture_replaced<FS: Storage>(
+    fs: &FS,
+    full: &PathBuf,
+    undo: &mut Vec<Undo>,
+) -> Result<()> {
     #[cfg(verus_keep_ghost)]
     proof_decl! {
         broadcast use port::lemma_content;
@@ -1859,7 +1872,6 @@ async fn check_expected<FS: Storage>(
     }
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -3370,7 +3382,11 @@ mod tests {
     #[cfg(unix)]
     fn mode_of(root: &Path, rel: &str) -> u32 {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::metadata(root.join(rel)).unwrap().permissions().mode() & 0o777
+        std::fs::metadata(root.join(rel))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
     }
 
     #[cfg(unix)]
@@ -3383,7 +3399,11 @@ mod tests {
     #[test]
     fn a_rollback_gives_back_what_it_removed_with_its_mode() {
         let root = tmp("rollback-keeps-mode");
-        for (name, mode) in [("tool.sh", 0o755), ("private.md", 0o600), ("occupant.md", 0o600)] {
+        for (name, mode) in [
+            ("tool.sh", 0o755),
+            ("private.md", 0o600),
+            ("occupant.md", 0o600),
+        ] {
             std::fs::write(root.join(name), name).unwrap();
             chmod(&root, name, mode);
         }

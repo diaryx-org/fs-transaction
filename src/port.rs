@@ -572,7 +572,11 @@ pub(crate) fn copy_path(p: &PathBuf) -> PathBuf {
                 && (has_file(*old(tree), fid(*full)) ==> final(tree)[fid(*full)]->File_mode == old(tree)[fid(*full)]->File_mode)
         },
 ))]
-pub(crate) async fn write_back<FS: Storage>(fs: &FS, full: &PathBuf, bytes: &Vec<u8>) -> Result<()> {
+pub(crate) async fn write_back<FS: Storage>(
+    fs: &FS,
+    full: &PathBuf,
+    bytes: &Vec<u8>,
+) -> Result<()> {
     fs.write(full, bytes).await?;
     Ok(fs.sync(full, crate::fs::Durability::Ordered).await?)
 }
@@ -640,7 +644,11 @@ pub(crate) fn nothing_to_remove(full: &PathBuf) -> Error {
 /// Certify a landed set: every debt pushed, one drain of the root. Nothing
 /// in the tree changes.
 #[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
-pub(crate) async fn certify<FS: Storage>(fs: &FS, touched: BTreeSet<PathBuf>, root: &Path) -> Result<()> {
+pub(crate) async fn certify<FS: Storage>(
+    fs: &FS,
+    touched: BTreeSet<PathBuf>,
+    root: &Path,
+) -> Result<()> {
     Ok(crate::fs::flush_all(fs, touched, root, crate::fs::Durability::Durable).await?)
 }
 

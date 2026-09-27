@@ -2,8 +2,8 @@
 //! enough: a set that passes it recovers from any crash by replaying from its
 //! first op. Compiled only by Verus (`verus_keep_ghost`).
 
-use vstd::prelude::*;
 use super::{Act, Refusal, Shape};
+use vstd::prelude::*;
 
 verus! {
 

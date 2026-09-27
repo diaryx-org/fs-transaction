@@ -591,7 +591,10 @@ impl Journal {
         // that removes or replaces a path names where. Rolled forward, none
         // of them is anyone's to put back.
         for (index, op) in ops.iter().enumerate() {
-            if let FileOp::Remove { path } | FileOp::Rename { to: path, .. } | FileOp::SetLink { path, .. } = op {
+            if let FileOp::Remove { path }
+            | FileOp::Rename { to: path, .. }
+            | FileOp::SetLink { path, .. } = op
+            {
                 let aside = crate::fs::aside_sibling(&root.join(path), index);
                 if matches!(port::occupant(fs, &aside).await?, port::Occupant::Absent) {
                     continue;
@@ -1108,9 +1111,9 @@ fn fnv1a(data: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ChangeSet;
     use crate::exec::block_on;
     use crate::fs::StdFs;
-    use crate::ChangeSet;
 
     fn tmp(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("fstx-journal-{name}-{}", std::process::id()));
@@ -1768,7 +1771,12 @@ mod tests {
     /// Apply `build`'s set, then put its journal back, as a power cut after
     /// `Ok` may: the deletion is not flushed. Recovery must leave the tree
     /// exactly as the apply left it.
-    fn resurrect(name: &str, files: &[(&str, &str)], build: impl Fn(&mut ChangeSet), show: &[&str]) {
+    fn resurrect(
+        name: &str,
+        files: &[(&str, &str)],
+        build: impl Fn(&mut ChangeSet),
+        show: &[&str],
+    ) {
         let root = tmp(name);
         for (f, b) in files {
             std::fs::write(root.join(f), b).unwrap();
@@ -1778,7 +1786,10 @@ mod tests {
         block_on(cs.apply(&StdFs, &root)).unwrap();
         let applied: Vec<_> = show.iter().map(|f| read(&root, f)).collect();
         std::fs::write(Journal::default().path_in(&root), encode(cs.ops()).unwrap()).unwrap();
-        assert!(matches!(block_on(recover(&StdFs, &root)), Ok(Recovered::Applied(_))));
+        assert!(matches!(
+            block_on(recover(&StdFs, &root)),
+            Ok(Recovered::Applied(_))
+        ));
         let recovered: Vec<_> = show.iter().map(|f| read(&root, f)).collect();
         assert_eq!(recovered, applied, "{name}");
     }
@@ -1826,11 +1837,19 @@ mod tests {
         std::fs::write(&aside, "A").unwrap();
         std::fs::write(root.join("b.md"), "B").unwrap();
         let ops = vec![
-            FileOp::Remove { path: "a.md".into() },
-            FileOp::Write { path: "b.md".into(), bytes: b"B2".to_vec() },
+            FileOp::Remove {
+                path: "a.md".into(),
+            },
+            FileOp::Write {
+                path: "b.md".into(),
+                bytes: b"B2".to_vec(),
+            },
         ];
         std::fs::write(Journal::default().path_in(&root), encode(&ops).unwrap()).unwrap();
-        assert_eq!(block_on(recover(&StdFs, &root)).unwrap(), Recovered::Applied(2));
+        assert_eq!(
+            block_on(recover(&StdFs, &root)).unwrap(),
+            Recovered::Applied(2)
+        );
         assert!(!aside.exists());
         assert_eq!(read(&root, "a.md"), None);
         assert_eq!(read(&root, "b.md").as_deref(), Some("B2"));

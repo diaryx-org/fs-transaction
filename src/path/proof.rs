@@ -14,8 +14,8 @@
 //! behind it), and that the unverified shell around `fold` hands it the
 //! components' kinds and maps the indices it keeps back to those components.
 
-use vstd::prelude::*;
 use super::Kind;
+use vstd::prelude::*;
 
 verus! {
 

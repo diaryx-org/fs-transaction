@@ -35,6 +35,13 @@ fn visit(dir: &Path, found: &mut Vec<String>) {
 #[test]
 fn only_the_port_is_trusted() {
     let mut found = Vec::new();
-    visit(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut found);
-    assert!(found.is_empty(), "trust outside src/port.rs:\n{}", found.join("\n"));
+    visit(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut found,
+    );
+    assert!(
+        found.is_empty(),
+        "trust outside src/port.rs:\n{}",
+        found.join("\n")
+    );
 }
