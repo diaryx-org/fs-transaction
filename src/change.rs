@@ -777,10 +777,9 @@ async fn unwind_durable<FS: Storage>(
         proof_with! {Tracked(tree), Ghost(exact), Ghost(keys), Ghost(hist[i as int]), Ghost(hist[i + 1])}
         let undone = undo_step(fs, &undo[i], &mut dirs);
         let result = undone.await;
-        if first_error.is_none() {
-            if let Err(e) = result {
-                first_error = Some(e);
-            }
+        match result {
+            Err(e) if first_error.is_none() => first_error = Some(e),
+            _ => {}
         }
     }
     if let Some(e) = first_error {
