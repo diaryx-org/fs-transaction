@@ -137,10 +137,19 @@ I recommend enabling the feature where performance is important on Apple platfor
 
 ## Verified
 
-The root guard — `normalize` and `escapes_root` — is proved correct with [Verus](https://github.com/verus-lang/verus),
+Two parts of the crate are proved correct with [Verus](https://github.com/verus-lang/verus),
 in place: the specs sit on the code that runs,
-and the proofs sit beside it in a module only Verus compiles.
+and the proofs sit beside it in modules only Verus compiles.
 An ordinary build sees none of it and gains no dependency.
+
+- **The root guard.** `normalize` reaches a normal form, is idempotent, and keeps a path's meaning;
+  `escapes_root` is true exactly when a path is absolute or climbs above the root at any point.
+- **What a journaled set may contain.** The check `apply` runs before its commit point is proved to accept exactly the sets its rule describes,
+  and the rule is proved enough:
+  for any set it accepts, replaying the journal from its first op —
+  over the tree before or after any op, halfway through one, or halfway through a rollback —
+  reaches exactly the tree the apply would have.
+
 With a Verus release on `PATH`:
 
 ```sh
