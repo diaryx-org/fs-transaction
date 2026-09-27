@@ -1,0 +1,13 @@
+# What the shared release tooling needs to know about fs-transaction.
+# Everything not stated here is a default in lib/repo.nu — the manifest, the
+# changelog path, the cliff config, and that this is a Cargo workspace.
+name = "fs-transaction"
+url = "https://github.com/diaryx-org/fs-transaction"
+release_branch = "main"
+
+# What to run before cutting. Each repo owns its own CI; this names it.
+verify = "cargo xtask ci"
+
+# No `tag_starts`: nothing runs on the tag. The upload to crates.io is a
+# `cargo publish` somebody runs deliberately, so the warning before the push
+# says exactly that.

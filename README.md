@@ -169,11 +169,16 @@ with their documentation as their spec;
 and what the proofs assume about paths — that the paths a set names are not nested,
 and that it names none of the crate's own scratch files.
 A test fails if anything is taken on trust anywhere else.
-With a Verus release on `PATH`:
+CI runs the proofs on every push, and so does this:
 
 ```sh
-verus src/lib.rs --crate-type=lib --crate-name fs_transaction --edition=2024
+cargo xtask proofs
 ```
+
+It fetches the pinned Verus release once, into `~/.cache/verus`,
+and installs the Rust toolchain that release was built against.
+To use a Verus you already have, set `VERUS` to its `verus`.
+`cargo xtask ci` runs every CI job, in the order CI does.
 
 ## License
 

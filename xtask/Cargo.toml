@@ -1,0 +1,12 @@
+# fs-transaction's CI, as a program. Not a published crate — `publish = false`
+# keeps it out of any `cargo publish` sweep, and it deliberately has no
+# dependencies: every job needs `cargo xtask` to build before it can do
+# anything, so the cost of building it is paid on every CI job.
+[package]
+name = "xtask"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]

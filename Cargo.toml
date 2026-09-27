@@ -35,3 +35,10 @@ barrier-fsync = ["dep:libc"]
 # Verus sets `verus_keep_ghost` when it verifies the crate; see src/path.rs.
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_keep_ghost)'] }
+
+# `xtask` is the crate's CI, as a program: `cargo xtask <job>` runs one job,
+# and the workflow runs nothing else. It is `publish = false`, and cargo leaves
+# a nested package out of this one's upload, so the crate still ships with no
+# dependencies.
+[workspace]
+members = ["xtask"]
