@@ -20,6 +20,12 @@ editing their own code would observe.
 
 <!-- git-cliff:begin — generated; edits here are overwritten -->
 
+_No commits since the last tag._
+
+<!-- git-cliff:end -->
+
+## v0.4.0 — 2026-09-27
+
 ### Breaking
 
 - **change** — refuse sets replay cannot recover, and roll back by moving aside ([`7f553a5`](https://github.com/diaryx-org/fs-transaction/commit/7f553a5dc6720dd12589f051f360cd1e756de816))
@@ -40,7 +46,6 @@ editing their own code would observe.
 
 - a journaled set that writes a path and later renames it is now refused with Error::Unreplayable.
 
-<!-- git-cliff:end -->
 ## v0.3.0 — 2026-09-17
 
 ### Breaking
