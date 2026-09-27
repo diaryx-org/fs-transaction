@@ -512,8 +512,14 @@ pub(crate) async fn read<FS: Storage>(fs: &FS, full: &PathBuf) -> Result<Vec<u8>
     Ok(fs.read(full).await?)
 }
 
-/// [`ReadStorage::executable`](crate::fs::ReadStorage::executable).
+/// [`ReadStorage::executable`](crate::fs::ReadStorage::executable): an answer
+/// is read from the entry's metadata, so one is there.
 #[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    with Tracked(tree): Tracked<&Tree>
+    ensures
+        r is Ok && r->Ok_0 is Some ==> has_entry(*tree, fid(*full)),
+))]
 pub(crate) async fn executable<FS: Storage>(fs: &FS, full: &PathBuf) -> Result<Option<bool>> {
     Ok(fs.executable(full).await?)
 }

@@ -983,14 +983,43 @@ pub(crate) enum Undo {
 
 /// Everything a failed apply needs to put back: the steps, in the order they
 /// were recorded, and the files moved aside, which a landed apply removes.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 #[derive(Default)]
-struct Rollback {
+pub(crate) struct Rollback {
     steps: Vec<Undo>,
     asides: Vec<PathBuf>,
 }
 
 /// Move whatever entry is at `full` to its aside sibling for op `index`, and
 /// record moving it back.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    with Tracked(tree): Tracked<&mut port::Tree>, Tracked(h): Tracked<&mut rollback::Hist>,
+        Ghost(exact): Ghost<bool>, Ghost(keys): Ghost<Set<int>>
+    requires
+        port::sound(keys),
+        rollback::holds(exact, keys, old(undo).steps@, old(h).s, *old(tree)),
+        keys.contains(port::fid(*full)),
+        keys.contains(port::aside_of(port::fid(*full), index as int)),
+        port::aside_of(port::fid(*full), index as int) != port::fid(*full),
+        !old(tree).contains_key(port::aside_of(port::fid(*full), index as int)),
+    ensures
+        rollback::holds(exact, keys, final(undo).steps@, final(h).s, *final(tree)),
+        r is Ok ==> {
+            &&& final(undo).steps@.len() == old(undo).steps@.len() + 1
+            &&& final(undo).steps@.drop_last() == old(undo).steps@
+            &&& final(undo).steps@.last() is Rename
+            &&& port::fid(rollback::move_from(final(undo).steps@.last())) == port::aside_of(port::fid(*full), index as int)
+            &&& port::fid(rollback::move_to(final(undo).steps@.last())) == port::fid(*full)
+            &&& final(h).s == old(h).s.push(*final(tree))
+            &&& port::ent(*final(tree), port::aside_of(port::fid(*full), index as int)) == port::ent(*old(tree), port::fid(*full))
+            &&& old(tree).contains_key(port::fid(*full))
+            &&& !final(tree).contains_key(port::fid(*full))
+            &&& rollback::frame(keys, *old(tree), *final(tree), set![port::aside_of(port::fid(*full), index as int), port::fid(*full)])
+        },
+        r is Err ==> final(undo).steps@ == old(undo).steps@ && final(h).s == old(h).s
+            && rollback::frame(keys, *old(tree), *final(tree), Set::empty()),
+))]
 async fn move_aside<FS: Storage>(
     fs: &FS,
     full: &PathBuf,
@@ -998,11 +1027,45 @@ async fn move_aside<FS: Storage>(
     undo: &mut Rollback,
 ) -> Result<()> {
     let aside = port::aside(full, index);
-    port::rename(fs, full, &aside).await?;
-    undo.steps.push(Undo::Rename {
+    #[cfg(verus_keep_ghost)]
+    proof_decl! {
+        broadcast use port::lemma_content;
+        let ghost pre = *tree;
+        let ghost a = port::aside_of(port::fid(*full), index as int);
+        let ghost p = port::fid(*full);
+    }
+    #[cfg(verus_keep_ghost)]
+    proof_with! {Tracked(tree)}
+    let moving = port::rename(fs, full, &aside);
+    let moved = moving.await;
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        assert forall|z: int| keys.contains(z) && !set![a, p].contains(z)
+            implies #[trigger] port::ent(*tree, z) == port::ent(pre, z) by {
+            assert(!port::ancestor(p, z) && !port::ancestor(a, z));
+        }
+        if moved is Err {
+            assert(rollback::frame(keys, pre, *tree, Set::empty()));
+            rollback::lemma_same_frame(exact, keys, pre, *tree, h.s.last());
+        }
+    }
+    moved?;
+    let step = Undo::Rename {
         from: port::copy_path(&aside),
         to: port::copy_path(full),
-    });
+    };
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        rollback::lemma_moved_fits(exact, keys, step, h.s.last(), pre, *tree);
+        rollback::lemma_log_push(exact, keys, undo.steps@, h.s, step, *tree);
+        rollback::lemma_same_refl(exact, keys, *tree);
+        h.s = h.s.push(*tree);
+    }
+    undo.steps.push(step);
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        assert(undo.steps@.drop_last() =~= old(undo).steps@);
+    }
     undo.asides.push(aside);
     Ok(())
 }
@@ -1043,6 +1106,23 @@ pub(crate) async fn retire_asides<FS: Storage>(
 /// execute-bit flip's inode; a fresh directory chain. Deferring the lot to
 /// one drain-capped flush is what makes ten writes into a directory cost
 /// one drain, not ten.
+///
+/// Verified: whether the op lands or fails partway, the rollback's log stays
+/// true of the tree — so a rollback from any point gives back the tree the
+/// set began from.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    with Tracked(tree): Tracked<&mut port::Tree>, Tracked(h): Tracked<&mut rollback::Hist>,
+        Ghost(exact): Ghost<bool>, Ghost(keys): Ghost<Set<int>>
+    requires
+        port::sound(keys),
+        port::names(root, *op, keys),
+        rollback::aside_ok(root, *op, index as int, keys, *old(tree)),
+        port::model(root, *op).act is SetExecutable ==> !exact,
+        record ==> rollback::holds(exact, keys, old(undo).steps@, old(h).s, *old(tree)),
+    ensures
+        record ==> rollback::holds(exact, keys, final(undo).steps@, final(h).s, *final(tree)),
+))]
 async fn exec<FS: Storage>(
     fs: &FS,
     root: &Path,
@@ -1052,6 +1132,10 @@ async fn exec<FS: Storage>(
     undo: &mut Rollback,
     touched: &mut BTreeSet<PathBuf>,
 ) -> Result<()> {
+    #[cfg(verus_keep_ghost)]
+    proof_decl! {
+        broadcast use port::lemma_content;
+    }
     match op {
         FileOp::Write { path, bytes } => {
             let full = port::join(root, path);
@@ -1059,23 +1143,22 @@ async fn exec<FS: Storage>(
             // (a full disk) leaves a truncated file, and restoring the old
             // bytes over it is exactly the repair.
             if record {
-                capture_replaced(fs, &full, &mut undo.steps).await?;
+                #[cfg(verus_keep_ghost)]
+                proof_with! {Tracked(&*tree), Tracked(h), Ghost(exact), Ghost(keys)}
+                let capturing = capture_replaced(fs, &full, &mut undo.steps);
+                capturing.await?;
             }
-            port::ensure_parent(fs, &full, touched).await?;
-            // Land the document through the atomic-replace protocol, so even a
-            // crash mid-write cannot expose a half-written file. `replace`,
-            // not `write_atomic`: the atomicity is per-file, but durability is
-            // the *set's* — the parent entry (and, on a backend that cannot
-            // replace atomically, the plainly-written bytes) joins the flush
-            // debt the apply settles once, so ten writes into one directory
-            // cost one drain rather than ten.
-            port::replace(fs, &full, bytes).await?;
-            port::settle_write(fs, &full, touched).await?;
+            #[cfg(verus_keep_ghost)]
+            proof_with! {Tracked(tree), Tracked(h), Ghost(exact), Ghost(keys), Ghost(undo.steps@), Ghost(record)}
+            let landing = land_bytes(fs, &full, bytes, touched);
+            landing.await?;
         }
         FileOp::Rename { from, to } => {
             let from_full = port::join(root, from);
             let to_full = port::join(root, to);
-            if record && !port::same_path(&from_full, &to_full) {
+            // A rename onto itself moves nothing, and so owes nothing back.
+            let moves = !port::same_path(&from_full, &to_full);
+            if record && moves {
                 // The destination may be occupied, and the rename replaces
                 // the occupant — the port contract's load-bearing half. What
                 // it replaces is therefore part of "the tree as it was", and
@@ -1083,16 +1166,60 @@ async fn exec<FS: Storage>(
                 // Rename undo below, so the reversed unwind first moves the
                 // mover home and then moves the occupant back into the
                 // vacated name — the same file, its mode and all.
-                match port::occupant(fs, &to_full).await? {
+                #[cfg(verus_keep_ghost)]
+                proof_with! {Tracked(&*tree)}
+                let looking = port::occupant(fs, &to_full);
+                match looking.await? {
                     port::Occupant::Absent => {}
                     port::Occupant::Directory => return Err(port::not_a_directory(&to_full)),
                     port::Occupant::File | port::Occupant::Link(_) => {
-                        move_aside(fs, &to_full, index, undo).await?;
+                        #[cfg(verus_keep_ghost)]
+                        proof_with! {Tracked(tree), Tracked(h), Ghost(exact), Ghost(keys)}
+                        let moving = move_aside(fs, &to_full, index, undo);
+                        moving.await?;
                     }
                 }
             }
-            port::ensure_parent(fs, &to_full, touched).await?;
-            port::rename(fs, &from_full, &to_full).await?;
+            #[cfg(verus_keep_ghost)]
+            proof_decl! {
+                let ghost x = port::fid(to_full);
+                let ghost y = port::fid(from_full);
+                let ghost t0 = *tree;
+            }
+            #[cfg(verus_keep_ghost)]
+            proof_with! {Tracked(tree)}
+            let making = port::ensure_parent(fs, &to_full, touched);
+            let made = making.await;
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                assert forall|z: int| keys.contains(z) implies #[trigger] port::ent(*tree, z) == port::ent(t0, z) by {
+                    assert(!port::ancestor(z, x));
+                }
+                if record {
+                    rollback::lemma_same_frame(exact, keys, t0, *tree, h.s.last());
+                }
+            }
+            made?;
+            #[cfg(verus_keep_ghost)]
+            proof_decl! {
+                let ghost pre = *tree;
+            }
+            #[cfg(verus_keep_ghost)]
+            proof_with! {Tracked(tree)}
+            let renaming = port::rename(fs, &from_full, &to_full);
+            let renamed = renaming.await;
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                assert forall|z: int| keys.contains(z) && !set![x, y].contains(z)
+                    implies #[trigger] port::ent(*tree, z) == port::ent(pre, z) by {
+                    assert(!port::ancestor(x, z) && !port::ancestor(y, z));
+                }
+                if record && (renamed is Err || !moves) {
+                    assert(rollback::frame(keys, pre, *tree, Set::empty()));
+                    rollback::lemma_same_frame(exact, keys, pre, *tree, h.s.last());
+                }
+            }
+            renamed?;
             // Two directory entries changed — the name removed from one
             // parent, added to the other — and nothing has flushed either.
             // The rename's *atomicity* across a crash is the metadata
@@ -1100,11 +1227,19 @@ async fn exec<FS: Storage>(
             // the flush buys is that it is not taken back wholesale.
             port::note_parent(touched, &from_full);
             port::note_parent(touched, &to_full);
-            if record {
-                undo.steps.push(Undo::Rename {
+            if record && moves {
+                let step = Undo::Rename {
                     from: to_full,
                     to: from_full,
-                });
+                };
+                #[cfg(verus_keep_ghost)]
+                proof! {
+                    rollback::lemma_moved_fits(exact, keys, step, h.s.last(), pre, *tree);
+                    rollback::lemma_log_push(exact, keys, undo.steps@, h.s, step, *tree);
+                    rollback::lemma_same_refl(exact, keys, *tree);
+                    h.s = h.s.push(*tree);
+                }
+                undo.steps.push(step);
             }
         }
         FileOp::Remove { path } => {
@@ -1116,15 +1251,24 @@ async fn exec<FS: Storage>(
                 // very same entry back — a link as a link, a file with its
                 // mode — and a landed set removes it at the end. A dangling
                 // link moves on the same terms as any other.
-                match port::occupant(fs, &full).await? {
+                #[cfg(verus_keep_ghost)]
+                proof_with! {Tracked(&*tree)}
+                let looking = port::occupant(fs, &full);
+                match looking.await? {
                     port::Occupant::Absent => return Err(port::nothing_to_remove(&full)),
                     port::Occupant::Directory => return Err(port::not_a_directory(&full)),
                     port::Occupant::File | port::Occupant::Link(_) => {
-                        move_aside(fs, &full, index, undo).await?;
+                        #[cfg(verus_keep_ghost)]
+                        proof_with! {Tracked(tree), Tracked(h), Ghost(exact), Ghost(keys)}
+                        let moving = move_aside(fs, &full, index, undo);
+                        moving.await?;
                     }
                 }
             } else {
-                port::remove(fs, &full).await?;
+                #[cfg(verus_keep_ghost)]
+                proof_with! {Tracked(tree)}
+                let removing = port::remove(fs, &full);
+                removing.await?;
             }
         }
         // A `Write` whose bytes were left at the source. The read happens here, at
@@ -1133,13 +1277,20 @@ async fn exec<FS: Storage>(
         FileOp::CopyFrom { path, source } => {
             let full = port::join(root, path);
             let source_full = port::join(root, source);
-            let bytes = port::read(fs, &source_full).await?;
+            #[cfg(verus_keep_ghost)]
+            proof_with! {Tracked(&*tree)}
+            let reading = port::read(fs, &source_full);
+            let bytes = reading.await?;
             if record {
-                capture_replaced(fs, &full, &mut undo.steps).await?;
+                #[cfg(verus_keep_ghost)]
+                proof_with! {Tracked(&*tree), Tracked(h), Ghost(exact), Ghost(keys)}
+                let capturing = capture_replaced(fs, &full, &mut undo.steps);
+                capturing.await?;
             }
-            port::ensure_parent(fs, &full, touched).await?;
-            port::replace(fs, &full, &bytes).await?;
-            port::settle_write(fs, &full, touched).await?;
+            #[cfg(verus_keep_ghost)]
+            proof_with! {Tracked(tree), Tracked(h), Ghost(exact), Ghost(keys), Ghost(undo.steps@), Ghost(record)}
+            let landing = land_bytes(fs, &full, &bytes, touched);
+            landing.await?;
         }
         FileOp::SetExecutable { path, executable } => {
             let full = port::join(root, path);
@@ -1149,8 +1300,16 @@ async fn exec<FS: Storage>(
             // it is lexical, the link is not. So the op is refused on any
             // link, loudly, before the undo capture reads a bit that is not
             // the path's own.
-            if port::holds_link(fs, &full).await {
+            #[cfg(verus_keep_ghost)]
+            proof_with! {Tracked(&*tree)}
+            let looking = port::holds_link(fs, &full);
+            if looking.await {
                 return Err(port::flip_through_link(&full));
+            }
+            #[cfg(verus_keep_ghost)]
+            proof_decl! {
+                let ghost p = port::fid(full);
+                let ghost mut recorded = false;
             }
             if record {
                 // Captured through the read half, so the rollback restores
@@ -1159,12 +1318,29 @@ async fn exec<FS: Storage>(
                 // requested state. A backend that declines the question
                 // (`None`) has no bit to restore and the op below will no-op
                 // on it too, so nothing is recorded.
-                if let Some(was) = port::executable(fs, &full).await? {
-                    undo.steps.push(Undo::SetExecutable {
+                #[cfg(verus_keep_ghost)]
+                proof_with! {Tracked(&*tree)}
+                let asking = port::executable(fs, &full);
+                if let Some(was) = asking.await? {
+                    let step = Undo::SetExecutable {
                         path: port::copy_path(&full),
                         executable: was,
-                    });
+                    };
+                    #[cfg(verus_keep_ghost)]
+                    proof! {
+                        assert(rollback::frame(keys, *tree, *tree, set![p]));
+                        rollback::lemma_flip_fits(exact, keys, step, h.s.last(), *tree, *tree);
+                        rollback::lemma_log_push(exact, keys, undo.steps@, h.s, step, *tree);
+                        rollback::lemma_same_refl(exact, keys, *tree);
+                        h.s = h.s.push(*tree);
+                        recorded = true;
+                    }
+                    undo.steps.push(step);
                 }
+            }
+            #[cfg(verus_keep_ghost)]
+            proof_decl! {
+                let ghost t0 = *tree;
             }
             // A mode is inode metadata, and the inode is barriered *now*,
             // while the name still resolves to it — a later op in this very
@@ -1172,39 +1348,225 @@ async fn exec<FS: Storage>(
             // final pass would then be addressed to nothing and quietly
             // no-op. The parent joins the batched debt instead: a stable
             // name, and what keeps the final drain owed at all.
-            port::set_executable(fs, &full, *executable).await?;
+            #[cfg(verus_keep_ghost)]
+            proof_with! {Tracked(tree)}
+            let flipping = port::set_executable(fs, &full, *executable);
+            let flipped = flipping.await;
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                if record {
+                    if recorded {
+                        rollback::lemma_landed(exact, keys, undo.steps@, h.s, t0, *tree, p);
+                        h.s = h.s.update(h.s.len() - 1, *tree);
+                    } else {
+                        assert forall|z: int| keys.contains(z) implies #[trigger] rollback::same_at(exact, *tree, h.s.last(), z) by {
+                            assert(rollback::same_at(exact, t0, h.s.last(), z));
+                        }
+                    }
+                }
+            }
+            flipped?;
             port::note_parent(touched, &full);
         }
         FileOp::SetLink { path, target } => {
             let full = port::join(root, path);
             if record {
-                match port::occupant(fs, &full).await? {
+                #[cfg(verus_keep_ghost)]
+                proof_with! {Tracked(&*tree)}
+                let looking = port::occupant(fs, &full);
+                match looking.await? {
                     // The path held a link: point it back afterwards.
-                    port::Occupant::Link(old_target) => undo.steps.push(Undo::Relink {
-                        path: port::copy_path(&full),
-                        target: old_target,
-                    }),
+                    port::Occupant::Link(old_target) => {
+                        let step = Undo::Relink {
+                            path: port::copy_path(&full),
+                            target: old_target,
+                        };
+                        #[cfg(verus_keep_ghost)]
+                        proof! {
+                            assert(rollback::frame(keys, *tree, *tree, set![port::fid(full)]));
+                            rollback::lemma_captured_fits(exact, keys, step, h.s.last(), *tree, *tree);
+                            rollback::lemma_log_push(exact, keys, undo.steps@, h.s, step, *tree);
+                            rollback::lemma_same_refl(exact, keys, *tree);
+                            h.s = h.s.push(*tree);
+                        }
+                        undo.steps.push(step);
+                    }
                     // Nothing there: the undo is removal, and `Delete`
                     // removes a link as readily as a file.
-                    port::Occupant::Absent => undo.steps.push(Undo::Delete {
-                        path: port::copy_path(&full),
-                    }),
+                    port::Occupant::Absent => {
+                        let step = Undo::Delete {
+                            path: port::copy_path(&full),
+                        };
+                        #[cfg(verus_keep_ghost)]
+                        proof! {
+                            assert(rollback::frame(keys, *tree, *tree, set![port::fid(full)]));
+                            rollback::lemma_captured_fits(exact, keys, step, h.s.last(), *tree, *tree);
+                            rollback::lemma_log_push(exact, keys, undo.steps@, h.s, step, *tree);
+                            rollback::lemma_same_refl(exact, keys, *tree);
+                            h.s = h.s.push(*tree);
+                        }
+                        undo.steps.push(step);
+                    }
                     port::Occupant::Directory => return Err(port::not_a_directory(&full)),
                     // A regular file about to give way to a link: moved
                     // aside, and moved back over the link by a rollback —
                     // a rename replaces the link entry itself, where a plain
                     // write would land in its referent.
-                    port::Occupant::File => move_aside(fs, &full, index, undo).await?,
+                    port::Occupant::File => {
+                        #[cfg(verus_keep_ghost)]
+                        proof_with! {Tracked(tree), Tracked(h), Ghost(exact), Ghost(keys)}
+                        let moving = move_aside(fs, &full, index, undo);
+                        moving.await?;
+                    }
                 }
             }
-            port::ensure_parent(fs, &full, touched).await?;
-            port::set_link(fs, &full, target).await?;
+            #[cfg(verus_keep_ghost)]
+            proof_with! {Tracked(tree), Tracked(h), Ghost(exact), Ghost(keys), Ghost(undo.steps@), Ghost(record)}
+            let landing = land_link(fs, &full, target, touched);
+            landing.await?;
             // The link is an entry (and its inode rides on the entry's
             // flush): the parent is the debt.
             port::note_parent(touched, &full);
         }
     }
     Ok(())
+}
+
+/// Land a replacing write's bytes: the parent chain, then the replacement.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    with Tracked(tree): Tracked<&mut port::Tree>, Tracked(h): Tracked<&mut rollback::Hist>,
+        Ghost(exact): Ghost<bool>, Ghost(keys): Ghost<Set<int>>, Ghost(steps): Ghost<Seq<Undo>>,
+        Ghost(record): Ghost<bool>
+    requires
+        port::sound(keys),
+        keys.contains(port::fid(*full)),
+        record ==> rollback::pending(exact, keys, steps, old(h).s, *old(tree), port::fid(*full)),
+        record ==> steps.last() is Restore || steps.last() is Delete || steps.last() is Relink,
+    ensures
+        record ==> rollback::holds(exact, keys, steps, final(h).s, *final(tree)),
+))]
+async fn land_bytes<FS: Storage>(
+    fs: &FS,
+    full: &PathBuf,
+    bytes: &Vec<u8>,
+    touched: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    #[cfg(verus_keep_ghost)]
+    proof_decl! {
+        broadcast use port::lemma_content;
+        let ghost p = port::fid(*full);
+        let ghost t0 = *tree;
+    }
+    #[cfg(verus_keep_ghost)]
+    proof_with! {Tracked(tree)}
+    let making = port::ensure_parent(fs, full, touched);
+    let made = making.await;
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        assert forall|z: int| keys.contains(z) implies #[trigger] port::ent(*tree, z) == port::ent(t0, z) by {
+            assert(!port::ancestor(z, p));
+        }
+        if record {
+            rollback::lemma_same_frame(exact, keys, t0, *tree, h.s.last());
+        }
+    }
+    made?;
+    // Land the document through the atomic-replace protocol, so even a
+    // crash mid-write cannot expose a half-written file. `replace`,
+    // not `write_atomic`: the atomicity is per-file, but durability is
+    // the *set's* — the parent entry (and, on a backend that cannot
+    // replace atomically, the plainly-written bytes) joins the flush
+    // debt the apply settles once, so ten writes into one directory
+    // cost one drain rather than ten.
+    #[cfg(verus_keep_ghost)]
+    proof_decl! {
+        let ghost t1 = *tree;
+    }
+    #[cfg(verus_keep_ghost)]
+    proof_with! {Tracked(tree)}
+    let replacing = port::replace(fs, full, bytes);
+    let replaced = replacing.await;
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        if record {
+            let i = steps.len() - 1;
+            assert(rollback::fits(exact, keys, steps[i], h.s[i], h.s[i + 1]));
+            assert(steps.last() == steps[i] && h.s.last() == h.s[i + 1]);
+            assert(rollback::same_at(exact, t1, h.s.last(), p));
+            if replaced is Ok {
+                rollback::lemma_landed(exact, keys, steps, h.s, t1, *tree, p);
+                h.s = h.s.update(h.s.len() - 1, *tree);
+            } else {
+                assert(rollback::frame(keys, t1, *tree, Set::empty()));
+                rollback::lemma_same_frame(exact, keys, t1, *tree, h.s.last());
+            }
+        }
+    }
+    replaced?;
+    port::settle_write(fs, full, touched).await
+}
+
+/// Land a link: the parent chain, then the link.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    with Tracked(tree): Tracked<&mut port::Tree>, Tracked(h): Tracked<&mut rollback::Hist>,
+        Ghost(exact): Ghost<bool>, Ghost(keys): Ghost<Set<int>>, Ghost(steps): Ghost<Seq<Undo>>,
+        Ghost(record): Ghost<bool>
+    requires
+        port::sound(keys),
+        keys.contains(port::fid(*full)),
+        record ==> rollback::pending(exact, keys, steps, old(h).s, *old(tree), port::fid(*full)),
+        record ==> steps.last() is Relink || steps.last() is Delete || steps.last() is Rename,
+    ensures
+        record ==> rollback::holds(exact, keys, steps, final(h).s, *final(tree)),
+))]
+async fn land_link<FS: Storage>(
+    fs: &FS,
+    full: &PathBuf,
+    target: &PathBuf,
+    touched: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    #[cfg(verus_keep_ghost)]
+    proof_decl! {
+        broadcast use port::lemma_content;
+        let ghost p = port::fid(*full);
+        let ghost t0 = *tree;
+    }
+    #[cfg(verus_keep_ghost)]
+    proof_with! {Tracked(tree)}
+    let making = port::ensure_parent(fs, full, touched);
+    let made = making.await;
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        assert forall|z: int| keys.contains(z) implies #[trigger] port::ent(*tree, z) == port::ent(t0, z) by {
+            assert(!port::ancestor(z, p));
+        }
+        if record {
+            rollback::lemma_same_frame(exact, keys, t0, *tree, h.s.last());
+        }
+    }
+    made?;
+    #[cfg(verus_keep_ghost)]
+    proof_decl! {
+        let ghost t1 = *tree;
+    }
+    #[cfg(verus_keep_ghost)]
+    proof_with! {Tracked(tree)}
+    let linking = port::set_link(fs, full, target);
+    let linked = linking.await;
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        if record {
+            let i = steps.len() - 1;
+            assert(rollback::fits(exact, keys, steps[i], h.s[i], h.s[i + 1]));
+            assert(steps.last() == steps[i] && h.s.last() == h.s[i + 1]);
+            assert(rollback::same_at(exact, t1, h.s.last(), p));
+            rollback::lemma_landed(exact, keys, steps, h.s, t1, *tree, p);
+            h.s = h.s.update(h.s.len() - 1, *tree);
+        }
+    }
+    linked
 }
 
 /// Settle what one [`Storage::replace`] leaves behind: the parent entry the
@@ -1237,23 +1599,65 @@ pub(crate) async fn settle_write_debt<FS: Storage>(
 /// ([`Undo::Relink`] — the replacement will have replaced the entry itself,
 /// and `set_link` restores it the same way); nothing is put back by deletion;
 /// and only a path holding an actual file is captured as bytes.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    with Tracked(tree): Tracked<&port::Tree>, Tracked(h): Tracked<&mut rollback::Hist>,
+        Ghost(exact): Ghost<bool>, Ghost(keys): Ghost<Set<int>>
+    requires
+        port::sound(keys),
+        rollback::holds(exact, keys, old(undo)@, old(h).s, *tree),
+        keys.contains(port::fid(*full)),
+    ensures
+        rollback::holds(exact, keys, final(undo)@, final(h).s, *tree),
+        r is Ok ==> {
+            &&& final(undo)@.len() == old(undo)@.len() + 1
+            &&& final(undo)@.drop_last() == old(undo)@
+            &&& rollback::captured(final(undo)@.last(), *tree, port::fid(*full))
+            &&& final(h).s == old(h).s.push(*tree)
+        },
+        r is Err ==> final(undo)@ == old(undo)@ && final(h).s == old(h).s,
+))]
 async fn capture_replaced<FS: Storage>(fs: &FS, full: &PathBuf, undo: &mut Vec<Undo>) -> Result<()> {
-    match port::occupant(fs, full).await? {
-        port::Occupant::Link(target) => undo.push(Undo::Relink {
+    #[cfg(verus_keep_ghost)]
+    proof_decl! {
+        broadcast use port::lemma_content;
+    }
+    #[cfg(verus_keep_ghost)]
+    proof_with! {Tracked(tree)}
+    let looking = port::occupant(fs, full);
+    let step = match looking.await? {
+        port::Occupant::Link(target) => Undo::Relink {
             path: port::copy_path(full),
             target,
-        }),
-        port::Occupant::Absent => undo.push(Undo::Delete {
+        },
+        port::Occupant::Absent => Undo::Delete {
             path: port::copy_path(full),
-        }),
+        },
         port::Occupant::Directory => return Err(port::not_a_directory(full)),
         port::Occupant::File => {
-            let bytes = port::read(fs, full).await?;
-            undo.push(Undo::Restore {
+            #[cfg(verus_keep_ghost)]
+            proof_with! {Tracked(tree)}
+            let reading = port::read(fs, full);
+            let bytes = reading.await?;
+            Undo::Restore {
                 path: port::copy_path(full),
                 bytes,
-            });
+            }
         }
+    };
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        assert(rollback::captured(step, *tree, port::fid(*full)));
+        assert(rollback::frame(keys, *tree, *tree, set![port::fid(*full)]));
+        rollback::lemma_captured_fits(exact, keys, step, h.s.last(), *tree, *tree);
+        rollback::lemma_log_push(exact, keys, undo@, h.s, step, *tree);
+        rollback::lemma_same_refl(exact, keys, *tree);
+        h.s = h.s.push(*tree);
+    }
+    undo.push(step);
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        assert(undo@.drop_last() =~= old(undo)@);
     }
     Ok(())
 }
