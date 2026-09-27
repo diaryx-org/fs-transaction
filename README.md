@@ -155,9 +155,17 @@ An ordinary build sees none of it and gains no dependency.
   every path the set names is as it was before the set began —
   entry for entry, permissions included, unless the set flips an execute bit,
   in which case what each path holds.
+- **Each op.** The code `apply` runs for an op is proved to do what the recovery theorem's step says, whenever it succeeds —
+  but for a rename or copy whose source is a link, which the model cannot read through.
+  So between any two ops of a journaled set the model completes,
+  the tree holds what the model says on every path the set names,
+  and a crash there is proved to replay to exactly the applied tree.
+- **The journal's format.** What `encode` writes for a set, `decode` is proved to read back as the same set, never refusing it.
 
 What the proofs take on trust is in one file, `src/port.rs`:
-each storage call the executor makes, with the port contract as its spec,
+each storage call the executor makes, with the port contract as its spec;
+the standard library calls the journal's encoding makes — little-endian integers, a path's UTF-8 text —
+with their documentation as their spec;
 and what the proofs assume about paths — that the paths a set names are not nested,
 and that it names none of the crate's own scratch files.
 A test fails if anything is taken on trust anywhere else.
