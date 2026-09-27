@@ -1172,6 +1172,16 @@ pub(crate) fn temp_sibling(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{name}.fstx-tmp"))
 }
 
+/// Where a [`ChangeSet`](crate::ChangeSet) moves the entry at `path` aside
+/// while op `index` of the set replaces or removes it: a dotted, suffixed
+/// sibling, for [`temp_sibling`]'s reasons, and numbered by the op, so two
+/// ops of one set that each move the same path aside never collide — and so
+/// recovery, which knows the ops, can find every one of them.
+pub(crate) fn aside_sibling(path: &Path, index: usize) -> PathBuf {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    path.with_file_name(format!(".{name}.fstx-aside-{index}"))
+}
+
 impl Storage for StdFs {
     async fn write(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
         std::fs::write(path, contents)

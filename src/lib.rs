@@ -81,6 +81,7 @@ pub mod fs;
 pub mod journal;
 pub mod ordered;
 pub mod path;
+mod replayable;
 
 #[cfg(test)]
 mod fs_faults;

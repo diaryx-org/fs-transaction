@@ -1,8 +1,9 @@
 //! What a transaction can fail with.
 //!
 //! The split between the variants is the crate's whole safety story:
-//! [`Io`](Error::Io), [`Escape`](Error::Escape), and
-//! [`Drifted`](Error::Drifted) are ordinary refusals that
+//! [`Io`](Error::Io), [`Escape`](Error::Escape),
+//! [`Drifted`](Error::Drifted), and [`Unreplayable`](Error::Unreplayable)
+//! are ordinary refusals that
 //! leave the target untouched, the construction-time refusals
 //! ([`InvalidJournalName`](Error::InvalidJournalName),
 //! [`InvalidJournalHome`](Error::InvalidJournalHome),
@@ -81,6 +82,25 @@ pub enum Error {
     /// recovery can finish once the missing piece is back.
     Recovery(String),
 
+    /// A set that recovery could not finish after a crash, refused before
+    /// anything is written or journaled.
+    ///
+    /// Recovery replays a journal from its first op, over whatever state the
+    /// crash left, so an op that *reads* the tree — a rename, an execute-bit
+    /// flip, a copy — must read the same thing whether or not the ops after
+    /// it have already run. A swap through a temporary name, a rename whose
+    /// old path is written again, or a remove before a rename onto the same
+    /// path breaks that: replayed, it would undo or destroy what the set did.
+    /// See [`Journal::apply`](crate::Journal::apply) for the whole rule. Only
+    /// a set that takes the journal is held to it; split one that is refused
+    /// into sets that are not, each of which lands all-or-nothing.
+    Unreplayable {
+        /// The index of the op that broke the rule, in [`ChangeSet::ops`](crate::ChangeSet::ops).
+        op: usize,
+        /// What it did.
+        reason: &'static str,
+    },
+
     /// A set was applied while a *previous* set's journal was still on disk: an
     /// earlier change was interrupted and never recovered. Landing this set
     /// would overwrite the record needed to finish that one, so the apply
@@ -134,6 +154,11 @@ impl fmt::Display for Error {
             }
             Error::Corrupt(what) => write!(f, "journal is corrupt: {what}"),
             Error::Recovery(what) => write!(f, "journal replay: {what}"),
+            Error::Unreplayable { op, reason } => write!(
+                f,
+                "op {op} of the set could not be recovered after a crash: {reason}; \
+                 nothing was written — split the set"
+            ),
             Error::StaleJournal(p) => write!(
                 f,
                 "a previous change was interrupted and not yet recovered (found {}); \

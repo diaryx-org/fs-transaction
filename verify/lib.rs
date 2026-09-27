@@ -1,6 +1,11 @@
 //! Machine-checked proofs about fs-transaction's algorithms, in Verus.
 //!
-//! These files are models of `src/change.rs` and `src/journal.rs`, not the
+//! These model `src/change.rs` and `src/journal.rs` as they were *before*
+//! the rollback moved files aside and the apply refused unreplayable sets —
+//! the counterexamples below are the bugs those changes fix. They are
+//! being replaced by proofs in the source itself.
+//!
+//! They are models of the code, not the
 //! code itself, and nothing mechanical ties them to it. They exist until that
 //! code is restructured so its decisions can be verified where they are
 //! written, as `src/path.rs` already is. Each module names the source it

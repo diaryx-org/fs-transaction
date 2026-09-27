@@ -426,6 +426,21 @@ impl Journal {
         for op in &ops {
             replay(fs, root, op, &mut touched).await?;
         }
+        // The apply may have moved entries aside before the crash: each op
+        // that removes or replaces a path names where. Rolled forward, none
+        // of them is anyone's to put back.
+        for (index, op) in ops.iter().enumerate() {
+            if let FileOp::Remove { path } | FileOp::Rename { to: path, .. } | FileOp::SetLink { path, .. } = op {
+                let aside = crate::fs::aside_sibling(&root.join(path), index);
+                if !crate::change::entry_exists(fs, &aside).await? {
+                    continue;
+                }
+                fs.remove_file(&aside).await?;
+                if let Some(dir) = crate::fs::parent_dir(&aside) {
+                    touched.insert(dir.to_path_buf());
+                }
+            }
+        }
         // Recovery makes the same promise a clean apply does: once the
         // journal is given up, the state it certified survives a power cut.
         // The replayed renames, removals, bits, and fresh directory chains
@@ -504,9 +519,16 @@ async fn replay<FS: Storage>(
         // means there. The link guard is apply's, for apply's reason: mode
         // writes follow links, and a journal is bytes this process did not
         // author.
+        //
+        // Where nothing is there, the file has already been removed or renamed
+        // away by a later op of the same set — the only way the apply's rule
+        // lets it go — so the flip already happened, and moved with it.
         FileOp::SetExecutable { path, executable } => {
             let full = root.join(path);
             crate::change::guard_not_link(fs, &full).await?;
+            if !fs.try_exists(&full).await? {
+                return Ok(());
+            }
             fs.set_executable(&full, *executable).await?;
             // The inode barriered while the name still resolves — a later op
             // in this same journal may rename or remove it — and the parent
@@ -647,6 +669,7 @@ mod tests {
     use super::*;
     use crate::exec::block_on;
     use crate::fs::StdFs;
+    use crate::ChangeSet;
 
     fn tmp(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("fstx-journal-{name}-{}", std::process::id()));
@@ -1297,5 +1320,78 @@ mod tests {
         .unwrap();
         assert_eq!(&bytes[..MAGIC.len()], MAGIC);
         assert_ne!(&bytes[..LEGACY_MAGIC.len()], LEGACY_MAGIC);
+    }
+
+    // ---- a journal that outlives its apply ----
+
+    /// Apply `build`'s set, then put its journal back, as a power cut after
+    /// `Ok` may: the deletion is not flushed. Recovery must leave the tree
+    /// exactly as the apply left it.
+    fn resurrect(name: &str, files: &[(&str, &str)], build: impl Fn(&mut ChangeSet), show: &[&str]) {
+        let root = tmp(name);
+        for (f, b) in files {
+            std::fs::write(root.join(f), b).unwrap();
+        }
+        let mut cs = ChangeSet::new();
+        build(&mut cs);
+        block_on(cs.apply(&StdFs, &root)).unwrap();
+        let applied: Vec<_> = show.iter().map(|f| read(&root, f)).collect();
+        std::fs::write(Journal::default().path_in(&root), encode(cs.ops()).unwrap()).unwrap();
+        assert!(matches!(block_on(recover(&StdFs, &root)), Ok(Recovered::Applied(_))));
+        let recovered: Vec<_> = show.iter().map(|f| read(&root, f)).collect();
+        assert_eq!(recovered, applied, "{name}");
+    }
+
+    #[test]
+    fn a_resurrected_journal_leaves_what_the_apply_left() {
+        resurrect(
+            "resurrect-rename",
+            &[("a.md", "A"), ("index.md", "old")],
+            |c| {
+                c.rename("a.md", "b.md");
+                c.write("b.md", "A, relinked");
+                c.write("index.md", "new");
+            },
+            &["a.md", "b.md", "index.md"],
+        );
+        resurrect(
+            "resurrect-delete",
+            &[("a.md", "A"), ("deletions.md", "log")],
+            |c| {
+                c.remove("a.md");
+                c.remove("deletions.md");
+                c.write("deletions.md", "log, and a");
+            },
+            &["a.md", "deletions.md"],
+        );
+        resurrect(
+            "resurrect-install",
+            &[],
+            |c| {
+                c.write("staged", "#!/bin/sh");
+                c.set_executable("staged", true);
+                c.rename("staged", "tool");
+            },
+            &["staged", "tool"],
+        );
+    }
+
+    #[test]
+    fn recovery_removes_what_the_apply_had_moved_aside() {
+        // A crash after `remove` moved the file aside: the aside is the only
+        // trace, and rolling forward is its removal.
+        let root = tmp("recover-asides");
+        let aside = crate::fs::aside_sibling(&root.join("a.md"), 0);
+        std::fs::write(&aside, "A").unwrap();
+        std::fs::write(root.join("b.md"), "B").unwrap();
+        let ops = vec![
+            FileOp::Remove { path: "a.md".into() },
+            FileOp::Write { path: "b.md".into(), bytes: b"B2".to_vec() },
+        ];
+        std::fs::write(Journal::default().path_in(&root), encode(&ops).unwrap()).unwrap();
+        assert_eq!(block_on(recover(&StdFs, &root)).unwrap(), Recovered::Applied(2));
+        assert!(!aside.exists());
+        assert_eq!(read(&root, "a.md"), None);
+        assert_eq!(read(&root, "b.md").as_deref(), Some("B2"));
     }
 }

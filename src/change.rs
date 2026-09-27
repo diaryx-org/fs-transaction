@@ -45,12 +45,16 @@
 //! - **Directories are not unwound.** Applying a set creates any parent
 //!   directory its writes need; a rollback leaves an empty one behind. An empty
 //!   directory is litter, not a torn tree.
-//! - **Undo is held in memory.** Overwriting or removing a file reads its old
-//!   bytes first so the rollback can put them back, which means a removed
-//!   payload is briefly held whole. The buffer lives only for the length of the
-//!   apply, but it does mean a set is bounded by what fits in memory —
+//! - **An overwrite's undo is held in memory.** Overwriting a file reads its
+//!   old bytes first so the rollback can write them back into it, which means
+//!   the payload is briefly held whole. The buffer lives only for the length
+//!   of the apply, but it does mean a set is bounded by what fits in memory —
 //!   [`FileOp::CopyFrom`] is the escape hatch for a large payload already on
-//!   disk.
+//!   disk. A file the set *removes*, renames over, or replaces with a link is
+//!   not read at all: it is renamed aside to a hidden sibling
+//!   (`.name.fstx-aside-N`), a rollback renames it back — the same file, its
+//!   permissions and all — and a set that lands removes it before giving up
+//!   the journal.
 //!
 //! ## Staging is also a plan
 //!
@@ -458,6 +462,16 @@ impl Journal {
     /// that must write two files before the tree exists can still land them
     /// together.
     ///
+    /// A journaled set is held to one more rule before anything is written:
+    /// recovery replays it from its first op over whatever a crash left, so
+    /// no op may read what a later op changes. A set that renames a file and
+    /// then writes its old path, removes a path and then renames onto it,
+    /// chains or swaps renames, flips a bit on a file it later replaces with
+    /// a link, or copies from a path it changes is refused with
+    /// [`Error::Unreplayable`], as is one that renames a symbolic link. The
+    /// rule is in full in the source of `replayable.rs`. A set of one is never
+    /// refused.
+    ///
     /// Whatever recovers an interruption of this call must name the same
     /// journal — see [`Journal`] for why the two operations live together.
     pub async fn apply<FS: Storage>(
@@ -482,6 +496,17 @@ impl Journal {
         for (path, _) in &changes.expected {
             guard_in_root(path)?;
         }
+        // Refuse a set a crash could not be recovered from — see
+        // [`crate::replayable`]. A set of one replays from its only op, which
+        // is always its crash point, so it needs no such rule.
+        if changes.ops.len() > 1 {
+            crate::replayable::check(&changes.ops).map_err(|(op, refusal)| {
+                Error::Unreplayable {
+                    op,
+                    reason: refusal.reason(),
+                }
+            })?;
+        }
         // Refuse to clobber a journal left by a *previous* interrupted change. Its
         // presence means an earlier mutation crashed mid-apply and has not been
         // recovered; overwriting it with this set's intent would strand the old
@@ -502,6 +527,27 @@ impl Journal {
         check_expected(fs, root, &changes.expected).await?;
         if changes.ops.is_empty() {
             return Ok(());
+        }
+        let journaled = !(changes.ops.len() == 1
+            && fs.capabilities().atomic_replace
+            && !matches!(changes.ops[0], FileOp::SetLink { .. }));
+        // Recovery decides whether a rename already ran by whether its source
+        // still exists, and `try_exists` follows links: a moved link that
+        // dangles — as a relative one can, from its new directory — looks
+        // like a rename with neither side present. So a journaled set does
+        // not move links.
+        if journaled {
+            for (op, staged) in changes.ops.iter().enumerate() {
+                if let FileOp::Rename { from, .. } = staged
+                    && let Ok(Some(_)) = fs.read_link(&root.join(from)).await
+                {
+                    return Err(Error::Unreplayable {
+                        op,
+                        reason: "it renames a symbolic link, which recovery cannot tell from \
+                                 a missing file once it dangles",
+                    });
+                }
+            }
         }
         // A set of one needs no journal. The journal exists to make *several*
         // file operations land as one unit; a lone op is already indivisible on a
@@ -532,10 +578,7 @@ impl Journal {
         // is a half-applied set of one — the very thing the fast path's
         // argument says cannot exist — so the op takes the journal, whose
         // recovery re-runs `set_link` to the applied state.
-        if changes.ops.len() == 1
-            && fs.capabilities().atomic_replace
-            && !matches!(changes.ops[0], FileOp::SetLink { .. })
-        {
+        if !journaled {
             // No undo to record, either. Nothing preceded this op that could need
             // unwinding, and every failure mode leaves the target untouched — so
             // the reflexive read of the very file about to be overwritten, whose
@@ -552,7 +595,7 @@ impl Journal {
             // error is the flush's, and the caller knows the op is at most
             // applied-but-uncertified.
             let mut touched = BTreeSet::new();
-            exec(fs, root, &changes.ops[0], None, &mut touched).await?;
+            exec(fs, root, 0, &changes.ops[0], None, &mut touched).await?;
             return Ok(
                 crate::fs::flush_all(fs, touched, root, crate::fs::Durability::Durable).await?,
             );
@@ -577,11 +620,11 @@ impl Journal {
         fs.write_atomic(&journal, &crate::journal::encode(&changes.ops)?)
             .await?;
 
-        let mut undo: Vec<Undo> = Vec::new();
+        let mut undo = Rollback::default();
         let mut touched = BTreeSet::new();
         let mut cause: Option<Error> = None;
-        for op in &changes.ops {
-            if let Err(e) = exec(fs, root, op, Some(&mut undo), &mut touched).await {
+        for (index, op) in changes.ops.iter().enumerate() {
+            if let Err(e) = exec(fs, root, index, op, Some(&mut undo), &mut touched).await {
                 cause = Some(e);
                 break;
             }
@@ -601,7 +644,7 @@ impl Journal {
             cause = Some(e.into());
         }
         if let Some(cause) = cause {
-            return Err(match unwind_durable(fs, undo, root, &journal).await {
+            return Err(match unwind_durable(fs, undo.steps, root, &journal).await {
                 // Reverted cleanly and durably: the abort is now a fact a
                 // power cut cannot contradict, so the cause alone is the
                 // answer.
@@ -613,6 +656,19 @@ impl Journal {
                     cause: cause.to_string(),
                     rollback: rollback.to_string(),
                 },
+            });
+        }
+        // The set is certified; what it moved aside is no longer anyone's to
+        // put back. Removed now, and the removals certified before the journal
+        // goes: a removal a power cut took back, under a journal that stayed
+        // gone, would resurrect a deleted file as a hidden one nothing cleans.
+        if let Err(e) = retire_asides(fs, &undo.asides, root).await {
+            return Err(Error::Torn {
+                cause: format!(
+                    "the set applied and was certified durable, but a file it moved aside \
+                     could not be removed: {e}"
+                ),
+                rollback: "the surviving journal's next recovery removes it".to_string(),
             });
         }
         // The deletion itself is deliberately *not* flushed: if a crash
@@ -725,27 +781,6 @@ async fn unwind_durable<FS: Storage>(
                 }
                 fs.set_link(&path, &target).await
             }
-            // The link first, tolerantly (the `set_link` being reversed may
-            // have failed before creating it), and only then the bytes — a
-            // plain write while the link stands would land them in its target,
-            // which is also why a remove that fails for a real reason must
-            // stop the write rather than precede it.
-            Undo::RestoreOverLink { path, bytes } => {
-                if let Some(dir) = crate::fs::parent_dir(&path) {
-                    dirs.insert(dir.to_path_buf());
-                }
-                let removed = match fs.remove_file(&path).await {
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    other => other,
-                };
-                match removed {
-                    Ok(()) => match fs.write(&path, &bytes).await {
-                        Ok(()) => fs.sync(&path, crate::fs::Durability::Ordered).await,
-                        e => e,
-                    },
-                    Err(e) => Err(e),
-                }
-            }
         };
         if let Err(e) = result
             && first_error.is_none()
@@ -795,18 +830,93 @@ enum Undo {
     /// Point the link back at its old target (the path held a link before a
     /// [`FileOp::SetLink`] repointed it).
     Relink { path: PathBuf, target: PathBuf },
-    /// Put a regular file's bytes back where a link now stands.
-    ///
-    /// Not a [`Restore`](Undo::Restore): a plain `write` to a path holding a
-    /// link writes *through* it, landing the old bytes in whatever the link
-    /// points at instead of back at the path. The link has to be removed
-    /// first — and tolerantly, since the `set_link` being reversed may have
-    /// failed before creating it.
-    RestoreOverLink { path: PathBuf, bytes: Vec<u8> },
+}
+
+/// Everything a failed apply needs to put back: the steps, in the order they
+/// were recorded, and the files moved aside, which a landed apply removes.
+#[derive(Default)]
+struct Rollback {
+    steps: Vec<Undo>,
+    asides: Vec<PathBuf>,
+}
+
+/// What is at a path, as far as putting it back is concerned.
+enum Occupant {
+    Absent,
+    Link(PathBuf),
+    Directory,
+    File,
+}
+
+/// Look at `full` without following a link that stands there.
+async fn occupant<FS: Storage>(fs: &FS, full: &Path) -> Result<Occupant> {
+    match fs.read_link(full).await {
+        Ok(Some(target)) => return Ok(Occupant::Link(target)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Occupant::Absent),
+        // Not a link, or a backend with none.
+        _ => {}
+    }
+    match fs.metadata(full).await {
+        Ok(md) if md.is_dir() => Ok(Occupant::Directory),
+        Ok(_) => Ok(Occupant::File),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Occupant::Absent),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Whether anything — a dangling link included — stands at `full`.
+pub(crate) async fn entry_exists<FS: Storage>(fs: &FS, full: &Path) -> Result<bool> {
+    Ok(!matches!(occupant(fs, full).await?, Occupant::Absent))
+}
+
+fn not_a_directory(full: &Path) -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::IsADirectory,
+        format!("{} is a directory", full.display()),
+    ))
+}
+
+/// Move whatever entry is at `full` to its aside sibling for op `index`, and
+/// record moving it back.
+async fn move_aside<FS: Storage>(
+    fs: &FS,
+    full: &Path,
+    index: usize,
+    undo: &mut Rollback,
+) -> Result<()> {
+    let aside = crate::fs::aside_sibling(full, index);
+    fs.rename(full, &aside).await?;
+    undo.steps.push(Undo::Rename {
+        from: aside.clone(),
+        to: full.to_path_buf(),
+    });
+    undo.asides.push(aside);
+    Ok(())
+}
+
+/// Remove what a landed apply moved aside, and make the removals durable.
+pub(crate) async fn retire_asides<FS: Storage>(
+    fs: &FS,
+    asides: &[PathBuf],
+    root: &Path,
+) -> Result<()> {
+    let mut dirs = BTreeSet::new();
+    for aside in asides {
+        match fs.remove_file(aside).await {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+        if let Some(dir) = crate::fs::parent_dir(aside) {
+            dirs.insert(dir.to_path_buf());
+        }
+    }
+    Ok(crate::fs::flush_all(fs, dirs, root, crate::fs::Durability::Durable).await?)
 }
 
 /// Apply one op, optionally recording how to reverse it, and always recording
 /// what it dirtied.
+///
+/// `index` is the op's place in its set, which names its aside sibling.
 ///
 /// `undo` is `None` only for a set of one, which has no rollback to feed: see
 /// the fast path in [`ChangeSet::apply`]. Recording is not merely unused there,
@@ -823,8 +933,9 @@ enum Undo {
 async fn exec<FS: Storage>(
     fs: &FS,
     root: &Path,
+    index: usize,
     op: &FileOp,
-    mut undo: Option<&mut Vec<Undo>>,
+    mut undo: Option<&mut Rollback>,
     touched: &mut BTreeSet<PathBuf>,
 ) -> Result<()> {
     match op {
@@ -834,7 +945,7 @@ async fn exec<FS: Storage>(
             // (a full disk) leaves a truncated file, and restoring the old
             // bytes over it is exactly the repair.
             if let Some(undo) = undo {
-                capture_replaced(fs, &full, undo).await?;
+                capture_replaced(fs, &full, &mut undo.steps).await?;
             }
             ensure_parent(fs, &full, touched).await?;
             // Land the document through the atomic-replace protocol, so even a
@@ -849,16 +960,23 @@ async fn exec<FS: Storage>(
         }
         FileOp::Rename { from, to } => {
             let (from_full, to_full) = (root.join(from), root.join(to));
-            if let Some(undo) = undo.as_deref_mut() {
+            if let Some(undo) = undo.as_deref_mut()
+                && from_full != to_full
+            {
                 // The destination may be occupied, and the rename replaces
                 // the occupant — the port contract's load-bearing half. What
                 // it replaces is therefore part of "the tree as it was", and
-                // the rollback owes it back: captured here, *before* the
+                // the rollback owes it back: moved aside here, *before* the
                 // Rename undo below, so the reversed unwind first moves the
-                // mover home and then restores the displaced occupant into
-                // the vacated name. An empty destination records a tolerant
-                // delete, which the rename-back has already satisfied.
-                capture_replaced(fs, &to_full, undo).await?;
+                // mover home and then moves the occupant back into the
+                // vacated name — the same file, its mode and all.
+                match occupant(fs, &to_full).await? {
+                    Occupant::Absent => {}
+                    Occupant::Directory => return Err(not_a_directory(&to_full)),
+                    Occupant::File | Occupant::Link(_) => {
+                        move_aside(fs, &to_full, index, undo).await?;
+                    }
+                }
             }
             ensure_parent(fs, &to_full, touched).await?;
             fs.rename(&from_full, &to_full).await?;
@@ -873,7 +991,7 @@ async fn exec<FS: Storage>(
                 }
             }
             if let Some(undo) = undo {
-                undo.push(Undo::Rename {
+                undo.steps.push(Undo::Rename {
                     from: to_full,
                     to: from_full,
                 });
@@ -886,26 +1004,20 @@ async fn exec<FS: Storage>(
                 touched.insert(dir.to_path_buf());
             }
             match undo {
-                // What was removed is the undo, so it has to be read out
-                // before it goes — the *link* where the path holds one
-                // (`remove_file` removes the link, never its target, so a
-                // rollback that rewrote it as a file holding the target's
-                // bytes would remove a link and give back a copy), the bytes
-                // everywhere else. A dangling link is removable on the same
-                // terms; reading through it to capture bytes would refuse an
-                // op the filesystem itself permits.
-                Some(undo) => match fs.read_link(&full).await {
-                    Ok(Some(target)) => {
-                        fs.remove_file(&full).await?;
-                        undo.push(Undo::Relink { path: full, target });
+                // Not removed yet: moved aside, so a rollback can move the
+                // very same entry back — a link as a link, a file with its
+                // mode — and a landed set removes it at the end. A dangling
+                // link moves on the same terms as any other.
+                Some(undo) => match occupant(fs, &full).await? {
+                    Occupant::Absent => {
+                        return Err(Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("nothing to remove at {}", full.display()),
+                        )));
                     }
-                    _ => {
-                        let old = fs.read(&full).await?;
-                        fs.remove_file(&full).await?;
-                        undo.push(Undo::Restore {
-                            path: full,
-                            bytes: old,
-                        });
+                    Occupant::Directory => return Err(not_a_directory(&full)),
+                    Occupant::File | Occupant::Link(_) => {
+                        move_aside(fs, &full, index, undo).await?;
                     }
                 },
                 None => fs.remove_file(&full).await?,
@@ -918,7 +1030,7 @@ async fn exec<FS: Storage>(
             let (full, source_full) = (root.join(path), root.join(source));
             let bytes = fs.read(&source_full).await?;
             if let Some(undo) = undo {
-                capture_replaced(fs, &full, undo).await?;
+                capture_replaced(fs, &full, &mut undo.steps).await?;
             }
             ensure_parent(fs, &full, touched).await?;
             fs.replace(&full, &bytes).await?;
@@ -935,7 +1047,7 @@ async fn exec<FS: Storage>(
                 // (`None`) has no bit to restore and the op below will no-op
                 // on it too, so nothing is recorded.
                 if let Some(was) = fs.executable(&full).await? {
-                    undo.push(Undo::SetExecutable {
+                    undo.steps.push(Undo::SetExecutable {
                         path: full.clone(),
                         executable: was,
                     });
@@ -956,32 +1068,21 @@ async fn exec<FS: Storage>(
         FileOp::SetLink { path, target } => {
             let full = root.join(path);
             if let Some(undo) = undo {
-                match fs.read_link(&full).await {
+                match occupant(fs, &full).await? {
                     // The path held a link: point it back afterwards.
-                    Ok(Some(old_target)) => undo.push(Undo::Relink {
+                    Occupant::Link(old_target) => undo.steps.push(Undo::Relink {
                         path: full.clone(),
                         target: old_target,
                     }),
-                    // The backend models no links at all; `set_link` below
-                    // will refuse, so there is nothing to record — the op
-                    // never applies.
-                    Ok(None) => {}
                     // Nothing there: the undo is removal, and `Delete`
                     // removes a link as readily as a file.
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        undo.push(Undo::Delete { path: full.clone() });
-                    }
-                    // Not a link — a regular file about to give way to one.
-                    // Its bytes are the undo, restored *after* the link is
-                    // removed (see [`Undo::RestoreOverLink`]); any error
-                    // reading them aborts the op before it touches anything.
-                    Err(_) => {
-                        let old = fs.read(&full).await?;
-                        undo.push(Undo::RestoreOverLink {
-                            path: full.clone(),
-                            bytes: old,
-                        });
-                    }
+                    Occupant::Absent => undo.steps.push(Undo::Delete { path: full.clone() }),
+                    Occupant::Directory => return Err(not_a_directory(&full)),
+                    // A regular file about to give way to a link: moved
+                    // aside, and moved back over the link by a rollback —
+                    // a rename replaces the link entry itself, where a plain
+                    // write would land in its referent.
+                    Occupant::File => move_aside(fs, &full, index, undo).await?,
                 }
             }
             ensure_parent(fs, &full, touched).await?;
@@ -1681,12 +1782,18 @@ mod tests {
                 FsEvent::Sync(root.clone(), crate::fs::Durability::Durable),
                 // The ops.
                 FsEvent::Rename(root.join("a.md"), root.join("sub/b.md")),
-                FsEvent::Remove(root.join("c.md")),
+                // The removal, as a move aside a rollback could undo.
+                FsEvent::Rename(root.join("c.md"), root.join(".c.md.fstx-aside-1")),
                 // The debt: both touched directories, pushes capped by one
                 // drain of the root — the anchor, which always exists, where
                 // whichever debt happened to sort last might not — and only
-                // then the journal.
+                // then the rest.
                 FsEvent::Sync(root.join("sub"), crate::fs::Durability::Pushed),
+                FsEvent::Sync(root.clone(), crate::fs::Durability::Durable),
+                // Certified, the set owes nothing back: what it moved aside is
+                // removed, and that removal made durable before the journal
+                // goes, so no power cut resurrects it with nothing to clean it.
+                FsEvent::Remove(root.join(".c.md.fstx-aside-1")),
                 FsEvent::Sync(root.clone(), crate::fs::Durability::Durable),
                 FsEvent::Remove(journal),
             ]
@@ -2682,5 +2789,107 @@ mod tests {
             [Path::new("child.md"), Path::new("old.md")]
         );
         assert_eq!(read(&root, "child.md"), None);
+    }
+
+    // ---- rollback gives back the same file, not a copy of its bytes ----
+
+    #[cfg(unix)]
+    fn mode_of(root: &Path, rel: &str) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(root.join(rel)).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    fn chmod(root: &Path, rel: &str, mode: u32) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(root.join(rel), std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rollback_gives_back_what_it_removed_with_its_mode() {
+        let root = tmp("rollback-keeps-mode");
+        for (name, mode) in [("tool.sh", 0o755), ("private.md", 0o600), ("occupant.md", 0o600)] {
+            std::fs::write(root.join(name), name).unwrap();
+            chmod(&root, name, mode);
+        }
+        std::fs::write(root.join("mover.md"), "mover.md").unwrap();
+        std::fs::write(root.join("page.md"), "page.md").unwrap();
+        chmod(&root, "page.md", 0o640);
+        let mut cs = ChangeSet::new();
+        cs.remove("tool.sh");
+        cs.remove("private.md");
+        cs.rename("mover.md", "occupant.md");
+        cs.set_link("page.md", "elsewhere.md");
+        cs.remove("missing.md");
+        assert!(block_on(cs.apply(&StdFs, &root)).is_err());
+
+        for (name, mode) in [
+            ("tool.sh", 0o755),
+            ("private.md", 0o600),
+            ("occupant.md", 0o600),
+            ("page.md", 0o640),
+        ] {
+            assert_eq!(read(&root, name).as_deref(), Some(name), "{name}");
+            assert_eq!(mode_of(&root, name), mode, "{name}");
+        }
+        assert_eq!(read(&root, "mover.md").as_deref(), Some("mover.md"));
+        let litter: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.contains("fstx"))
+            .collect();
+        assert!(litter.is_empty(), "{litter:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_landed_set_leaves_nothing_aside() {
+        let root = tmp("landed-leaves-nothing");
+        std::fs::write(root.join("a.md"), "a").unwrap();
+        std::fs::write(root.join("b.md"), "b").unwrap();
+        std::fs::write(root.join("c.md"), "c").unwrap();
+        let mut cs = ChangeSet::new();
+        cs.remove("a.md");
+        cs.rename("b.md", "c.md");
+        block_on(cs.apply(&StdFs, &root)).unwrap();
+        let names: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, vec!["c.md".to_string()]);
+        assert_eq!(read(&root, "c.md").as_deref(), Some("b"));
+    }
+
+    // ---- sets a crash could not be recovered from ----
+
+    #[test]
+    fn a_set_replay_would_undo_is_refused_before_anything_is_written() {
+        let root = tmp("refused-swap");
+        std::fs::write(root.join("a.md"), "A").unwrap();
+        std::fs::write(root.join("b.md"), "B").unwrap();
+        let mut cs = ChangeSet::new();
+        cs.rename("a.md", "tmp.md");
+        cs.rename("b.md", "a.md");
+        cs.rename("tmp.md", "b.md");
+        let err = block_on(cs.apply(&StdFs, &root)).unwrap_err();
+        assert!(matches!(err, Error::Unreplayable { op: 0, .. }), "{err}");
+        assert_eq!(read(&root, "a.md").as_deref(), Some("A"));
+        assert_eq!(read(&root, "b.md").as_deref(), Some("B"));
+        assert!(!Journal::default().path_in(&root).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_journaled_set_does_not_move_a_link() {
+        let root = tmp("refused-link-rename");
+        std::os::unix::fs::symlink("target.md", root.join("l")).unwrap();
+        let mut cs = ChangeSet::new();
+        cs.rename("l", "sub/l");
+        cs.write("other.md", "x");
+        let err = block_on(cs.apply(&StdFs, &root)).unwrap_err();
+        assert!(matches!(err, Error::Unreplayable { op: 0, .. }), "{err}");
+        assert!(std::fs::symlink_metadata(root.join("l")).is_ok());
+        assert_eq!(read(&root, "other.md"), None);
     }
 }
