@@ -104,6 +104,11 @@ use crate::path::guard_in_root;
 use crate::port;
 
 #[cfg(verus_keep_ghost)]
+mod rollback;
+#[cfg(verus_keep_ghost)]
+use rollback::{fits, same};
+
+#[cfg(verus_keep_ghost)]
 use vstd::prelude::*;
 
 /// One staged filesystem operation. Paths are **root-relative** — the root
@@ -730,6 +735,21 @@ impl Journal {
 /// certified but its retirement not — still [`Error::Torn`]'s territory, and
 /// still nameable: if the deletion survives, recovery finds nothing; if a
 /// power cut takes it back, recovery rolls the set forward.
+///
+/// Verified: `Ok` leaves every path the set names as it was before the set
+/// began — entry for entry, modes included, for a set that flips no execute
+/// bit, and in what each holds for one that does.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    with Tracked(tree): Tracked<&mut port::Tree>, Ghost(exact): Ghost<bool>, Ghost(keys): Ghost<Set<int>>,
+        Ghost(hist): Ghost<Seq<port::Tree>>
+    requires
+        port::sound(keys),
+        rollback::logged(exact, keys, undo@, hist),
+        same(exact, keys, *old(tree), hist.last()),
+    ensures
+        r is Ok ==> same(exact, keys, *final(tree), hist[0]),
+))]
 async fn unwind_durable<FS: Storage>(
     fs: &FS,
     undo: Vec<Undo>,
@@ -739,49 +759,196 @@ async fn unwind_durable<FS: Storage>(
     let mut first_error: Option<Error> = None;
     let mut dirs: BTreeSet<PathBuf> = BTreeSet::new();
     let mut i = undo.len();
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        invariant
+            i <= undo@.len(),
+            port::sound(keys),
+            rollback::logged(exact, keys, undo@, hist),
+            first_error is None ==> same(exact, keys, *tree, hist[i as int]),
+        decreases i,
+    ))]
     while i > 0 {
         i -= 1;
-        if let Err(e) = undo_step(fs, &undo[i], &mut dirs).await
-            && first_error.is_none()
-        {
-            first_error = Some(e);
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert(fits(exact, keys, undo@[i as int], hist[i as int], hist[i + 1]));
+        }
+        #[cfg(verus_keep_ghost)]
+        proof_with! {Tracked(tree), Ghost(exact), Ghost(keys), Ghost(hist[i as int]), Ghost(hist[i + 1])}
+        let undone = undo_step(fs, &undo[i], &mut dirs);
+        let result = undone.await;
+        if first_error.is_none() {
+            if let Err(e) = result {
+                first_error = Some(e);
+            }
         }
     }
     if let Some(e) = first_error {
         return Err(e);
     }
-    port::retire_after_abort(fs, dirs, root, journal).await
+    #[cfg(verus_keep_ghost)]
+    proof_decl! {
+        let ghost restored = *tree;
+    }
+    #[cfg(verus_keep_ghost)]
+    proof_with! {Tracked(tree)}
+    let retired = port::retire_after_abort(fs, dirs, root, journal);
+    let r = retired.await;
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        broadcast use port::lemma_content;
+        assert forall|x: int| keys.contains(x) implies #[trigger] rollback::same_at(exact, *tree, hist[0], x) by {
+            assert(port::ent(*tree, x) == port::ent(restored, x));
+            assert(rollback::same_at(exact, restored, hist[0], x));
+        }
+    }
+    r
 }
 
 /// Reverse one recorded step, noting the directories it edited.
+///
+/// Verified: from a tree that agrees with the one the step was recorded
+/// after, `Ok` leaves one that agrees with the one it was recorded before.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    with Tracked(tree): Tracked<&mut port::Tree>, Ghost(exact): Ghost<bool>, Ghost(keys): Ghost<Set<int>>,
+        Ghost(before): Ghost<port::Tree>, Ghost(after): Ghost<port::Tree>
+    requires
+        port::sound(keys),
+        fits(exact, keys, *step, before, after),
+    ensures
+        r is Ok && same(exact, keys, *old(tree), after) ==> same(exact, keys, *final(tree), before),
+))]
 async fn undo_step<FS: Storage>(fs: &FS, step: &Undo, dirs: &mut BTreeSet<PathBuf>) -> Result<()> {
+    #[cfg(verus_keep_ghost)]
+    proof_decl! {
+        broadcast use port::lemma_content;
+        let ghost t0 = *tree;
+    }
     match step {
         Undo::Restore { path, bytes } => {
             // The parent joins the debt even when a Restore born of an
             // overwrite left it unchanged: an extra barrier on an unchanged
             // directory costs less than telling origins apart.
             port::note_parent(dirs, path);
-            port::write_back(fs, path, bytes).await
+            #[cfg(verus_keep_ghost)]
+            proof_with! {Tracked(tree)}
+            let done = port::write_back(fs, path, bytes);
+            let r = done.await;
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                let p = port::fid(*path);
+                if r is Ok && same(exact, keys, t0, after) {
+                    rollback::lemma_frame(exact, keys, t0, *tree, after, before, set![p]);
+                    assert(rollback::same_at(exact, t0, after, p));
+                    if exact {
+                        assert(tree[p] == before[p]);
+                    }
+                    assert(rollback::same_at(exact, *tree, before, p));
+                    rollback::lemma_close(exact, keys, *tree, before, set![p]);
+                }
+            }
+            r
         }
         // Already absent is already undone — see `Undo::Delete`. Reporting it
         // would raise `Error::Torn` over the single most ordinary rollback
         // there is: a write to a new file that failed before creating it.
         Undo::Delete { path } => {
             port::note_parent(dirs, path);
-            port::remove_if_there(fs, path).await
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                let p = port::fid(*path);
+                if same(exact, keys, t0, after) {
+                    assert(rollback::same_at(exact, t0, after, p));
+                }
+            }
+            #[cfg(verus_keep_ghost)]
+            proof_with! {Tracked(tree)}
+            let done = port::remove_if_there(fs, path);
+            let r = done.await;
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                let p = port::fid(*path);
+                if r is Ok && same(exact, keys, t0, after) {
+                    rollback::lemma_frame(exact, keys, t0, *tree, after, before, set![p]);
+                    assert(rollback::same_at(exact, *tree, before, p));
+                    rollback::lemma_close(exact, keys, *tree, before, set![p]);
+                }
+            }
+            r
         }
         Undo::Rename { from, to } => {
             port::note_parent(dirs, from);
             port::note_parent(dirs, to);
-            port::rename(fs, from, to).await
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                let (x, y) = (port::fid(*from), port::fid(*to));
+                if same(exact, keys, t0, after) {
+                    assert(rollback::same_at(exact, t0, after, x));
+                    assert(rollback::same_at(exact, t0, after, y));
+                }
+            }
+            #[cfg(verus_keep_ghost)]
+            proof_with! {Tracked(tree)}
+            let done = port::rename(fs, from, to);
+            let r = done.await;
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                let (x, y) = (port::fid(*from), port::fid(*to));
+                if r is Ok && same(exact, keys, t0, after) {
+                    assert forall|z: int| keys.contains(z) && !set![x, y].contains(z)
+                        implies #[trigger] port::ent(*tree, z) == port::ent(t0, z) by {
+                        assert(!port::ancestor(x, z) && !port::ancestor(y, z));
+                    }
+                    rollback::lemma_frame(exact, keys, t0, *tree, after, before, set![x, y]);
+                    assert(rollback::same_at(exact, *tree, before, x));
+                    assert(rollback::same_at(exact, *tree, before, y));
+                    rollback::lemma_close(exact, keys, *tree, before, set![x, y]);
+                }
+            }
+            r
         }
         // The inode, barriered while the name still resolves.
         Undo::SetExecutable { path, executable } => {
-            port::set_executable(fs, path, *executable).await
+            #[cfg(verus_keep_ghost)]
+            proof_with! {Tracked(tree)}
+            let done = port::set_executable(fs, path, *executable);
+            let r = done.await;
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                let p = port::fid(*path);
+                if same(exact, keys, t0, after) {
+                    rollback::lemma_frame(exact, keys, t0, *tree, after, before, set![p]);
+                    assert(rollback::same_at(exact, t0, after, p));
+                    assert(rollback::same_at(exact, *tree, before, p));
+                    rollback::lemma_close(exact, keys, *tree, before, set![p]);
+                }
+            }
+            r
         }
         Undo::Relink { path, target } => {
             port::note_parent(dirs, path);
-            port::set_link(fs, path, target).await
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                let p = port::fid(*path);
+                if same(exact, keys, t0, after) {
+                    assert(rollback::same_at(exact, t0, after, p));
+                }
+            }
+            #[cfg(verus_keep_ghost)]
+            proof_with! {Tracked(tree)}
+            let done = port::set_link(fs, path, target);
+            let r = done.await;
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                let p = port::fid(*path);
+                if r is Ok && same(exact, keys, t0, after) {
+                    rollback::lemma_frame(exact, keys, t0, *tree, after, before, set![p]);
+                    assert(rollback::same_at(exact, *tree, before, p));
+                    rollback::lemma_close(exact, keys, *tree, before, set![p]);
+                }
+            }
+            r
         }
     }
 }
@@ -794,7 +961,8 @@ async fn undo_step<FS: Storage>(fs: &FS, step: &Undo, dirs: &mut BTreeSet<PathBu
 /// restore the bytes the rename put there — a snapshot taken before the set ran
 /// would say "`sub/a.md` did not exist; delete it", and the rename's undo would
 /// then have nothing to move back. Paths here are already root-joined.
-enum Undo {
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+pub(crate) enum Undo {
     /// Put these bytes back (the file existed and was overwritten or removed).
     Restore { path: PathBuf, bytes: Vec<u8> },
     /// Delete the file (it did not exist before the write created it).
