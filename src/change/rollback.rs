@@ -492,4 +492,35 @@ pub(crate) proof fn lemma_landed(exact: bool, keys: Set<int>, steps: Seq<Undo>, 
     assert(h2.last() == t);
 }
 
+/// The files op `index` may change: the ones it names, and its aside.
+pub(crate) open spec fn touches(root: &std::path::Path, op: crate::FileOp, index: int) -> Set<int> {
+    let m = crate::port::model(root, op);
+    let target = if m.act is Rename { m.other } else { m.path };
+    let named = if m.act is Rename || m.act is CopyFrom { set![m.path, m.other] } else { set![m.path] };
+    if m.act is Remove || m.act is Rename || m.act is SetLink {
+        named.insert(crate::port::aside_of(target, index))
+    } else {
+        named
+    }
+}
+
+/// Whether an op moves an entry aside, and where.
+pub(crate) open spec fn asides(root: &std::path::Path, op: crate::FileOp) -> bool {
+    let m = crate::port::model(root, op);
+    m.act is Remove || m.act is Rename || m.act is SetLink
+}
+
+pub(crate) open spec fn aside_key(root: &std::path::Path, op: crate::FileOp, index: int) -> int {
+    let m = crate::port::model(root, op);
+    crate::port::aside_of(if m.act is Rename { m.other } else { m.path }, index)
+}
+
+/// No op's aside is a file another op touches.
+pub(crate) open spec fn asides_apart(root: &std::path::Path, ops: Seq<crate::FileOp>) -> bool {
+    forall|i: int, j: int|
+        #![trigger touches(root, ops[j], j), aside_key(root, ops[i], i)]
+        0 <= i < ops.len() && 0 <= j < ops.len() && i != j && asides(root, ops[i])
+            ==> !touches(root, ops[j], j).contains(aside_key(root, ops[i], i))
+}
+
 } // verus!

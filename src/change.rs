@@ -632,42 +632,9 @@ impl Journal {
             .await?;
 
         let mut undo = Rollback::default();
-        let mut touched = BTreeSet::new();
-        let mut cause: Option<Error> = None;
-        for (index, op) in changes.ops.iter().enumerate() {
-            if let Err(e) = exec(fs, root, index, op, true, &mut undo, &mut touched).await {
-                cause = Some(e);
-                break;
-            }
-        }
-        // Applied cleanly — now make that mean something across a power cut.
-        // `exec` barriered every name-unstable debt as it ran; what remains
-        // is the stable ones (edited directories, fresh chains), flushed as
-        // pushes capped by one drain of the root, so the whole set survives
-        // before the journal that certifies it is given up. A certification
-        // that *fails* is treated exactly as a failed op — the set rolls
-        // back — because "applied, but perhaps not durable" is neither of
-        // the two endpoints `Ok` and `Err` name.
-        if cause.is_none()
-            && let Err(e) =
-                crate::fs::flush_all(fs, touched, root, crate::fs::Durability::Durable).await
-        {
-            cause = Some(e.into());
-        }
-        if let Some(cause) = cause {
-            return Err(match unwind_durable(fs, undo.steps, root, &journal).await {
-                // Reverted cleanly and durably: the abort is now a fact a
-                // power cut cannot contradict, so the cause alone is the
-                // answer.
-                Ok(()) => cause,
-                // Could not revert, or could not certify the reversion: the
-                // journal is kept where possible, so recovery rolls the set
-                // forward to the consistent applied state.
-                Err(rollback) => Error::Torn {
-                    cause: cause.to_string(),
-                    rollback: rollback.to_string(),
-                },
-            });
+        match run_or_roll_back(fs, root, &changes.ops, &journal, &mut undo).await {
+            Outcome::Landed => {}
+            Outcome::RolledBack(cause) | Outcome::Torn(cause) => return Err(cause),
         }
         // The set is certified; what it moved aside is no longer anyone's to
         // put back. Removed now, and the removals certified before the journal
@@ -705,6 +672,121 @@ impl Journal {
                            cleared by the next recovery"
                     .to_string(),
             }),
+        }
+    }
+}
+
+/// How a journaled set's run ended.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+enum Outcome {
+    /// Every op landed and the set is certified durable.
+    Landed,
+    /// An op, or the certification, failed; the rollback put everything back
+    /// and made that durable. The cause is the answer.
+    RolledBack(Error),
+    /// The rollback failed too ([`Error::Torn`]).
+    Torn(Error),
+}
+
+/// Run every op of a journaled set, recording how to reverse each, and
+/// certify the result — or, on the first failure, roll back.
+///
+/// Verified: [`Outcome::RolledBack`] leaves every path the set names as it
+/// was before the set began — entry for entry, modes included, for a set
+/// that flips no execute bit, and in what each holds for one that does.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    with Tracked(tree): Tracked<&mut port::Tree>, Ghost(exact): Ghost<bool>, Ghost(keys): Ghost<Set<int>>
+    requires
+        port::sound(keys),
+        forall|i: int| 0 <= i < ops@.len() ==> port::names(root, #[trigger] ops@[i], keys),
+        forall|i: int| 0 <= i < ops@.len() ==> rollback::aside_ok(root, #[trigger] ops@[i], i, keys, *old(tree)),
+        rollback::asides_apart(root, ops@),
+        forall|i: int| 0 <= i < ops@.len() && (#[trigger] port::model(root, ops@[i])).act is SetExecutable ==> !exact,
+        old(undo).steps@.len() == 0,
+    ensures
+        r is RolledBack ==> same(exact, keys, *final(tree), *old(tree)),
+))]
+async fn run_or_roll_back<FS: Storage>(
+    fs: &FS,
+    root: &Path,
+    ops: &[FileOp],
+    journal: &Path,
+    undo: &mut Rollback,
+) -> Outcome {
+    let mut touched = BTreeSet::new();
+    let mut cause: Option<Error> = None;
+    #[cfg(verus_keep_ghost)]
+    proof_decl! {
+        let ghost start = *tree;
+        let tracked mut h = rollback::Hist { s: seq![*tree] };
+        rollback::lemma_same_refl(exact, keys, *tree);
+    }
+    let mut i: usize = 0;
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        invariant
+            i <= ops@.len(),
+            port::sound(keys),
+            forall|x: int| 0 <= x < ops@.len() ==> port::names(root, #[trigger] ops@[x], keys),
+            forall|x: int| i <= x < ops@.len() ==> rollback::aside_ok(root, #[trigger] ops@[x], x, keys, *tree),
+            rollback::asides_apart(root, ops@),
+            forall|x: int| 0 <= x < ops@.len() && (#[trigger] port::model(root, ops@[x])).act is SetExecutable ==> !exact,
+            rollback::holds(exact, keys, undo.steps@, h.s, *tree),
+            h.s[0] == start,
+        decreases ops@.len() - i,
+    ))]
+    while i < ops.len() && cause.is_none() {
+        #[cfg(verus_keep_ghost)]
+        proof_decl! {
+            let ghost before = *tree;
+        }
+        #[cfg(verus_keep_ghost)]
+        proof_with! {Tracked(tree), Tracked(&mut h), Ghost(exact), Ghost(keys)}
+        let running = exec(fs, root, i, &ops[i], true, undo, &mut touched);
+        if let Err(e) = running.await {
+            cause = Some(e);
+        }
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert forall|x: int| i < x < ops@.len() implies rollback::aside_ok(root, #[trigger] ops@[x], x, keys, *tree) by {
+                assert(rollback::aside_ok(root, ops@[x], x, keys, before));
+                if rollback::asides(root, ops@[x]) {
+                    let a = rollback::aside_key(root, ops@[x], x);
+                    assert(!rollback::touches(root, ops@[i as int], i as int).contains(a));
+                    assert(port::ent(*tree, a) == port::ent(before, a));
+                }
+            }
+        }
+        i += 1;
+    }
+    // Applied cleanly — now make that mean something across a power cut.
+    // `exec` barriered every name-unstable debt as it ran; what remains
+    // is the stable ones (edited directories, fresh chains), flushed as
+    // pushes capped by one drain of the root, so the whole set survives
+    // before the journal that certifies it is given up. A certification
+    // that *fails* is treated exactly as a failed op — the set rolls
+    // back — because "applied, but perhaps not durable" is neither of
+    // the two endpoints `Ok` and `Err` name.
+    let cause = match cause {
+        None => port::certify(fs, touched, root).await.err(),
+        failed => failed,
+    };
+    match cause {
+        None => Outcome::Landed,
+        Some(cause) => {
+            #[cfg(verus_keep_ghost)]
+            proof_with! {Tracked(tree), Ghost(exact), Ghost(keys), Ghost(h.s)}
+            let unwinding = unwind_durable(fs, &undo.steps, root, journal);
+            match unwinding.await {
+                // Reverted cleanly and durably: the abort is now a fact a
+                // power cut cannot contradict, so the cause alone is the
+                // answer.
+                Ok(()) => Outcome::RolledBack(cause),
+                // Could not revert, or could not certify the reversion: the
+                // journal is kept where possible, so recovery rolls the set
+                // forward to the consistent applied state.
+                Err(rollback) => Outcome::Torn(port::torn(cause, rollback)),
+            }
         }
     }
 }
@@ -752,7 +834,7 @@ impl Journal {
 ))]
 async fn unwind_durable<FS: Storage>(
     fs: &FS,
-    undo: Vec<Undo>,
+    undo: &[Undo],
     root: &Path,
     journal: &Path,
 ) -> Result<()> {
@@ -1004,6 +1086,7 @@ pub(crate) struct Rollback {
         !old(tree).contains_key(port::aside_of(port::fid(*full), index as int)),
     ensures
         rollback::holds(exact, keys, final(undo).steps@, final(h).s, *final(tree)),
+        final(h).s[0] == old(h).s[0],
         r is Ok ==> {
             &&& final(undo).steps@.len() == old(undo).steps@.len() + 1
             &&& final(undo).steps@.drop_last() == old(undo).steps@
@@ -1121,6 +1204,8 @@ pub(crate) async fn retire_asides<FS: Storage>(
         record ==> rollback::holds(exact, keys, old(undo).steps@, old(h).s, *old(tree)),
     ensures
         record ==> rollback::holds(exact, keys, final(undo).steps@, final(h).s, *final(tree)),
+        record ==> final(h).s[0] == old(h).s[0],
+        rollback::frame(keys, *old(tree), *final(tree), rollback::touches(root, *op, index as int)),
 ))]
 async fn exec<FS: Storage>(
     fs: &FS,
@@ -1444,6 +1529,8 @@ async fn exec<FS: Storage>(
         record ==> steps.last() is Restore || steps.last() is Delete || steps.last() is Relink,
     ensures
         record ==> rollback::holds(exact, keys, steps, final(h).s, *final(tree)),
+        record ==> final(h).s[0] == old(h).s[0],
+        rollback::frame(keys, *old(tree), *final(tree), set![port::fid(*full)]),
 ))]
 async fn land_bytes<FS: Storage>(
     fs: &FS,
@@ -1519,6 +1606,8 @@ async fn land_bytes<FS: Storage>(
         record ==> steps.last() is Relink || steps.last() is Delete || steps.last() is Rename,
     ensures
         record ==> rollback::holds(exact, keys, steps, final(h).s, *final(tree)),
+        record ==> final(h).s[0] == old(h).s[0],
+        rollback::frame(keys, *old(tree), *final(tree), set![port::fid(*full)]),
 ))]
 async fn land_link<FS: Storage>(
     fs: &FS,
@@ -1608,6 +1697,7 @@ pub(crate) async fn settle_write_debt<FS: Storage>(
         keys.contains(port::fid(*full)),
     ensures
         rollback::holds(exact, keys, final(undo)@, final(h).s, *tree),
+        final(h).s[0] == old(h).s[0],
         r is Ok ==> {
             &&& final(undo)@.len() == old(undo)@.len() + 1
             &&& final(undo)@.drop_last() == old(undo)@

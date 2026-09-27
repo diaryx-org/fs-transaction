@@ -626,3 +626,19 @@ pub(crate) fn nothing_to_remove(full: &PathBuf) -> Error {
         format!("nothing to remove at {}", full.display()),
     ))
 }
+
+/// Certify a landed set: every debt pushed, one drain of the root. Nothing
+/// in the tree changes.
+#[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
+pub(crate) async fn certify<FS: Storage>(fs: &FS, touched: BTreeSet<PathBuf>, root: &Path) -> Result<()> {
+    Ok(crate::fs::flush_all(fs, touched, root, crate::fs::Durability::Durable).await?)
+}
+
+/// The error for a failed set whose rollback failed too.
+#[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
+pub(crate) fn torn(cause: Error, rollback: Error) -> Error {
+    Error::Torn {
+        cause: cause.to_string(),
+        rollback: rollback.to_string(),
+    }
+}
