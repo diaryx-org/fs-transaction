@@ -137,7 +137,7 @@ I recommend enabling the feature where performance is important on Apple platfor
 
 ## Verified
 
-Two parts of the crate are proved correct with [Verus](https://github.com/verus-lang/verus),
+Parts of the crate are proved correct with [Verus](https://github.com/verus-lang/verus),
 in place: the specs sit on the code that runs,
 and the proofs sit beside it in modules only Verus compiles.
 An ordinary build sees none of it and gains no dependency.
@@ -149,11 +149,15 @@ An ordinary build sees none of it and gains no dependency.
   for any set it accepts, replaying the journal from its first op —
   over the tree before or after any op, halfway through one, or halfway through a rollback —
   reaches exactly the tree the apply would have.
+- **Replay.** The code `recover` runs to roll a journal forward is proved to do exactly what that theorem says replay does.
 
+What the proofs take on trust is in one file, `src/port.rs`:
+each storage call the executor makes, with the port contract as its spec.
+A test fails if anything is taken on trust anywhere else.
 With a Verus release on `PATH`:
 
 ```sh
-verus src/lib.rs --crate-type=lib --crate-name fs_transaction --edition=2024 --no-cheating
+verus src/lib.rs --crate-type=lib --crate-name fs_transaction --edition=2024
 ```
 
 ## License

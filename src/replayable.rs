@@ -48,7 +48,7 @@ use crate::change::FileOp;
 use vstd::prelude::*;
 
 #[cfg(verus_keep_ghost)]
-mod proof;
+pub(crate) mod proof;
 
 /// Why a set was refused, and at which op.
 #[cfg_attr(verus_keep_ghost, verus_verify)]

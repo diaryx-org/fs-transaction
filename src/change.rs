@@ -102,9 +102,13 @@ use crate::fs::Storage;
 use crate::journal::Journal;
 use crate::path::guard_in_root;
 
+#[cfg(verus_keep_ghost)]
+use vstd::prelude::*;
+
 /// One staged filesystem operation. Paths are **root-relative** — the root
 /// is joined on at [`apply`](ChangeSet::apply) time, so a set is portable
 /// between trees and prints readably in a dry run.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileOp {
     /// Write `bytes` to `path`, creating it (and any missing parent directory)

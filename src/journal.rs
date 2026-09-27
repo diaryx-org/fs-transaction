@@ -70,6 +70,12 @@ use std::path::{Component, Path, PathBuf};
 use crate::change::FileOp;
 use crate::error::{Error, Result};
 use crate::fs::Storage;
+use crate::port;
+
+#[cfg(verus_keep_ghost)]
+use crate::replayable::proof::{replay_step, replay_upto};
+#[cfg(verus_keep_ghost)]
+use vstd::prelude::*;
 
 /// Where a change set's write-ahead journal lives — and, because they must
 /// agree about it, both halves of the protocol that depends on the answer.
@@ -423,9 +429,7 @@ impl Journal {
         // place like any other journal that cannot be trusted.
         crate::change::guard_ops(&ops)?;
         let mut touched = std::collections::BTreeSet::new();
-        for op in &ops {
-            replay(fs, root, op, &mut touched).await?;
-        }
+        replay_all(fs, root, &ops, &mut touched).await?;
         // The apply may have moved entries aside before the crash: each op
         // that removes or replaces a path names where. Rolled forward, none
         // of them is anyone's to put back.
@@ -459,12 +463,75 @@ pub async fn recover<FS: Storage>(fs: &FS, root: &Path) -> Result<Recovered> {
     Journal::default().recover(fs, root).await
 }
 
+/// Replay every op, in order, from the first.
+///
+/// Verified to leave the tree, on every path the set names, as the recovery
+/// theorem's `replay_upto` says, whenever it returns `Ok`.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    with Tracked(tree): Tracked<&mut port::Fs>, Ghost(keys): Ghost<Set<int>>
+    requires
+        port::sound(keys),
+        forall|i: int| 0 <= i < ops@.len() ==> port::names(root, #[trigger] ops@[i], keys),
+    ensures
+        r is Ok && replay_upto(*old(tree), port::models(root, ops@), ops@.len() as nat) is Some ==>
+            port::agree(keys, *final(tree), replay_upto(*old(tree), port::models(root, ops@), ops@.len() as nat)->Some_0),
+))]
+async fn replay_all<FS: Storage>(
+    fs: &FS,
+    root: &Path,
+    ops: &[FileOp],
+    touched: &mut std::collections::BTreeSet<PathBuf>,
+) -> Result<()> {
+    let mut i: usize = 0;
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        invariant
+            i <= ops@.len(),
+            port::sound(keys),
+            forall|x: int| 0 <= x < ops@.len() ==> port::names(root, #[trigger] ops@[x], keys),
+            replay_upto(*old(tree), port::models(root, ops@), i as nat) is Some ==>
+                port::agree(keys, *tree, replay_upto(*old(tree), port::models(root, ops@), i as nat)->Some_0),
+        decreases ops@.len() - i,
+    ))]
+    while i < ops.len() {
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            let ghost before = *tree;
+            let ghost models = port::models(root, ops@);
+            assert(models[i as int] == port::model(root, ops@[i as int]));
+            if replay_upto(*old(tree), models, (i + 1) as nat) is Some {
+                port::lemma_replay_congruent(keys, before, replay_upto(*old(tree), models, i as nat)->Some_0, models[i as int]);
+            }
+        }
+        #[cfg(verus_keep_ghost)]
+        proof_with! {Tracked(tree), Ghost(keys)}
+        let replayed = replay(fs, root, &ops[i], touched);
+        replayed.await?;
+        i += 1;
+    }
+    Ok(())
+}
+
 /// Re-apply one journaled op, tolerant of it having already landed before the
 /// crash — this is what makes rolling a journal forward idempotent.
 ///
 /// `touched` collects the same flush debt [`crate::change`]'s exec does — the
 /// entries, bits, and fresh chains no per-op call flushes — for
 /// [`Journal::recover`] to settle before the journal is given up.
+///
+/// Verified (by Verus, against the port contract in [`crate::port`]) to do
+/// to the tree exactly what the recovery theorem's `replay_step` says, on
+/// every path the set names, whenever it returns `Ok`.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    with Tracked(tree): Tracked<&mut port::Fs>, Ghost(keys): Ghost<Set<int>>
+    requires
+        port::sound(keys),
+        port::names(root, *op, keys),
+    ensures
+        r is Ok && replay_step(*old(tree), port::model(root, *op)) is Some ==>
+            port::agree(keys, *final(tree), replay_step(*old(tree), port::model(root, *op))->Some_0),
+))]
 async fn replay<FS: Storage>(
     fs: &FS,
     root: &Path,
@@ -477,10 +544,16 @@ async fn replay<FS: Storage>(
         // `replace`, on apply's own terms: the durability is the recovery's
         // one batched flush, not the file's.
         FileOp::Write { path, bytes } => {
-            let full = root.join(path);
-            ensure_parent(fs, &full, touched).await?;
-            fs.replace(&full, bytes).await?;
-            crate::change::settle_write_debt(fs, &full, touched).await?;
+            let full = port::join(root, path);
+            #[cfg(verus_keep_ghost)]
+            proof_with! {Tracked(tree)}
+            let made = port::ensure_parent(fs, &full, touched);
+            made.await?;
+            #[cfg(verus_keep_ghost)]
+            proof_with! {Tracked(tree)}
+            let landed = port::replace(fs, &full, bytes);
+            landed.await?;
+            port::settle_write(fs, &full, touched).await?;
         }
         // Idempotent for the same reason a `Write` is — with the bytes fetched
         // from the source rather than carried in the journal. That is sound
@@ -489,29 +562,30 @@ async fn replay<FS: Storage>(
         // gone is an error rather than a silent divergence, because replay must
         // never invent a state the original set did not intend.
         FileOp::CopyFrom { path, source } => {
-            let (full, source_full) = (root.join(path), root.join(source));
-            let bytes = fs.read(&source_full).await.map_err(|e| {
-                Error::Recovery(format!(
-                    "cannot copy {} from {} — {e}",
-                    full.display(),
-                    source_full.display()
-                ))
-            })?;
-            ensure_parent(fs, &full, touched).await?;
-            fs.replace(&full, &bytes).await?;
-            crate::change::settle_write_debt(fs, &full, touched).await?;
+            let full = port::join(root, path);
+            let source_full = port::join(root, source);
+            #[cfg(verus_keep_ghost)]
+            proof_with! {Tracked(&*tree)}
+            let read = port::read_source(fs, &full, &source_full);
+            let bytes = read.await?;
+            #[cfg(verus_keep_ghost)]
+            proof_with! {Tracked(tree)}
+            let made = port::ensure_parent(fs, &full, touched);
+            made.await?;
+            #[cfg(verus_keep_ghost)]
+            proof_with! {Tracked(tree)}
+            let landed = port::replace(fs, &full, &bytes);
+            landed.await?;
+            port::settle_write(fs, &full, touched).await?;
         }
         // A remove of a file already gone is the state we wanted, not a failure.
         FileOp::Remove { path } => {
-            let full = root.join(path);
-            match fs.remove_file(&full).await {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
-            }
-            if let Some(dir) = crate::fs::parent_dir(&full) {
-                touched.insert(dir.to_path_buf());
-            }
+            let full = port::join(root, path);
+            #[cfg(verus_keep_ghost)]
+            proof_with! {Tracked(tree)}
+            let removed = port::remove_if_there(fs, &full);
+            removed.await?;
+            port::note_parent(touched, &full);
         }
         // Setting a bit that is already set (or already cleared) reaches the
         // same state — idempotent by nature, like a whole-file write. On a
@@ -524,31 +598,43 @@ async fn replay<FS: Storage>(
         // away by a later op of the same set — the only way the apply's rule
         // lets it go — so the flip already happened, and moved with it.
         FileOp::SetExecutable { path, executable } => {
-            let full = root.join(path);
-            crate::change::guard_not_link(fs, &full).await?;
-            if !fs.try_exists(&full).await? {
+            let full = port::join(root, path);
+            #[cfg(verus_keep_ghost)]
+            proof_with! {Tracked(&*tree)}
+            let linked = port::holds_link(fs, &full);
+            if linked.await {
+                return Err(port::flip_through_link(&full));
+            }
+            #[cfg(verus_keep_ghost)]
+            proof_with! {Tracked(&*tree)}
+            let there = port::exists(fs, &full);
+            if !there.await? {
                 return Ok(());
             }
-            fs.set_executable(&full, *executable).await?;
             // The inode barriered while the name still resolves — a later op
             // in this same journal may rename or remove it — and the parent
             // batched, on exec's own terms.
-            fs.sync(&full, crate::fs::Durability::Ordered).await?;
-            if let Some(dir) = crate::fs::parent_dir(&full) {
-                touched.insert(dir.to_path_buf());
-            }
+            #[cfg(verus_keep_ghost)]
+            proof_with! {Tracked(tree)}
+            let flipped = port::set_executable(fs, &full, *executable);
+            flipped.await?;
+            port::note_parent(touched, &full);
         }
         // `set_link` replaces whatever is at the path, so replaying it lands
         // the same link whether the crash beat the op, interrupted it midway
         // (a remove-then-remake backend caught between the two), or came
         // after it was done.
         FileOp::SetLink { path, target } => {
-            let full = root.join(path);
-            ensure_parent(fs, &full, touched).await?;
-            fs.set_link(&full, target).await?;
-            if let Some(dir) = crate::fs::parent_dir(&full) {
-                touched.insert(dir.to_path_buf());
-            }
+            let full = port::join(root, path);
+            #[cfg(verus_keep_ghost)]
+            proof_with! {Tracked(tree)}
+            let made = port::ensure_parent(fs, &full, touched);
+            made.await?;
+            #[cfg(verus_keep_ghost)]
+            proof_with! {Tracked(tree)}
+            let linked = port::set_link(fs, &full, target);
+            linked.await?;
+            port::note_parent(touched, &full);
         }
         // The one op that is not naturally idempotent: after it lands, the source
         // is gone and the destination present, so a blind re-rename would fail.
@@ -556,40 +642,34 @@ async fn replay<FS: Storage>(
         // done if only the destination is, and refuse only if *neither* exists,
         // which no honest interruption of this set can produce.
         FileOp::Rename { from, to } => {
-            let (from_full, to_full) = (root.join(from), root.join(to));
-            if fs.try_exists(&from_full).await? {
-                ensure_parent(fs, &to_full, touched).await?;
-                fs.rename(&from_full, &to_full).await?;
-            } else if fs.try_exists(&to_full).await? {
-                // Already renamed before the crash — nothing to redo.
+            let from_full = port::join(root, from);
+            let to_full = port::join(root, to);
+            #[cfg(verus_keep_ghost)]
+            proof_with! {Tracked(&*tree)}
+            let source_there = port::exists(fs, &from_full);
+            if source_there.await? {
+                #[cfg(verus_keep_ghost)]
+                proof_with! {Tracked(tree)}
+                let made = port::ensure_parent(fs, &to_full, touched);
+                made.await?;
+                #[cfg(verus_keep_ghost)]
+                proof_with! {Tracked(tree)}
+                let moved = port::rename(fs, &from_full, &to_full);
+                moved.await?;
             } else {
-                return Err(Error::Recovery(format!(
-                    "neither {} nor {} exists — cannot complete the rename",
-                    from_full.display(),
-                    to_full.display()
-                )));
+                #[cfg(verus_keep_ghost)]
+                proof_with! {Tracked(&*tree)}
+                let destination_there = port::exists(fs, &to_full);
+                if !destination_there.await? {
+                    return Err(port::rename_lost(&from_full, &to_full));
+                }
+                // Already renamed before the crash — nothing to redo.
             }
             // Both entries owe a flush whichever branch ran: even an
             // already-done rename was done by a crashed process that never
             // flushed it.
-            for side in [&from_full, &to_full] {
-                if let Some(dir) = crate::fs::parent_dir(side) {
-                    touched.insert(dir.to_path_buf());
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn ensure_parent<FS: Storage>(
-    fs: &FS,
-    full: &Path,
-    touched: &mut std::collections::BTreeSet<PathBuf>,
-) -> Result<()> {
-    if let Some(dir) = crate::fs::parent_dir(full) {
-        for made in crate::fs::create_dir_all_traced(fs, dir).await? {
-            touched.insert(made);
+            port::note_parent(touched, &from_full);
+            port::note_parent(touched, &to_full);
         }
     }
     Ok(())
