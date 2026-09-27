@@ -104,6 +104,8 @@ use crate::path::guard_in_root;
 use crate::port;
 
 #[cfg(verus_keep_ghost)]
+mod refines;
+#[cfg(verus_keep_ghost)]
 mod rollback;
 #[cfg(verus_keep_ghost)]
 use rollback::{fits, same};
@@ -706,6 +708,8 @@ enum Outcome {
         old(undo).steps@.len() == 0,
     ensures
         r is RolledBack ==> same(exact, keys, *final(tree), *old(tree)),
+        r is Landed && refines::completes(root, ops@, *old(tree))
+            ==> refines::matches(root, ops@, keys, *final(tree), refines::applied(root, ops@, *old(tree), ops@.len() as nat)),
 ))]
 async fn run_or_roll_back<FS: Storage>(
     fs: &FS,
@@ -733,6 +737,11 @@ async fn run_or_roll_back<FS: Storage>(
             forall|x: int| 0 <= x < ops@.len() && (#[trigger] port::model(root, ops@[x])).act is SetExecutable ==> !exact,
             rollback::holds(exact, keys, undo.steps@, h.s, *tree),
             h.s[0] == start,
+            start == *old(tree),
+            // Between any two ops, the tree is the model's: a crash here is
+            // one `refines::theorem_between_ops` recovers from.
+            cause is None && refines::completes(root, ops@, start)
+                ==> refines::matches(root, ops@, keys, *tree, refines::applied(root, ops@, start, i as nat)),
         decreases ops@.len() - i,
     ))]
     while i < ops.len() && cause.is_none() {
@@ -748,6 +757,9 @@ async fn run_or_roll_back<FS: Storage>(
         }
         #[cfg(verus_keep_ghost)]
         proof! {
+            if cause is None && refines::completes(root, ops@, start) {
+                refines::lemma_next(root, ops@, i as int, keys, start, before, *tree);
+            }
             assert forall|x: int| i < x < ops@.len() implies rollback::aside_ok(root, #[trigger] ops@[x], x, keys, *tree) by {
                 assert(rollback::aside_ok(root, ops@[x], x, keys, before));
                 if rollback::asides(root, ops@[x]) {
@@ -1206,6 +1218,8 @@ pub(crate) async fn retire_asides<FS: Storage>(
         record ==> rollback::holds(exact, keys, final(undo).steps@, final(h).s, *final(tree)),
         record ==> final(h).s[0] == old(h).s[0],
         rollback::frame(keys, *old(tree), *final(tree), rollback::touches(root, *op, index as int)),
+        r is Ok && refines::seen(port::model(root, *op), port::content(*old(tree)))
+            ==> refines::lands(root, *op, index as int, keys, *old(tree), *final(tree)),
 ))]
 async fn exec<FS: Storage>(
     fs: &FS,
@@ -1513,6 +1527,12 @@ async fn exec<FS: Storage>(
             port::note_parent(touched, &full);
         }
     }
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        if refines::seen(port::model(root, *op), port::content(*old(tree))) {
+            refines::lemma_lands(root, *op, index as int, keys, *old(tree), *tree);
+        }
+    }
     Ok(())
 }
 
@@ -1531,6 +1551,8 @@ async fn exec<FS: Storage>(
         record ==> rollback::holds(exact, keys, steps, final(h).s, *final(tree)),
         record ==> final(h).s[0] == old(h).s[0],
         rollback::frame(keys, *old(tree), *final(tree), set![port::fid(*full)]),
+        r is Ok ==> !port::has_dir(*old(tree), port::fid(*full)) && port::has_file(*final(tree), port::fid(*full))
+            && final(tree)[port::fid(*full)]->File_bytes == bytes@,
 ))]
 async fn land_bytes<FS: Storage>(
     fs: &FS,
@@ -1608,6 +1630,8 @@ async fn land_bytes<FS: Storage>(
         record ==> rollback::holds(exact, keys, steps, final(h).s, *final(tree)),
         record ==> final(h).s[0] == old(h).s[0],
         rollback::frame(keys, *old(tree), *final(tree), set![port::fid(*full)]),
+        r is Ok ==> !port::has_dir(*old(tree), port::fid(*full))
+            && port::ent(*final(tree), port::fid(*full)) == Some(port::Entry::Link { target: port::tid(*target) }),
 ))]
 async fn land_link<FS: Storage>(
     fs: &FS,

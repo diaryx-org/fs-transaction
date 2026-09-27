@@ -543,7 +543,7 @@ proof fn lemma_step_frame(s: Fs, op: Op, p: int)
 {
 }
 
-proof fn lemma_apply_prefix(s0: Fs, ops: Seq<Op>, k: nat, n: nat)
+pub(crate) proof fn lemma_apply_prefix(s0: Fs, ops: Seq<Op>, k: nat, n: nat)
     requires
         k <= n,
         apply_upto(s0, ops, n) is Some,
