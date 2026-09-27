@@ -19,9 +19,10 @@
 //!   executor is verified on a set of paths none of which is another's
 //!   ancestor. For a journaled set, the replayability rule checks this on the
 //!   names; that the tree nests no two paths the names keep apart is assumed.
-//! - **Scratch names are the crate's.** The journal, a replacement's staging
-//!   sibling, and an aside are [`scratch`]; the proofs assume a set names none
-//!   of them.
+//! - **Scratch names are the crate's.** The journal and a replacement's
+//!   staging sibling are [`scratch`], and an aside is [`aside_of`] the file it
+//!   holds; the proofs assume a set names none of them, and that no aside is
+//!   there before the set moves something to it.
 //! - **`read_link` answers truly.** Whether a path holds a link is what
 //!   `read_link` says, where it says anything.
 
@@ -68,9 +69,12 @@ pub(crate) uninterp spec fn tid(target: PathBuf) -> int;
 /// Whether file `a` is a directory above file `b`.
 pub(crate) uninterp spec fn ancestor(a: int, b: int) -> bool;
 
-/// Whether a file is one of the crate's own: a journal, a staging sibling,
-/// an aside.
+/// Whether a file is one of the crate's own scratch: a journal, a staging
+/// sibling.
 pub(crate) uninterp spec fn scratch(x: int) -> bool;
+
+/// Where op `index` moves the entry at file `x` aside.
+pub(crate) uninterp spec fn aside_of(x: int, index: int) -> int;
 
 /// What a file holds, as the executor sees it: the recovery theorem's
 /// [`Content`] and, for a file or directory, its mode.
@@ -265,7 +269,14 @@ pub(crate) fn note_parent(touched: &mut BTreeSet<PathBuf>, full: &PathBuf) {
     }
 }
 
-/// Create whatever directories `full` needs, recording them as owed a flush.
+/// Create `full`'s parent directory if it is missing. Unconditional (rather than
+/// staged as its own op) because a directory is not part of the document graph:
+/// it is an artifact of *where* a write lands, so it belongs to the write.
+///
+/// Every directory the making mints joins `touched`: each is an entry of its
+/// own, persisting separately from the file that prompted it, and a
+/// durably-flushed file inside a chain of unflushed names is a file a power
+/// cut can orphan.
 #[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
 #[cfg_attr(verus_keep_ghost, verus_spec(r =>
     with Tracked(tree): Tracked<&mut Tree>
@@ -449,5 +460,163 @@ pub(crate) fn rename_lost(from: &PathBuf, to: &PathBuf) -> Error {
         "neither {} nor {} exists — cannot complete the rename",
         from.display(),
         to.display()
+    ))
+}
+
+/// What stands at a path, as far as putting it back is concerned.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+pub(crate) enum Occupant {
+    Absent,
+    Link(PathBuf),
+    Directory,
+    File,
+}
+
+/// Look at `full` without following a link that stands there.
+#[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    with Tracked(tree): Tracked<&Tree>
+    ensures
+        r is Ok ==> match r->Ok_0 {
+            Occupant::Absent => !tree.contains_key(fid(*full)),
+            Occupant::Link(t) => ent(*tree, fid(*full)) == Some(Entry::Link { target: tid(t) }),
+            Occupant::Directory => has_dir(*tree, fid(*full)),
+            Occupant::File => has_file(*tree, fid(*full)),
+        },
+))]
+pub(crate) async fn occupant<FS: Storage>(fs: &FS, full: &PathBuf) -> Result<Occupant> {
+    match fs.read_link(full).await {
+        Ok(Some(target)) => return Ok(Occupant::Link(target)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Occupant::Absent),
+        // Not a link, or a backend with none.
+        _ => {}
+    }
+    match fs.metadata(full).await {
+        Ok(md) if md.is_dir() => Ok(Occupant::Directory),
+        Ok(_) => Ok(Occupant::File),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Occupant::Absent),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// [`ReadStorage::read`](crate::fs::ReadStorage::read): a file's bytes. A read
+/// fails on nothing and on a directory, and reads through a link.
+#[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    with Tracked(tree): Tracked<&Tree>
+    ensures
+        r is Ok ==> tree.contains_key(fid(*full)) && !has_dir(*tree, fid(*full))
+            && (has_file(*tree, fid(*full)) ==> r->Ok_0@ == tree[fid(*full)]->File_bytes),
+))]
+pub(crate) async fn read<FS: Storage>(fs: &FS, full: &PathBuf) -> Result<Vec<u8>> {
+    Ok(fs.read(full).await?)
+}
+
+/// [`ReadStorage::executable`](crate::fs::ReadStorage::executable).
+#[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
+pub(crate) async fn executable<FS: Storage>(fs: &FS, full: &PathBuf) -> Result<Option<bool>> {
+    Ok(fs.executable(full).await?)
+}
+
+/// Where op `index` moves the entry at `full` aside.
+#[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
+#[cfg_attr(verus_keep_ghost, verus_spec(r => ensures fid(r) == aside_of(fid(*full), index as int)))]
+pub(crate) fn aside(full: &PathBuf, index: usize) -> PathBuf {
+    crate::fs::aside_sibling(full, index)
+}
+
+/// Whether two paths are spelled alike — and so name one file. Spelled
+/// differently, they may still.
+#[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
+#[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r ==> fid(*a) == fid(*b)))]
+pub(crate) fn same_path(a: &PathBuf, b: &PathBuf) -> bool {
+    a == b
+}
+
+#[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
+#[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == *p))]
+pub(crate) fn copy_path(p: &PathBuf) -> PathBuf {
+    p.clone()
+}
+
+/// [`Storage::write`], then a barrier on the bytes while the name still
+/// resolves: the old bytes put back into the file there, keeping its mode,
+/// or into a new file. Through a link it would write the referent; nothing
+/// asks it to.
+#[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    with Tracked(tree): Tracked<&mut Tree>
+    ensures
+        only_at(*old(tree), *final(tree), fid(*full)),
+        r is Ok ==> {
+            &&& !has_dir(*old(tree), fid(*full))
+            &&& has_link(*old(tree), fid(*full)) ==> ent(*final(tree), fid(*full)) == ent(*old(tree), fid(*full))
+            &&& !has_link(*old(tree), fid(*full)) ==> has_file(*final(tree), fid(*full))
+                && final(tree)[fid(*full)]->File_bytes == bytes@
+                && (has_file(*old(tree), fid(*full)) ==> final(tree)[fid(*full)]->File_mode == old(tree)[fid(*full)]->File_mode)
+        },
+))]
+pub(crate) async fn write_back<FS: Storage>(fs: &FS, full: &PathBuf, bytes: &Vec<u8>) -> Result<()> {
+    fs.write(full, bytes).await?;
+    Ok(fs.sync(full, crate::fs::Durability::Ordered).await?)
+}
+
+/// [`Storage::remove_file`]: the entry goes; a directory is not removed.
+#[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    with Tracked(tree): Tracked<&mut Tree>
+    ensures
+        only_at(*old(tree), *final(tree), fid(*full)),
+        r is Ok ==> old(tree).contains_key(fid(*full)) && !has_dir(*old(tree), fid(*full))
+            && !final(tree).contains_key(fid(*full)),
+        r is Err ==> ent(*final(tree), fid(*full)) == ent(*old(tree), fid(*full)),
+))]
+pub(crate) async fn remove<FS: Storage>(fs: &FS, full: &PathBuf) -> Result<()> {
+    Ok(fs.remove_file(full).await?)
+}
+
+/// After a rollback: flush what it restored, then durably retire the journal.
+/// Nothing but the journal changes.
+#[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    with Tracked(tree): Tracked<&mut Tree>
+    ensures
+        forall|x: int| !scratch(x) ==> #[trigger] ent(*final(tree), x) == ent(*old(tree), x),
+))]
+pub(crate) async fn retire_after_abort<FS: Storage>(
+    fs: &FS,
+    dirs: BTreeSet<PathBuf>,
+    root: &Path,
+    journal: &Path,
+) -> Result<()> {
+    for dir in dirs {
+        fs.sync(&dir, crate::fs::Durability::Ordered).await?;
+    }
+    let jparent = crate::fs::parent_dir(journal);
+    if jparent != Some(root) {
+        fs.sync(root, crate::fs::Durability::Durable).await?;
+    }
+    fs.remove_file(journal).await?;
+    match jparent {
+        Some(dir) => Ok(fs.sync(dir, crate::fs::Durability::Durable).await?),
+        None => Ok(()),
+    }
+}
+
+/// The error for a path that holds a directory where an op needs a file.
+#[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
+pub(crate) fn not_a_directory(full: &PathBuf) -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::IsADirectory,
+        format!("{} is a directory", full.display()),
+    ))
+}
+
+/// The error for a removal with nothing to remove.
+#[cfg_attr(verus_keep_ghost, verus_verify(external_body))]
+pub(crate) fn nothing_to_remove(full: &PathBuf) -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("nothing to remove at {}", full.display()),
     ))
 }

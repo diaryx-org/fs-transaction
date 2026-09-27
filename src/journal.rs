@@ -436,7 +436,7 @@ impl Journal {
         for (index, op) in ops.iter().enumerate() {
             if let FileOp::Remove { path } | FileOp::Rename { to: path, .. } | FileOp::SetLink { path, .. } = op {
                 let aside = crate::fs::aside_sibling(&root.join(path), index);
-                if !crate::change::entry_exists(fs, &aside).await? {
+                if matches!(port::occupant(fs, &aside).await?, port::Occupant::Absent) {
                     continue;
                 }
                 fs.remove_file(&aside).await?;

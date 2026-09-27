@@ -101,6 +101,7 @@ use crate::error::{Error, Result};
 use crate::fs::Storage;
 use crate::journal::Journal;
 use crate::path::guard_in_root;
+use crate::port;
 
 #[cfg(verus_keep_ghost)]
 use vstd::prelude::*;
@@ -599,7 +600,8 @@ impl Journal {
             // error is the flush's, and the caller knows the op is at most
             // applied-but-uncertified.
             let mut touched = BTreeSet::new();
-            exec(fs, root, 0, &changes.ops[0], None, &mut touched).await?;
+            let mut unrecorded = Rollback::default();
+            exec(fs, root, 0, &changes.ops[0], false, &mut unrecorded, &mut touched).await?;
             return Ok(
                 crate::fs::flush_all(fs, touched, root, crate::fs::Durability::Durable).await?,
             );
@@ -628,7 +630,7 @@ impl Journal {
         let mut touched = BTreeSet::new();
         let mut cause: Option<Error> = None;
         for (index, op) in changes.ops.iter().enumerate() {
-            if let Err(e) = exec(fs, root, index, op, Some(&mut undo), &mut touched).await {
+            if let Err(e) = exec(fs, root, index, op, true, &mut undo, &mut touched).await {
                 cause = Some(e);
                 break;
             }
@@ -734,78 +736,53 @@ async fn unwind_durable<FS: Storage>(
     root: &Path,
     journal: &Path,
 ) -> Result<()> {
-    let mut first_error: Option<std::io::Error> = None;
+    let mut first_error: Option<Error> = None;
     let mut dirs: BTreeSet<PathBuf> = BTreeSet::new();
-    for step in undo.into_iter().rev() {
-        let result = match step {
-            Undo::Restore { path, bytes } => {
-                // The parent joins the debt even when a Restore born of an
-                // overwrite left it unchanged: the same variant reverses a
-                // `Remove`, whose reversal *re-creates* the entry, and an
-                // extra barrier on an unchanged directory costs less than
-                // telling the two origins apart.
-                if let Some(dir) = crate::fs::parent_dir(&path) {
-                    dirs.insert(dir.to_path_buf());
-                }
-                match fs.write(&path, &bytes).await {
-                    Ok(()) => fs.sync(&path, crate::fs::Durability::Ordered).await,
-                    e => e,
-                }
-            }
-            // Already absent is already undone — see `Undo::Delete`. Reporting it
-            // would raise `Error::Torn` over the single most ordinary rollback
-            // there is: a write to a new file that failed before creating it.
-            Undo::Delete { path } => {
-                if let Some(dir) = crate::fs::parent_dir(&path) {
-                    dirs.insert(dir.to_path_buf());
-                }
-                match fs.remove_file(&path).await {
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    other => other,
-                }
-            }
-            Undo::Rename { from, to } => {
-                for side in [&from, &to] {
-                    if let Some(dir) = crate::fs::parent_dir(side) {
-                        dirs.insert(dir.to_path_buf());
-                    }
-                }
-                fs.rename(&from, &to).await
-            }
-            Undo::SetExecutable { path, executable } => {
-                match fs.set_executable(&path, executable).await {
-                    // The inode, barriered while the name still resolves.
-                    Ok(()) => fs.sync(&path, crate::fs::Durability::Ordered).await,
-                    e => e,
-                }
-            }
-            Undo::Relink { path, target } => {
-                if let Some(dir) = crate::fs::parent_dir(&path) {
-                    dirs.insert(dir.to_path_buf());
-                }
-                fs.set_link(&path, &target).await
-            }
-        };
-        if let Err(e) = result
+    let mut i = undo.len();
+    while i > 0 {
+        i -= 1;
+        if let Err(e) = undo_step(fs, &undo[i], &mut dirs).await
             && first_error.is_none()
         {
             first_error = Some(e);
         }
     }
     if let Some(e) = first_error {
-        return Err(e.into());
+        return Err(e);
     }
-    for dir in dirs {
-        fs.sync(&dir, crate::fs::Durability::Ordered).await?;
-    }
-    let jparent = crate::fs::parent_dir(journal);
-    if jparent != Some(root) {
-        fs.sync(root, crate::fs::Durability::Durable).await?;
-    }
-    fs.remove_file(journal).await?;
-    match jparent {
-        Some(dir) => Ok(fs.sync(dir, crate::fs::Durability::Durable).await?),
-        None => Ok(()),
+    port::retire_after_abort(fs, dirs, root, journal).await
+}
+
+/// Reverse one recorded step, noting the directories it edited.
+async fn undo_step<FS: Storage>(fs: &FS, step: &Undo, dirs: &mut BTreeSet<PathBuf>) -> Result<()> {
+    match step {
+        Undo::Restore { path, bytes } => {
+            // The parent joins the debt even when a Restore born of an
+            // overwrite left it unchanged: an extra barrier on an unchanged
+            // directory costs less than telling origins apart.
+            port::note_parent(dirs, path);
+            port::write_back(fs, path, bytes).await
+        }
+        // Already absent is already undone — see `Undo::Delete`. Reporting it
+        // would raise `Error::Torn` over the single most ordinary rollback
+        // there is: a write to a new file that failed before creating it.
+        Undo::Delete { path } => {
+            port::note_parent(dirs, path);
+            port::remove_if_there(fs, path).await
+        }
+        Undo::Rename { from, to } => {
+            port::note_parent(dirs, from);
+            port::note_parent(dirs, to);
+            port::rename(fs, from, to).await
+        }
+        // The inode, barriered while the name still resolves.
+        Undo::SetExecutable { path, executable } => {
+            port::set_executable(fs, path, *executable).await
+        }
+        Undo::Relink { path, target } => {
+            port::note_parent(dirs, path);
+            port::set_link(fs, path, target).await
+        }
     }
 }
 
@@ -844,55 +821,19 @@ struct Rollback {
     asides: Vec<PathBuf>,
 }
 
-/// What is at a path, as far as putting it back is concerned.
-enum Occupant {
-    Absent,
-    Link(PathBuf),
-    Directory,
-    File,
-}
-
-/// Look at `full` without following a link that stands there.
-async fn occupant<FS: Storage>(fs: &FS, full: &Path) -> Result<Occupant> {
-    match fs.read_link(full).await {
-        Ok(Some(target)) => return Ok(Occupant::Link(target)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Occupant::Absent),
-        // Not a link, or a backend with none.
-        _ => {}
-    }
-    match fs.metadata(full).await {
-        Ok(md) if md.is_dir() => Ok(Occupant::Directory),
-        Ok(_) => Ok(Occupant::File),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Occupant::Absent),
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// Whether anything — a dangling link included — stands at `full`.
-pub(crate) async fn entry_exists<FS: Storage>(fs: &FS, full: &Path) -> Result<bool> {
-    Ok(!matches!(occupant(fs, full).await?, Occupant::Absent))
-}
-
-fn not_a_directory(full: &Path) -> Error {
-    Error::Io(std::io::Error::new(
-        std::io::ErrorKind::IsADirectory,
-        format!("{} is a directory", full.display()),
-    ))
-}
-
 /// Move whatever entry is at `full` to its aside sibling for op `index`, and
 /// record moving it back.
 async fn move_aside<FS: Storage>(
     fs: &FS,
-    full: &Path,
+    full: &PathBuf,
     index: usize,
     undo: &mut Rollback,
 ) -> Result<()> {
-    let aside = crate::fs::aside_sibling(full, index);
-    fs.rename(full, &aside).await?;
+    let aside = port::aside(full, index);
+    port::rename(fs, full, &aside).await?;
     undo.steps.push(Undo::Rename {
-        from: aside.clone(),
-        to: full.to_path_buf(),
+        from: port::copy_path(&aside),
+        to: port::copy_path(full),
     });
     undo.asides.push(aside);
     Ok(())
@@ -922,7 +863,7 @@ pub(crate) async fn retire_asides<FS: Storage>(
 ///
 /// `index` is the op's place in its set, which names its aside sibling.
 ///
-/// `undo` is `None` only for a set of one, which has no rollback to feed: see
+/// `record` is false only for a set of one, which has no rollback to feed: see
 /// the fast path in [`ChangeSet::apply`]. Recording is not merely unused there,
 /// it is worth skipping — for a write it costs a full read of the file about to
 /// be replaced.
@@ -939,19 +880,20 @@ async fn exec<FS: Storage>(
     root: &Path,
     index: usize,
     op: &FileOp,
-    mut undo: Option<&mut Rollback>,
+    record: bool,
+    undo: &mut Rollback,
     touched: &mut BTreeSet<PathBuf>,
 ) -> Result<()> {
     match op {
         FileOp::Write { path, bytes } => {
-            let full = root.join(path);
+            let full = port::join(root, path);
             // Record the undo *before* writing: a write that fails partway
             // (a full disk) leaves a truncated file, and restoring the old
             // bytes over it is exactly the repair.
-            if let Some(undo) = undo {
+            if record {
                 capture_replaced(fs, &full, &mut undo.steps).await?;
             }
-            ensure_parent(fs, &full, touched).await?;
+            port::ensure_parent(fs, &full, touched).await?;
             // Land the document through the atomic-replace protocol, so even a
             // crash mid-write cannot expose a half-written file. `replace`,
             // not `write_atomic`: the atomicity is per-file, but durability is
@@ -959,14 +901,13 @@ async fn exec<FS: Storage>(
             // replace atomically, the plainly-written bytes) joins the flush
             // debt the apply settles once, so ten writes into one directory
             // cost one drain rather than ten.
-            fs.replace(&full, bytes).await?;
-            settle_write_debt(fs, &full, touched).await?;
+            port::replace(fs, &full, bytes).await?;
+            port::settle_write(fs, &full, touched).await?;
         }
         FileOp::Rename { from, to } => {
-            let (from_full, to_full) = (root.join(from), root.join(to));
-            if let Some(undo) = undo.as_deref_mut()
-                && from_full != to_full
-            {
+            let from_full = port::join(root, from);
+            let to_full = port::join(root, to);
+            if record && !port::same_path(&from_full, &to_full) {
                 // The destination may be occupied, and the rename replaces
                 // the occupant — the port contract's load-bearing half. What
                 // it replaces is therefore part of "the tree as it was", and
@@ -974,27 +915,24 @@ async fn exec<FS: Storage>(
                 // Rename undo below, so the reversed unwind first moves the
                 // mover home and then moves the occupant back into the
                 // vacated name — the same file, its mode and all.
-                match occupant(fs, &to_full).await? {
-                    Occupant::Absent => {}
-                    Occupant::Directory => return Err(not_a_directory(&to_full)),
-                    Occupant::File | Occupant::Link(_) => {
+                match port::occupant(fs, &to_full).await? {
+                    port::Occupant::Absent => {}
+                    port::Occupant::Directory => return Err(port::not_a_directory(&to_full)),
+                    port::Occupant::File | port::Occupant::Link(_) => {
                         move_aside(fs, &to_full, index, undo).await?;
                     }
                 }
             }
-            ensure_parent(fs, &to_full, touched).await?;
-            fs.rename(&from_full, &to_full).await?;
+            port::ensure_parent(fs, &to_full, touched).await?;
+            port::rename(fs, &from_full, &to_full).await?;
             // Two directory entries changed — the name removed from one
             // parent, added to the other — and nothing has flushed either.
             // The rename's *atomicity* across a crash is the metadata
             // journal's own gift on every filesystem this crate targets; what
             // the flush buys is that it is not taken back wholesale.
-            for side in [&from_full, &to_full] {
-                if let Some(dir) = crate::fs::parent_dir(side) {
-                    touched.insert(dir.to_path_buf());
-                }
-            }
-            if let Some(undo) = undo {
+            port::note_parent(touched, &from_full);
+            port::note_parent(touched, &to_full);
+            if record {
                 undo.steps.push(Undo::Rename {
                     from: to_full,
                     to: from_full,
@@ -1002,100 +940,100 @@ async fn exec<FS: Storage>(
             }
         }
         FileOp::Remove { path } => {
-            let full = root.join(path);
+            let full = port::join(root, path);
             // The entry leaves its parent, and nothing else flushes that.
-            if let Some(dir) = crate::fs::parent_dir(&full) {
-                touched.insert(dir.to_path_buf());
-            }
-            match undo {
+            port::note_parent(touched, &full);
+            if record {
                 // Not removed yet: moved aside, so a rollback can move the
                 // very same entry back — a link as a link, a file with its
                 // mode — and a landed set removes it at the end. A dangling
                 // link moves on the same terms as any other.
-                Some(undo) => match occupant(fs, &full).await? {
-                    Occupant::Absent => {
-                        return Err(Error::Io(std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            format!("nothing to remove at {}", full.display()),
-                        )));
-                    }
-                    Occupant::Directory => return Err(not_a_directory(&full)),
-                    Occupant::File | Occupant::Link(_) => {
+                match port::occupant(fs, &full).await? {
+                    port::Occupant::Absent => return Err(port::nothing_to_remove(&full)),
+                    port::Occupant::Directory => return Err(port::not_a_directory(&full)),
+                    port::Occupant::File | port::Occupant::Link(_) => {
                         move_aside(fs, &full, index, undo).await?;
                     }
-                },
-                None => fs.remove_file(&full).await?,
+                }
+            } else {
+                port::remove(fs, &full).await?;
             }
         }
         // A `Write` whose bytes were left at the source. The read happens here, at
         // execution time, rather than when the op was staged — that is the whole
         // saving, and it is why the source has to be immutable.
         FileOp::CopyFrom { path, source } => {
-            let (full, source_full) = (root.join(path), root.join(source));
-            let bytes = fs.read(&source_full).await?;
-            if let Some(undo) = undo {
+            let full = port::join(root, path);
+            let source_full = port::join(root, source);
+            let bytes = port::read(fs, &source_full).await?;
+            if record {
                 capture_replaced(fs, &full, &mut undo.steps).await?;
             }
-            ensure_parent(fs, &full, touched).await?;
-            fs.replace(&full, &bytes).await?;
-            settle_write_debt(fs, &full, touched).await?;
+            port::ensure_parent(fs, &full, touched).await?;
+            port::replace(fs, &full, &bytes).await?;
+            port::settle_write(fs, &full, touched).await?;
         }
         FileOp::SetExecutable { path, executable } => {
-            let full = root.join(path);
-            guard_not_link(fs, &full).await?;
-            if let Some(undo) = undo {
+            let full = port::join(root, path);
+            // Mode writes follow links — `metadata` and `set_permissions`
+            // both do — so setting the bit "at" a link sets it on the link's
+            // *referent*, wherever that is. The root guard cannot see this:
+            // it is lexical, the link is not. So the op is refused on any
+            // link, loudly, before the undo capture reads a bit that is not
+            // the path's own.
+            if port::holds_link(fs, &full).await {
+                return Err(port::flip_through_link(&full));
+            }
+            if record {
                 // Captured through the read half, so the rollback restores
                 // what *was* — not the blind opposite of what was asked,
                 // which is wrong whenever the bit was already in the
                 // requested state. A backend that declines the question
                 // (`None`) has no bit to restore and the op below will no-op
                 // on it too, so nothing is recorded.
-                if let Some(was) = fs.executable(&full).await? {
+                if let Some(was) = port::executable(fs, &full).await? {
                     undo.steps.push(Undo::SetExecutable {
-                        path: full.clone(),
+                        path: port::copy_path(&full),
                         executable: was,
                     });
                 }
             }
-            fs.set_executable(&full, *executable).await?;
             // A mode is inode metadata, and the inode is barriered *now*,
             // while the name still resolves to it — a later op in this very
             // set may rename or remove the name, and a flush deferred to the
             // final pass would then be addressed to nothing and quietly
             // no-op. The parent joins the batched debt instead: a stable
             // name, and what keeps the final drain owed at all.
-            fs.sync(&full, crate::fs::Durability::Ordered).await?;
-            if let Some(dir) = crate::fs::parent_dir(&full) {
-                touched.insert(dir.to_path_buf());
-            }
+            port::set_executable(fs, &full, *executable).await?;
+            port::note_parent(touched, &full);
         }
         FileOp::SetLink { path, target } => {
-            let full = root.join(path);
-            if let Some(undo) = undo {
-                match occupant(fs, &full).await? {
+            let full = port::join(root, path);
+            if record {
+                match port::occupant(fs, &full).await? {
                     // The path held a link: point it back afterwards.
-                    Occupant::Link(old_target) => undo.steps.push(Undo::Relink {
-                        path: full.clone(),
+                    port::Occupant::Link(old_target) => undo.steps.push(Undo::Relink {
+                        path: port::copy_path(&full),
                         target: old_target,
                     }),
                     // Nothing there: the undo is removal, and `Delete`
                     // removes a link as readily as a file.
-                    Occupant::Absent => undo.steps.push(Undo::Delete { path: full.clone() }),
-                    Occupant::Directory => return Err(not_a_directory(&full)),
+                    port::Occupant::Absent => undo.steps.push(Undo::Delete {
+                        path: port::copy_path(&full),
+                    }),
+                    port::Occupant::Directory => return Err(port::not_a_directory(&full)),
                     // A regular file about to give way to a link: moved
                     // aside, and moved back over the link by a rollback —
                     // a rename replaces the link entry itself, where a plain
                     // write would land in its referent.
-                    Occupant::File => move_aside(fs, &full, index, undo).await?,
+                    port::Occupant::File => move_aside(fs, &full, index, undo).await?,
                 }
             }
-            ensure_parent(fs, &full, touched).await?;
-            fs.set_link(&full, target).await?;
+            port::ensure_parent(fs, &full, touched).await?;
+            port::set_link(fs, &full, target).await?;
             // The link is an entry (and its inode rides on the entry's
             // flush): the parent is the debt.
-            if let Some(dir) = crate::fs::parent_dir(&full) {
-                touched.insert(dir.to_path_buf());
-            }
+            port::note_parent(touched, &full);
         }
     }
     Ok(())
@@ -1121,30 +1059,6 @@ pub(crate) async fn settle_write_debt<FS: Storage>(
     Ok(())
 }
 
-/// Refuse a [`FileOp::SetExecutable`] whose path holds a symbolic link.
-///
-/// Mode reads and writes follow links — `metadata` and `set_permissions`
-/// both do — so setting the bit "at" a link sets it on the link's *referent*,
-/// wherever that is. The root guard cannot see this: it is lexical, the link
-/// is not, and a set that stages `set_link("l", "/outside/victim")` then
-/// `set_executable("l", true)` would chmod a file the tree does not own. The
-/// same applies to a link the set never made. So the op is refused on any
-/// link, loudly, before the undo capture reads a bit that is not the path's
-/// own. Shared by the apply and the journal replay, which faces the same
-/// combination from bytes it did not author.
-pub(crate) async fn guard_not_link<FS: Storage>(fs: &FS, full: &Path) -> Result<()> {
-    if let Ok(Some(_)) = fs.read_link(full).await {
-        return Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "refusing to set the execute bit through the symbolic link at {}",
-                full.display()
-            ),
-        )));
-    }
-    Ok(())
-}
-
 /// Record how to put back whatever a replacing write (`Write`, `CopyFrom`) is
 /// about to displace at `full`.
 ///
@@ -1152,35 +1066,26 @@ pub(crate) async fn guard_not_link<FS: Storage>(fs: &FS, full: &Path) -> Result<
 /// by bytes alone and a path holding a link rolls back to a *regular file*
 /// holding a copy of its target — the link gone, shared content duplicated,
 /// and "the tree is as it was" quietly false. So: a link is put back as a link
-/// ([`Undo::Relink`] — `write_atomic` will have replaced the entry itself,
+/// ([`Undo::Relink`] — the replacement will have replaced the entry itself,
 /// and `set_link` restores it the same way); nothing is put back by deletion;
 /// and only a path holding an actual file is captured as bytes.
-async fn capture_replaced<FS: Storage>(fs: &FS, full: &Path, undo: &mut Vec<Undo>) -> Result<()> {
-    match fs.read_link(full).await {
-        Ok(Some(target)) => undo.push(Undo::Relink {
-            path: full.to_path_buf(),
+async fn capture_replaced<FS: Storage>(fs: &FS, full: &PathBuf, undo: &mut Vec<Undo>) -> Result<()> {
+    match port::occupant(fs, full).await? {
+        port::Occupant::Link(target) => undo.push(Undo::Relink {
+            path: port::copy_path(full),
             target,
         }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            undo.push(Undo::Delete {
-                path: full.to_path_buf(),
+        port::Occupant::Absent => undo.push(Undo::Delete {
+            path: port::copy_path(full),
+        }),
+        port::Occupant::Directory => return Err(port::not_a_directory(full)),
+        port::Occupant::File => {
+            let bytes = port::read(fs, full).await?;
+            undo.push(Undo::Restore {
+                path: port::copy_path(full),
+                bytes,
             });
         }
-        // `Ok(None)` — a backend with no links, where nothing can be one —
-        // and any other error — the path holds something that is not a link —
-        // both fall through to capturing bytes.
-        _ => match fs.read(full).await {
-            Ok(old) => undo.push(Undo::Restore {
-                path: full.to_path_buf(),
-                bytes: old,
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                undo.push(Undo::Delete {
-                    path: full.to_path_buf(),
-                });
-            }
-            Err(e) => return Err(e.into()),
-        },
     }
     Ok(())
 }
@@ -1270,26 +1175,6 @@ async fn check_expected<FS: Storage>(
     Ok(())
 }
 
-/// Create `full`'s parent directory if it is missing. Unconditional (rather than
-/// staged as its own op) because a directory is not part of the document graph:
-/// it is an artifact of *where* a write lands, so it belongs to the write.
-///
-/// Every directory the making mints joins `touched`: each is an entry of its
-/// own, persisting separately from the file that prompted it, and a
-/// durably-flushed file inside a chain of unflushed names is a file a power
-/// cut can orphan.
-async fn ensure_parent<FS: Storage>(
-    fs: &FS,
-    full: &Path,
-    touched: &mut BTreeSet<PathBuf>,
-) -> Result<()> {
-    if let Some(dir) = crate::fs::parent_dir(full) {
-        for made in crate::fs::create_dir_all_traced(fs, dir).await? {
-            touched.insert(made);
-        }
-    }
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
