@@ -8,6 +8,8 @@ release_branch = "main"
 # What to run before cutting. Each repo owns its own CI; this names it.
 verify = "cargo xtask ci"
 
-# No `tag_starts`: nothing runs on the tag. The upload to crates.io is a
-# `cargo publish` somebody runs deliberately, so the warning before the push
-# says exactly that.
+# What pushing the tag sets off. The warning printed before the push is handed
+# back to you is composed from this.
+[[tag_starts]]
+workflow = "publish.yml"
+does = "uploads fs-transaction to crates.io"

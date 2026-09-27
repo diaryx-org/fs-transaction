@@ -1,0 +1,48 @@
+name: Publish
+# Publish fs-transaction to crates.io on a version tag — the registry half of a
+# release. `dx release <spec> --push` cuts the tag, and this runs on it.
+#
+# `cargo publish --workspace` reads what goes up off the manifests: `xtask` is
+# `publish = false` and is skipped, so today that is the one crate, and a crate
+# added to the workspace later is published by the next tag with no edit here.
+#
+# A re-run of a tag that already published fails at the upload: crates.io never
+# takes one version twice. `workflow_dispatch` is for finishing a run that died
+# before the upload, from a checkout of the tag.
+#
+# Auth is the `CARGO_REGISTRY_TOKEN` secret, as in prov, fig, twig, and moid —
+# one token with `publish-update` for fs-transaction. Rotating it is a
+# repo-settings edit (`gh secret set CARGO_REGISTRY_TOKEN`), and nothing here
+# changes.
+on:
+  push: { tags: [v*.*.*] }
+  workflow_dispatch: null
+permissions:
+  contents: read
+jobs:
+  crates-io:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: Swatinem/rust-cache@v2
+
+    # On a tag, the tag must name the version being published — refuse a
+    # mismatch rather than publish a surprise. (workflow_dispatch has no tag, so
+    # the guard is skipped there.)
+    - name: Check the tag against the crate's version
+      if: github.ref_type == 'tag'
+      run: |
+        version=$(cargo metadata --no-deps --format-version 1 \
+          | jq -r '.packages[] | select(.name == "fs-transaction") | .version')
+        echo "Crate version: $version"
+        if [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+          echo "::error::tag ${GITHUB_REF_NAME} does not match crate version ${version}"
+          exit 1
+        fi
+
+    - name: Publish every publishable crate
+      env:
+        CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      run: cargo publish --workspace
