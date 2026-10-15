@@ -1,6 +1,6 @@
 name: Publish
 # Publish fs-transaction to crates.io on a version tag — the registry half of a
-# release. `release <spec> --push` cuts the tag, and this runs on it.
+# release. `ship <spec> --push` cuts the tag, and this runs on it.
 #
 # `cargo publish --workspace` reads what goes up off the manifests: `xtask` is
 # `publish = false` and is skipped, so today that is the one crate, and a crate

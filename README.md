@@ -178,7 +178,8 @@ cargo xtask proofs
 It fetches the pinned Verus release once, into `~/.cache/verus`,
 and installs the Rust toolchain that release was built against.
 To use a Verus you already have, set `VERUS` to its `verus`.
-`cargo xtask ci` runs every CI job, in the order CI does.
+`ship ci` runs every CI job, in the order CI does;
+the jobs are the `job` list in `.config/ship.figl`.
 
 ## License
 

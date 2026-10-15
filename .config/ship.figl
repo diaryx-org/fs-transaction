@@ -1,0 +1,91 @@
+# What ship needs to know about fs-transaction: its release, and its CI.
+# Everything not stated here is ship's default — the manifest, the changelog
+# path, the cliff config, and that this is a Cargo workspace.
+name = fs-transaction
+url = https://github.com/diaryx-org/fs-transaction
+release_branch = main
+
+# No `verify`: before cutting, a release runs the jobs below.
+
+# What pushing the tag sets off. The warning printed before the push is handed
+# back to you is composed from this.
+tag_starts
+> *
+> > workflow = publish.yml
+> > does = uploads fs-transaction to crates.io
+
+# CI. `.github/workflows/ci.yml` asks `ship ci --matrix` for these and runs one
+# per runner, as `ship ci <id>`; `ship ci` runs them all here, in this order,
+# with the same shell, and stops at the first that fails. Changing CI is an edit
+# here and nowhere else.
+#
+# A job is `id` (what `ship ci <id>` takes), `name` (the check GitHub shows as
+# `CI / <name>` — renaming it renames the required status check) and `run` (run
+# by `bash -eo pipefail -c` at the repository root). `runner` is the workflow's:
+# `runs-on` is the machine it asks for (Ubuntu when left out), `components` are
+# the rustup components it installs, and `builds = false` skips restoring the
+# cargo cache. Cheapest and most likely to fail first.
+job
+> *
+> > id = fmt
+> > name = Format
+> > run = cargo fmt --all --check
+> > runner
+> > > components = rustfmt
+> > > builds = false
+> *
+> > # Warnings are errors in CI, so they are errors here too — a lint that only
+> > # fires on the runner is a lint found too late.
+> > id = clippy
+> > name = Clippy
+> > run = cargo clippy --workspace --all-targets --all-features -- -D warnings
+> > runner
+> > > components = clippy
+> *
+> > # rustdoc, held to the same standard as the compiler: a link to an item that
+> > # was renamed still compiles, and renders as plain text on docs.rs.
+> > id = doc
+> > name = Doc
+> > run = RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps
+> *
+> > id = test
+> > name = Test
+> > run = cargo test --workspace
+> *
+> > # `barrier-fsync` answers an ordered sync with `F_BARRIERFSYNC`, and the code
+> > # that does is compiled on Apple platforms alone. Anywhere else the feature
+> > # builds nothing, so `clippy` and `test` cannot see it; this job asks for a
+> > # Mac. Run locally off a Mac it checks nothing the others do not.
+> > id = apple
+> > name = Apple
+> > run = '''
+cargo clippy --all-targets --features barrier-fsync -- -D warnings
+cargo test --features barrier-fsync
+'''
+> > runner
+> > > runs-on = macos-latest
+> > > components = clippy
+> *
+> > # A build, not a test run: MSRV is a promise about who can compile
+> > # fs-transaction, and the test tooling need not hold to it. The version is
+> > # read from `rust-version` in Cargo.toml, so the pin follows the declared
+> > # floor. `rustup run` rather than `cargo +<version>`, which only rustup's
+> > # proxy knows.
+> > id = msrv
+> > name = MSRV
+> > run = '''
+version=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+test -n "$version" || { echo "no rust-version in Cargo.toml" >&2; exit 1; }
+echo "MSRV from Cargo.toml: $version"
+rustup toolchain install "$version" --profile minimal --no-self-update
+rustup run "$version" cargo build --package fs-transaction --all-features
+'''
+> *
+> > # Verus over the library, fetching the pinned release once. Real work, so
+> > # it stays a program: xtask/src/proofs.rs. It builds into a target directory
+> > # of its own, so the cargo cache is not worth restoring.
+> > id = proofs
+> > name = Proofs
+> > run = cargo xtask proofs
+> > runner
+> > > builds = false

@@ -75,8 +75,8 @@ pub(crate) fn proofs(sh: &Sh) -> Result<()> {
             ("CARGO_TARGET_DIR", &target.to_string_lossy()),
         ],
         "rustup",
-        // `rustup run`, for `msrv`'s reason: `cargo +toolchain` is a proxy
-        // feature, and $CARGO may point past the proxy.
+        // `rustup run`, not `cargo +toolchain`: the shorthand is a
+        // rustup-proxy feature, and $CARGO may point past the proxy.
         &[
             "run",
             &toolchain,
