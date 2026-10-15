@@ -66,7 +66,7 @@ argues the shape this crate should offer and defers to this task for it.
 Both enums are exhaustive and public. A `match` on either in a consumer
 breaks; so does a backend that implements `sync` by matching `need`. That is
 a version somebody names, and it is why this is a task rather than a commit:
-`dx deps fs-transaction --all` says who feels it, and the answer today is
+`org deps fs-transaction --all` says who feels it, and the answer today is
 historica and diaryx through it.
 
 The crash state changes too, and the docs must say so: with a barrier per

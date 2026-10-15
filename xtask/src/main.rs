@@ -9,7 +9,7 @@
 //! Locally, `cargo xtask ci` runs the same jobs in the same order against the
 //! same commands, so a green run here is a green run there.
 //!
-//! Cutting a release does not live here. It is `dx <command>`, the shared
+//! Cutting a release does not live here. It is `release`, the shared
 //! tooling configured by `.config/release.toml`.
 //!
 //! There are no dependencies on purpose. Every CI job builds this crate before
