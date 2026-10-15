@@ -60,6 +60,8 @@ jobs:
     # No components when the runner table names none, and the cache restored
     # unless the job says `builds = false`.
     - uses: Swatinem/rust-cache@v2
-      if: matrix.job.builds != false
+      # A missing `builds` is null, and GitHub compares loosely, so `null != false`
+      # is false: the test is for null itself.
+      if: matrix.job.builds == null || matrix.job.builds
     - run: cargo install --locked --git https://github.com/diaryx-org/ship ship
     - run: ship ci ${{ matrix.job.id }}
