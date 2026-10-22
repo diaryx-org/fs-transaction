@@ -92,7 +92,22 @@ impl Refusal {
 pub(crate) fn check(ops: &[FileOp]) -> Result<(), (usize, Refusal)> {
     let mut names = BTreeMap::new();
     let shapes: Vec<Shape> = ops.iter().map(|op| shape(op, &mut names)).collect();
-    first_refusal(&shapes)
+    first_refusal(&shapes, &order(&shapes))
+}
+
+/// Every path `ops` name, as an entry — `2 * i` for op `i`'s `path`, `2 * i +
+/// 1` for its `other` — sorted by key. Only a hint: [`first_refusal`] checks
+/// it before it relies on it.
+fn order(ops: &[Shape]) -> Vec<usize> {
+    let mut order = Vec::with_capacity(2 * ops.len());
+    for (i, op) in ops.iter().enumerate() {
+        order.push(2 * i);
+        if two(op.act) {
+            order.push(2 * i + 1);
+        }
+    }
+    order.sort_by(|&a, &b| entry_key(ops, a).cmp(entry_key(ops, b)));
+    order
 }
 
 /// A path as the rule compares it: its normalized components, each lowered
@@ -147,13 +162,310 @@ pub(crate) struct Shape {
     pub(crate) other: Vec<usize>,
 }
 
-/// The first op that breaks the rule, or none.
+/// The first op that breaks the rule, or none: for the lowest `i` with a pair
+/// `(i, k)` refused, the refusal at the lowest such `k`.
+///
+/// A pair can only be refused where a path one op names is a path the other
+/// names, or lies inside it, so of every pair of ops this compares only those:
+/// each entry in `order` with the ones after it that its key is a prefix of,
+/// which in key order follow it without a gap. That costs a sort of the paths
+/// and the pairs that meet, rather than every pair. Should `order` not be
+/// what [`order`] makes, it compares every pair.
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(r =>
     ensures
         r is Ok <==> proof::admissible(proof::views(ops@)),
 ))]
-fn first_refusal(ops: &[Shape]) -> Result<(), (usize, Refusal)> {
+fn first_refusal(ops: &[Shape], order: &[usize]) -> Result<(), (usize, Refusal)> {
+    // `_pos`, and `_q` below, are read only by the proof.
+    let _pos = match place(ops, order) {
+        Some(pos) => pos,
+        None => return first_refusal_pairwise(ops),
+    };
+    let mut best: Option<(usize, usize, Refusal)> = None;
+    // Each op against itself.
+    let mut i: usize = 0;
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        invariant
+            i <= ops@.len(),
+            proof::found(proof::views(ops@), best),
+            forall|x: int| 0 <= x < i ==>
+                #[trigger] proof::covered(proof::views(ops@), best, x, x),
+        decreases ops@.len() - i,
+    ))]
+    while i < ops.len() {
+        best = least(best, ops, i, i);
+        i += 1;
+    }
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        reveal(proof::selfs);
+        reveal(proof::swept);
+    }
+    // Each entry against the ones after it inside its key.
+    let mut p: usize = 0;
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        invariant
+            p <= order@.len(),
+            proof::placed(proof::views(ops@), order@, _pos@),
+            proof::found(proof::views(ops@), best),
+            proof::selfs(proof::views(ops@), best),
+            proof::swept(proof::views(ops@), order@, best, p as int),
+        decreases order@.len() - p,
+    ))]
+    while p < order.len() {
+        let (next, _q) = scan(ops, order, p, best);
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            proof::lemma_swept_one_more(proof::views(ops@), order@, _pos@, best, next, p as int, _q as int);
+        }
+        best = next;
+        p += 1;
+    }
+    #[cfg(verus_keep_ghost)]
+    proof! { proof::lemma_swept(proof::views(ops@), order@, _pos@, best); }
+    match best {
+        None => Ok(()),
+        Some((i, _, refusal)) => Err((i, refusal)),
+    }
+}
+
+/// [`least`] over the entry at `p` in `order` and each one after it that its
+/// key is a prefix of, up to the first `q` that it is not.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    requires
+        p < order@.len(),
+        forall|x: int| 0 <= x < order@.len() ==> proof::valid(proof::views(ops@), #[trigger] order@[x] as int),
+        proof::found(proof::views(ops@), best),
+    ensures
+        p < r.1 <= order@.len(),
+        proof::found(proof::views(ops@), r.0),
+        proof::grows(proof::views(ops@), best, r.0),
+        forall|t: int| p < t < r.1 ==>
+            #[trigger] proof::scanned(proof::views(ops@), order@, r.0, p as int, t),
+        r.1 < order@.len() ==> !proof::prefix(
+            proof::key(proof::views(ops@), order@[p as int] as int),
+            proof::key(proof::views(ops@), order@[r.1 as int] as int),
+        ),
+))]
+fn scan(
+    ops: &[Shape],
+    order: &[usize],
+    p: usize,
+    best: Option<(usize, usize, Refusal)>,
+) -> (Option<(usize, usize, Refusal)>, usize) {
+    let a = order[p];
+    let mut least_yet = best;
+    let mut q = p + 1;
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        invariant
+            p < q <= order@.len(),
+            a == order@[p as int],
+            forall|x: int| 0 <= x < order@.len() ==> proof::valid(proof::views(ops@), #[trigger] order@[x] as int),
+            proof::found(proof::views(ops@), least_yet),
+            proof::grows(proof::views(ops@), best, least_yet),
+            forall|t: int| p < t < q ==>
+                #[trigger] proof::scanned(proof::views(ops@), order@, least_yet, p as int, t),
+        decreases order@.len() - q,
+    ))]
+    loop {
+        if q >= order.len() || !prefix(entry_key(ops, a), entry_key(ops, order[q])) {
+            return (least_yet, q);
+        }
+        let b = order[q];
+        let mut next = least(least_yet, ops, a / 2, b / 2);
+        next = least(next, ops, b / 2, a / 2);
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert forall|t: int| p < t < q + 1 implies
+                #[trigger] proof::scanned(proof::views(ops@), order@, next, p as int, t) by {
+                if t < q {
+                    assert(proof::scanned(proof::views(ops@), order@, least_yet, p as int, t));
+                    assert(proof::covered(proof::views(ops@), next, order@[p as int] as int / 2, order@[t] as int / 2));
+                    assert(proof::covered(proof::views(ops@), next, order@[t] as int / 2, order@[p as int] as int / 2));
+                }
+            }
+        }
+        least_yet = next;
+        q += 1;
+    }
+}
+
+/// `best`, or the refusal of the pair `(i, k)` if there is one and it comes
+/// before `best`'s.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    requires
+        i < ops@.len(),
+        k < ops@.len(),
+        proof::found(proof::views(ops@), best),
+    ensures
+        proof::found(proof::views(ops@), r),
+        proof::covered(proof::views(ops@), r, i as int, k as int),
+        forall|x: int, y: int| #[trigger] proof::covered(proof::views(ops@), r, x, y) <==
+            proof::covered(proof::views(ops@), best, x, y),
+))]
+fn least(
+    best: Option<(usize, usize, Refusal)>,
+    ops: &[Shape],
+    i: usize,
+    k: usize,
+) -> Option<(usize, usize, Refusal)> {
+    match pair(ops, i, k) {
+        None => best,
+        Some(refusal) => match best {
+            Some((bi, bk, _)) if bi < i || (bi == i && bk <= k) => best,
+            _ => Some((i, k, refusal)),
+        },
+    }
+}
+
+/// Check that `order` lists every entry of `ops`, each in key order after the
+/// last, and find each one in it.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    ensures
+        r matches Some(pos) ==> proof::placed(proof::views(ops@), order@, pos@),
+))]
+fn place(ops: &[Shape], order: &[usize]) -> Option<Vec<usize>> {
+    if ops.len() > usize::MAX / 2 {
+        return None;
+    }
+    let entries = 2 * ops.len();
+    let mut pos: Vec<usize> = Vec::new();
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        invariant
+            entries == 2 * ops@.len(),
+            pos@.len() <= entries,
+            forall|c: int| 0 <= c < pos@.len() ==> #[trigger] pos@[c] == usize::MAX,
+        decreases entries - pos@.len(),
+    ))]
+    while pos.len() < entries {
+        pos.push(usize::MAX);
+    }
+    let mut p: usize = 0;
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        invariant
+            entries == 2 * ops@.len(),
+            pos@.len() == entries,
+            p <= order@.len(),
+            forall|x: int| 0 <= x < p ==> proof::valid(proof::views(ops@), #[trigger] order@[x] as int),
+            forall|x: int| 0 <= x && x + 1 < p ==> proof::lex_le(
+                proof::key(proof::views(ops@), #[trigger] order@[x] as int),
+                proof::key(proof::views(ops@), order@[x + 1] as int),
+            ),
+            forall|c: int| 0 <= c < entries && #[trigger] pos@[c] != usize::MAX ==>
+                pos@[c] < p && order@[pos@[c] as int] == c,
+        decreases order@.len() - p,
+    ))]
+    while p < order.len() {
+        let c = order[p];
+        if !valid_entry(ops, c) {
+            return None;
+        }
+        if p > 0 && !lex_le(entry_key(ops, order[p - 1]), entry_key(ops, c)) {
+            return None;
+        }
+        pos[c] = p;
+        p += 1;
+    }
+    let mut c: usize = 0;
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        invariant
+            entries == 2 * ops@.len(),
+            pos@.len() == entries,
+            c <= entries,
+            forall|x: int| 0 <= x < order@.len() ==> proof::valid(proof::views(ops@), #[trigger] order@[x] as int),
+            forall|x: int| 0 <= x && x + 1 < order@.len() ==> proof::lex_le(
+                proof::key(proof::views(ops@), #[trigger] order@[x] as int),
+                proof::key(proof::views(ops@), order@[x + 1] as int),
+            ),
+            forall|x: int| 0 <= x < entries && #[trigger] pos@[x] != usize::MAX ==>
+                pos@[x] < order@.len() && order@[pos@[x] as int] == x,
+            forall|x: int| 0 <= x < c && #[trigger] proof::valid(proof::views(ops@), x) ==>
+                pos@[x] != usize::MAX,
+        decreases entries - c,
+    ))]
+    while c < entries {
+        if valid_entry(ops, c) && pos[c] == usize::MAX {
+            return None;
+        }
+        c += 1;
+    }
+    Some(pos)
+}
+
+/// Whether `c` is an entry of `ops`.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == proof::valid(proof::views(ops@), c as int)))]
+// `% 2`, because Verus has no specification for `is_multiple_of`.
+#[allow(clippy::manual_is_multiple_of)]
+fn valid_entry(ops: &[Shape], c: usize) -> bool {
+    c / 2 < ops.len() && (c % 2 == 0 || two(ops[c / 2].act))
+}
+
+/// The key of entry `c`.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    requires
+        c / 2 < ops@.len(),
+    ensures
+        r@ == proof::key(proof::views(ops@), c as int),
+))]
+// `% 2`, because Verus has no specification for `is_multiple_of`.
+#[allow(clippy::manual_is_multiple_of)]
+fn entry_key(ops: &[Shape], c: usize) -> &Vec<usize> {
+    if c % 2 == 0 {
+        &ops[c / 2].path
+    } else {
+        &ops[c / 2].other
+    }
+}
+
+/// Whether `a` comes no later than `b`, in the order of `Vec<usize>`'s `Ord`.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == proof::lex_le(a@, b@)))]
+fn lex_le(a: &[usize], b: &[usize]) -> bool {
+    let mut j: usize = 0;
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        invariant
+            j <= a@.len(),
+            j <= b@.len(),
+            proof::lex_le(a@, b@) == proof::lex_le_from(a@, b@, j as int),
+        decreases a@.len() - j,
+    ))]
+    while j < a.len() {
+        if j >= b.len() {
+            return false;
+        }
+        if a[j] != b[j] {
+            return a[j] < b[j];
+        }
+        j += 1;
+    }
+    true
+}
+
+/// Whether `a` is `b`, or `b` lies inside it.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == proof::prefix(a@, b@)))]
+fn prefix(a: &[usize], b: &[usize]) -> bool {
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        assert(a@.take(a@.len() as int) =~= a@);
+        assert(b@.take(b@.len() as int) =~= b@);
+    }
+    same(a, b) || strictly_under(a, b)
+}
+
+/// [`first_refusal`] by comparing every op with every other.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    ensures
+        r is Ok <==> proof::admissible(proof::views(ops@)),
+))]
+fn first_refusal_pairwise(ops: &[Shape]) -> Result<(), (usize, Refusal)> {
     let mut i: usize = 0;
     #[cfg_attr(verus_keep_ghost, verus_spec(
         invariant
@@ -497,6 +809,109 @@ mod tests {
                 c.write("dir/a", "x");
             }),
             Some(Refusal::Nested)
+        );
+    }
+
+    #[test]
+    fn the_refusal_reported_is_the_first() {
+        // Op 0 is refused by op 1 and, for another reason, by op 2, which sorts
+        // beside it; op 1 is refused by nothing earlier. The lowest op wins,
+        // then the lowest op it is refused by.
+        let mut set = crate::ChangeSet::new();
+        set.rename("a", "b").remove("b").write("a", "x");
+        assert_eq!(check(set.ops()), Err((0, Refusal::RenamedFileChangedAfter)));
+        let mut set = crate::ChangeSet::new();
+        set.rename("a", "tmp")
+            .write("dir/x", "x")
+            .rename("b", "a")
+            .rename("tmp", "b")
+            .rename("dir", "d");
+        assert_eq!(check(set.ops()), Err((0, Refusal::RenameSourceUsedAfter)));
+    }
+
+    /// Shapes for `set`, as [`check`] makes them.
+    fn shapes(set: &crate::ChangeSet) -> Vec<Shape> {
+        let mut names = BTreeMap::new();
+        set.ops().iter().map(|op| shape(op, &mut names)).collect()
+    }
+
+    #[test]
+    fn sweeping_finds_what_comparing_every_pair_finds() {
+        // Sets of up to eight ops over a few paths, some inside others and
+        // some two spellings of one, so most sets have pairs that meet.
+        const PATHS: &[&str] = &["a", "A", "a/b", "a/b/c", "b", "./b/../a", "c", "c/d"];
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let mut refused = 0;
+        for _ in 0..20_000 {
+            let mut set = crate::ChangeSet::new();
+            for _ in 0..1 + next(8) {
+                let (p, q) = (PATHS[next(PATHS.len())], PATHS[next(PATHS.len())]);
+                match next(6) {
+                    0 => set.write(p, "x"),
+                    1 => set.copy_from(p, q),
+                    2 => set.remove(p),
+                    3 => set.rename(p, q),
+                    4 => set.set_executable(p, true),
+                    _ => set.set_link(p, q),
+                };
+            }
+            let shapes = shapes(&set);
+            let pairwise = first_refusal_pairwise(&shapes);
+            refused += usize::from(pairwise.is_err());
+            assert_eq!(
+                first_refusal(&shapes, &order(&shapes)),
+                pairwise,
+                "{:?}",
+                set.ops()
+            );
+        }
+        // Both answers are exercised.
+        assert!(
+            (1_000..19_000).contains(&refused),
+            "{refused} of 20,000 refused"
+        );
+    }
+
+    #[test]
+    fn an_order_that_is_not_one_compares_every_pair() {
+        let mut set = crate::ChangeSet::new();
+        set.rename("a", "tmp").rename("b", "a").rename("tmp", "b");
+        let shapes = shapes(&set);
+        let expected = Err((0, Refusal::RenameSourceUsedAfter));
+        let sorted = order(&shapes);
+        let mut reversed = sorted.clone();
+        reversed.reverse();
+        // Unsorted, missing an entry, or naming one there is not.
+        for bad in [
+            reversed,
+            sorted[1..].to_vec(),
+            [sorted.clone(), vec![99]].concat(),
+        ] {
+            assert_eq!(first_refusal(&shapes, &bad), expected);
+        }
+    }
+
+    #[test]
+    fn ops_on_unrelated_paths_are_not_compared() {
+        // 20,000 ops, no two naming one path or one inside another: 400
+        // million pairs for a check that compares every op with every other,
+        // which a debug build takes many seconds over.
+        let mut set = crate::ChangeSet::new();
+        for n in 0..20_000 {
+            set.write(format!("dir{}/file{n}.md", n % 100), "x");
+        }
+        let start = std::time::Instant::now();
+        assert_eq!(check(set.ops()), Ok(()));
+        let took = start.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(1),
+            "checking 20,000 unrelated ops took {took:?}"
         );
     }
 

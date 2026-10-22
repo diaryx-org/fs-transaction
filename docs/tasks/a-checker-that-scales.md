@@ -1,13 +1,29 @@
 ---
 title: A replay checker that scales with a set's size
 description: The rule `Journal::apply` checks before its commit point compares every op with every other; group ops by path so only related pairs are compared, and keep the proof
-status: open
+status: done
 created: 2026-09-27
-updated: 2026-09-27
+updated: 2026-10-22
 part_of: "[Tasks](tasks.md)"
 ---
 
 # A replay checker that scales with a set's size
+
+**Status.** Done, by `perf(replayable): compare only the ops whose paths
+meet`. `check` sorts every path the set names and hands the order to
+`first_refusal`, which checks it (falling back to every pair if it is not an
+order of the set's paths) and compares each path only with the ones after it
+that lie inside it or equal it. The proof is in `replayable/proof.rs`
+(`lemma_unrelated`, `lemma_swept`) with the same `ensures`, and nothing new is
+trusted. `sweeping_finds_what_comparing_every_pair_finds` holds the reported
+refusal to the old checker's, kept as `first_refusal_pairwise`, over 20,000
+generated sets.
+
+Measured on hbox (an i5-8279U, release build), each op writing a 1 KB file in
+a nested directory: for 10,000 ops the sort and the sweep take about 1 ms,
+against 396 ms comparing every pair; for 100,000, about 30 ms. Building the
+path keys (normalizing, lowering and interning each path), which was already
+linear, is now the larger cost: about 11 ms for 10,000 ops on that machine.
 
 Before a set of more than one op is journaled, `replayable::check` decides
 whether a crash in it could be recovered from. `first_refusal` does that by

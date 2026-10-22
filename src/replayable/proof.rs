@@ -127,6 +127,419 @@ pub(crate) open spec fn admissible(ops: Seq<SOp>) -> bool {
         0 <= i < ops.len() && 0 <= k < ops.len() ==> (#[trigger] pair_refusal(ops, i, k)) is None
 }
 
+// ---- comparing only the pairs that meet ----
+//
+// Two ops refuse one another only where a path one names is a path the other
+// names, or lies inside it. So the checker sorts every path the set names —
+// each an *entry*, `2 * i` for op `i`'s `path` and `2 * i + 1` for its
+// `other` — and compares an entry only with the ones after it that its key is
+// a prefix of. In lexicographic order those follow it without a gap.
+
+/// `c` names a path op `c / 2` names.
+pub(crate) open spec fn valid(ops: Seq<SOp>, c: int) -> bool {
+    0 <= c && c / 2 < ops.len() && (c % 2 == 0 || two(ops[c / 2].act))
+}
+
+/// The key of entry `c`.
+pub(crate) open spec fn key(ops: Seq<SOp>, c: int) -> Seq<usize> {
+    if c % 2 == 0 {
+        ops[c / 2].path
+    } else {
+        ops[c / 2].other
+    }
+}
+
+/// `a` is `b`, or `b` lies inside it.
+pub(crate) open spec fn prefix(a: Seq<usize>, b: Seq<usize>) -> bool {
+    a.len() <= b.len() && b.take(a.len() as int) == a
+}
+
+pub(crate) open spec fn related(a: Seq<usize>, b: Seq<usize>) -> bool {
+    prefix(a, b) || prefix(b, a)
+}
+
+/// Lexicographic order from position `j` on, the order of `Vec<usize>`'s `Ord`.
+pub(crate) open spec fn lex_le_from(a: Seq<usize>, b: Seq<usize>, j: int) -> bool
+    decreases a.len() - j,
+{
+    if j < 0 || j >= a.len() {
+        true
+    } else if j >= b.len() {
+        false
+    } else if a[j] != b[j] {
+        a[j] < b[j]
+    } else {
+        lex_le_from(a, b, j + 1)
+    }
+}
+
+pub(crate) open spec fn lex_le(a: Seq<usize>, b: Seq<usize>) -> bool {
+    lex_le_from(a, b, 0)
+}
+
+/// `order` lists entries of `ops` in key order, and `pos` finds each one in it.
+pub(crate) open spec fn placed(ops: Seq<SOp>, order: Seq<usize>, pos: Seq<usize>) -> bool {
+    &&& forall|p: int| 0 <= p < order.len() ==> valid(ops, #[trigger] order[p] as int)
+    &&& forall|p: int|
+        0 <= p && p + 1 < order.len() ==> lex_le(
+            key(ops, #[trigger] order[p] as int),
+            key(ops, order[p + 1] as int),
+        )
+    &&& forall|c: int|
+        #![trigger valid(ops, c)]
+        valid(ops, c) ==> c < pos.len() && pos[c] < order.len() && order[pos[c] as int] == c
+}
+
+/// Whether `(i, k)` comes no later than `(x, y)`, pairs ordered by first op, then second.
+pub(crate) open spec fn before(i: int, k: int, x: int, y: int) -> bool {
+    i < x || (i == x && k <= y)
+}
+
+/// The pair `(x, y)` is no refusal, or `best` is one that comes before it.
+pub(crate) open spec fn covered(ops: Seq<SOp>, best: Option<(usize, usize, Refusal)>, x: int, y: int) -> bool {
+    pair_refusal(ops, x, y) is None || match best {
+        Some((i, k, _)) => before(i as int, k as int, x, y),
+        None => false,
+    }
+}
+
+/// `best`, if anything, is a refusal.
+pub(crate) open spec fn found(ops: Seq<SOp>, best: Option<(usize, usize, Refusal)>) -> bool {
+    match best {
+        Some((i, k, r)) => i < ops.len() && k < ops.len() && pair_refusal(ops, i as int, k as int)
+            == Some(r),
+        None => true,
+    }
+}
+
+/// Both ways round, the ops of the entries at `p` and `q` in `order` are covered.
+pub(crate) open spec fn scanned(
+    ops: Seq<SOp>,
+    order: Seq<usize>,
+    best: Option<(usize, usize, Refusal)>,
+    p: int,
+    q: int,
+) -> bool {
+    covered(ops, best, order[p] as int / 2, order[q] as int / 2) && covered(
+        ops,
+        best,
+        order[q] as int / 2,
+        order[p] as int / 2,
+    )
+}
+
+/// Every pair of entries `s < t` in `order`, with `s` before `p` and `s`'s key a
+/// prefix of `t`'s, is scanned.
+#[verifier::opaque]
+pub(crate) open spec fn swept(
+    ops: Seq<SOp>,
+    order: Seq<usize>,
+    best: Option<(usize, usize, Refusal)>,
+    p: int,
+) -> bool {
+    forall|s: int, t: int|
+        0 <= s < p && s < t < order.len() && prefix(
+            #[trigger] key(ops, order[s] as int),
+            #[trigger] key(ops, order[t] as int),
+        ) ==> scanned(ops, order, best, s, t)
+}
+
+/// Every op against itself is covered.
+#[verifier::opaque]
+pub(crate) open spec fn selfs(ops: Seq<SOp>, best: Option<(usize, usize, Refusal)>) -> bool {
+    forall|x: int| 0 <= x < ops.len() ==> #[trigger] covered(ops, best, x, x)
+}
+
+/// `next` covers whatever `best` did.
+pub(crate) open spec fn grows(
+    ops: Seq<SOp>,
+    best: Option<(usize, usize, Refusal)>,
+    next: Option<(usize, usize, Refusal)>,
+) -> bool {
+    forall|x: int, y: int| #[trigger] covered(ops, next, x, y) <== covered(ops, best, x, y)
+}
+
+/// One more entry swept: the scan from `p` stopped at `q`, at the first entry
+/// after it that its key is not a prefix of.
+pub(crate) proof fn lemma_swept_one_more(
+    ops: Seq<SOp>,
+    order: Seq<usize>,
+    pos: Seq<usize>,
+    best: Option<(usize, usize, Refusal)>,
+    next: Option<(usize, usize, Refusal)>,
+    p: int,
+    q: int,
+)
+    requires
+        placed(ops, order, pos),
+        0 <= p < q <= order.len(),
+        swept(ops, order, best, p),
+        selfs(ops, best),
+        grows(ops, best, next),
+        forall|t: int| p < t < q ==> #[trigger] scanned(ops, order, next, p, t),
+        q < order.len() ==> !prefix(key(ops, order[p] as int), key(ops, order[q] as int)),
+    ensures
+        swept(ops, order, next, p + 1),
+        selfs(ops, next),
+{
+    reveal(swept);
+    reveal(selfs);
+    lemma_sorted(ops, order, pos);
+    assert forall|s: int, t: int|
+        0 <= s < p + 1 && s < t < order.len() && prefix(
+            #[trigger] key(ops, order[s] as int),
+            #[trigger] key(ops, order[t] as int),
+        ) implies scanned(ops, order, next, s, t) by {
+        if s < p {
+            assert(scanned(ops, order, best, s, t));
+            assert(covered(ops, next, order[s] as int / 2, order[t] as int / 2));
+            assert(covered(ops, next, order[t] as int / 2, order[s] as int / 2));
+        } else if t >= q {
+            let (ka, kq, kt) = (
+                key(ops, order[p] as int),
+                key(ops, order[q] as int),
+                key(ops, order[t] as int),
+            );
+            assert(kq.take(0) =~= ka.take(0));
+            assert(lex_le(ka, kq));
+            assert(lex_le(kq, kt));
+            lemma_lex_between(ka, kq, kt, 0);
+        }
+    }
+    assert forall|x: int| 0 <= x < ops.len() implies #[trigger] covered(ops, next, x, x) by {
+        assert(covered(ops, best, x, x));
+    }
+}
+
+/// Swept to the end, every pair is covered, so the rule holds exactly when
+/// nothing was found.
+pub(crate) proof fn lemma_swept(
+    ops: Seq<SOp>,
+    order: Seq<usize>,
+    pos: Seq<usize>,
+    best: Option<(usize, usize, Refusal)>,
+)
+    requires
+        placed(ops, order, pos),
+        swept(ops, order, best, order.len() as int),
+        selfs(ops, best),
+        found(ops, best),
+    ensures
+        best is None <==> admissible(ops),
+{
+    reveal(selfs);
+    assert forall|x: int, y: int| 0 <= x < ops.len() && 0 <= y < ops.len() implies
+        #[trigger] covered(ops, best, x, y) by {
+        if x != y {
+            assert((2 * x) / 2 == x && (2 * x) % 2 == 0);
+            assert((2 * x + 1) / 2 == x && (2 * x + 1) % 2 == 1);
+            assert((2 * y) / 2 == y && (2 * y) % 2 == 0);
+            assert((2 * y + 1) / 2 == y && (2 * y + 1) % 2 == 1);
+            if related(ops[x].path, ops[y].path) {
+                lemma_met(ops, order, pos, best, 2 * x, 2 * y);
+            } else if two(ops[x].act) && related(ops[x].other, ops[y].path) {
+                lemma_met(ops, order, pos, best, 2 * x + 1, 2 * y);
+            } else if two(ops[y].act) && related(ops[x].path, ops[y].other) {
+                lemma_met(ops, order, pos, best, 2 * x, 2 * y + 1);
+            } else if two(ops[x].act) && two(ops[y].act) && related(ops[x].other, ops[y].other) {
+                lemma_met(ops, order, pos, best, 2 * x + 1, 2 * y + 1);
+            } else {
+                lemma_unrelated(ops, x, y);
+            }
+        } else {
+            assert(covered(ops, best, x, x));
+        }
+    }
+    if best is None {
+        assert forall|x: int, y: int| 0 <= x < ops.len() && 0 <= y < ops.len() implies
+            (#[trigger] pair_refusal(ops, x, y)) is None by {
+            assert(covered(ops, best, x, y));
+        }
+    }
+}
+
+pub(crate) proof fn lemma_lex_refl(a: Seq<usize>, j: int)
+    requires
+        0 <= j,
+    ensures
+        lex_le_from(a, a, j),
+    decreases a.len() - j,
+{
+    if j < a.len() {
+        lemma_lex_refl(a, j + 1);
+    }
+}
+
+pub(crate) proof fn lemma_lex_trans(a: Seq<usize>, b: Seq<usize>, c: Seq<usize>, j: int)
+    requires
+        0 <= j,
+        lex_le_from(a, b, j),
+        lex_le_from(b, c, j),
+    ensures
+        lex_le_from(a, c, j),
+    decreases a.len() - j,
+{
+    if j < a.len() && a[j] == b[j] && b[j] == c[j] {
+        lemma_lex_trans(a, b, c, j + 1);
+    }
+}
+
+/// A key between `a` and a key `a` is a prefix of has `a` as a prefix too.
+pub(crate) proof fn lemma_lex_between(a: Seq<usize>, b: Seq<usize>, c: Seq<usize>, j: int)
+    requires
+        0 <= j <= a.len(),
+        j <= b.len(),
+        b.take(j) == a.take(j),
+        prefix(a, c),
+        lex_le_from(a, b, j),
+        lex_le_from(b, c, j),
+    ensures
+        prefix(a, b),
+    decreases a.len() - j,
+{
+    if j == a.len() {
+        assert(a.take(j) =~= a);
+    } else {
+        assert(c.take(a.len() as int)[j] == c[j]);
+        assert(b[j] == a[j]);
+        assert(b.take(j + 1) =~= a.take(j + 1)) by {
+            assert forall|x: int| 0 <= x < j + 1 implies #[trigger] b.take(j + 1)[x] == a.take(j + 1)[x] by {
+                if x < j {
+                    assert(b.take(j)[x] == a.take(j)[x]);
+                }
+            }
+        }
+        lemma_lex_between(a, b, c, j + 1);
+    }
+}
+
+/// A key no greater than one of its own prefixes is that prefix.
+pub(crate) proof fn lemma_lex_prefix(a: Seq<usize>, b: Seq<usize>, j: int)
+    requires
+        0 <= j <= b.len(),
+        prefix(b, a),
+        lex_le_from(a, b, j),
+    ensures
+        a == b,
+    decreases b.len() - j,
+{
+    if j < b.len() {
+        assert(a.take(b.len() as int)[j] == a[j]);
+        lemma_lex_prefix(a, b, j + 1);
+    } else {
+        assert(a =~= a.take(b.len() as int));
+    }
+}
+
+/// Sorted neighbour by neighbour is sorted throughout.
+pub(crate) proof fn lemma_sorted(ops: Seq<SOp>, order: Seq<usize>, pos: Seq<usize>)
+    requires
+        placed(ops, order, pos),
+    ensures
+        forall|p: int, q: int|
+            0 <= p <= q < order.len() ==> lex_le(
+                #[trigger] key(ops, order[p] as int),
+                #[trigger] key(ops, order[q] as int),
+            ),
+{
+    assert forall|p: int, q: int| 0 <= p <= q < order.len() implies lex_le(
+        #[trigger] key(ops, order[p] as int),
+        #[trigger] key(ops, order[q] as int),
+    ) by {
+        lemma_sorted_from(ops, order, pos, p, q);
+    }
+}
+
+proof fn lemma_sorted_from(ops: Seq<SOp>, order: Seq<usize>, pos: Seq<usize>, p: int, q: int)
+    requires
+        placed(ops, order, pos),
+        0 <= p <= q < order.len(),
+    ensures
+        lex_le(key(ops, order[p] as int), key(ops, order[q] as int)),
+    decreases q - p,
+{
+    if p == q {
+        lemma_lex_refl(key(ops, order[p] as int), 0);
+    } else {
+        lemma_sorted_from(ops, order, pos, p, q - 1);
+        assert(lex_le(key(ops, order[q - 1] as int), key(ops, order[q] as int)));
+        lemma_lex_trans(
+            key(ops, order[p] as int),
+            key(ops, order[q - 1] as int),
+            key(ops, order[q] as int),
+            0,
+        );
+    }
+}
+
+/// Two distinct ops none of whose paths are related cannot refuse one another.
+pub(crate) proof fn lemma_unrelated(ops: Seq<SOp>, x: int, y: int)
+    requires
+        0 <= x < ops.len(),
+        0 <= y < ops.len(),
+        x != y,
+        !related(ops[x].path, ops[y].path),
+        two(ops[x].act) ==> !related(ops[x].other, ops[y].path),
+        two(ops[y].act) ==> !related(ops[x].path, ops[y].other),
+        two(ops[x].act) && two(ops[y].act) ==> !related(ops[x].other, ops[y].other),
+    ensures
+        pair_refusal(ops, x, y) is None,
+{
+    let (a, b) = (ops[x], ops[y]);
+    assert(a.path.take(a.path.len() as int) =~= a.path);
+    assert(a.other.take(a.other.len() as int) =~= a.other);
+    assert(!nested(a.path, b.path));
+    assert(two(a.act) ==> !nested(a.other, b.path));
+    assert(two(b.act) ==> !nested(a.path, b.other));
+    assert(two(a.act) && two(b.act) ==> !nested(a.other, b.other));
+    assert(!mentions(b, a.path));
+    assert(two(a.act) ==> !mentions(b, a.other));
+}
+
+/// Entries `cx` and `cy` of two distinct ops, with related keys, were met by
+/// the scan, whichever of them comes first in `order`.
+pub(crate) proof fn lemma_met(
+    ops: Seq<SOp>,
+    order: Seq<usize>,
+    pos: Seq<usize>,
+    best: Option<(usize, usize, Refusal)>,
+    cx: int,
+    cy: int,
+)
+    requires
+        placed(ops, order, pos),
+        valid(ops, cx),
+        valid(ops, cy),
+        cx / 2 != cy / 2,
+        related(key(ops, cx), key(ops, cy)),
+        swept(ops, order, best, order.len() as int),
+    ensures
+        covered(ops, best, cx / 2, cy / 2),
+        covered(ops, best, cy / 2, cx / 2),
+{
+    reveal(swept);
+    lemma_sorted(ops, order, pos);
+    let (px, py) = (pos[cx] as int, pos[cy] as int);
+    assert(order[px] == cx && order[py] == cy);
+    let (kx, ky) = (key(ops, cx), key(ops, cy));
+    if px < py {
+        assert(lex_le(kx, ky));
+        if !prefix(kx, ky) {
+            lemma_lex_prefix(kx, ky, 0);
+            assert(ky.take(ky.len() as int) =~= ky);
+        }
+        assert(scanned(ops, order, best, px, py));
+    } else {
+        assert(px != py);
+        assert(lex_le(ky, kx));
+        if !prefix(ky, kx) {
+            lemma_lex_prefix(ky, kx, 0);
+            assert(kx.take(kx.len() as int) =~= kx);
+        }
+        assert(scanned(ops, order, best, py, px));
+    }
+}
+
 
 // ---- the rule on the tree's own identities ----
 //
