@@ -189,7 +189,7 @@ impl Journal {
     /// ```
     pub fn kept_in(self, home: impl Into<PathBuf>) -> Result<Self> {
         let home = home.into();
-        if !home.is_absolute() {
+        if !absolute(&home) {
             return Err(Error::InvalidJournalHome(home));
         }
         Ok(Self {
@@ -1854,4 +1854,14 @@ mod tests {
         assert_eq!(read(&root, "a.md"), None);
         assert_eq!(read(&root, "b.md").as_deref(), Some("B2"));
     }
+}
+
+/// Whether `path` is absolute: std's answer, except in a browser
+/// (`wasm32-unknown-unknown`), where std calls no path absolute, since the
+/// target has no filesystem of its own to say what one is. There a path from
+/// the root (`/home/...`), as a store held in memory or in OPFS names its
+/// files, is as absolute as a path can be.
+fn absolute(path: &std::path::Path) -> bool {
+    path.is_absolute()
+        || (cfg!(all(target_arch = "wasm32", target_os = "unknown")) && path.has_root())
 }
