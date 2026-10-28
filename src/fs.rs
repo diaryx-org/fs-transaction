@@ -123,6 +123,36 @@ pub trait ReadStorage {
             Ok(None)
         }
     }
+
+    /// Read the file at `path` a piece at a time, handing each piece to
+    /// `visit` in order: concatenated, the pieces are exactly what
+    /// [`read`](ReadStorage::read) returns. No piece is longer than `chunk`
+    /// bytes (a `chunk` of 0 is taken as 1), and an empty file hands over
+    /// none.
+    ///
+    /// For a consumer that only needs to see every byte once, a checksum
+    /// above all, and must not hold a file of any size in memory to do it:
+    /// a video is gigabytes, and the machine an archive lives on may have
+    /// less memory than that.
+    ///
+    /// The default reads the whole file with [`read`](ReadStorage::read) and
+    /// hands it over in pieces, which is correct and costs what a `read` does.
+    /// A backend that can read a file in parts overrides it, and then holds
+    /// one piece at a time.
+    fn read_chunks<F: FnMut(&[u8])>(
+        &self,
+        path: &Path,
+        chunk: usize,
+        mut visit: F,
+    ) -> impl Future<Output = io::Result<()>> {
+        async move {
+            let bytes = self.read(path).await?;
+            for piece in bytes.chunks(chunk.max(1)) {
+                visit(piece);
+            }
+            Ok(())
+        }
+    }
 }
 
 /// A borrowed [`ReadStorage`] is itself a [`ReadStorage`] — so an owned backend
@@ -160,6 +190,15 @@ impl<S: ReadStorage + ?Sized> ReadStorage for &S {
 
     async fn read_link(&self, path: &Path) -> io::Result<Option<PathBuf>> {
         (**self).read_link(path).await
+    }
+
+    async fn read_chunks<F: FnMut(&[u8])>(
+        &self,
+        path: &Path,
+        chunk: usize,
+        visit: F,
+    ) -> io::Result<()> {
+        (**self).read_chunks(path, chunk, visit).await
     }
 }
 
@@ -199,6 +238,15 @@ impl<S: ReadStorage + ?Sized> ReadStorage for Arc<S> {
 
     async fn read_link(&self, path: &Path) -> io::Result<Option<PathBuf>> {
         (**self).read_link(path).await
+    }
+
+    async fn read_chunks<F: FnMut(&[u8])>(
+        &self,
+        path: &Path,
+        chunk: usize,
+        visit: F,
+    ) -> io::Result<()> {
+        (**self).read_chunks(path, chunk, visit).await
     }
 }
 
@@ -349,6 +397,26 @@ impl ReadStorage for StdFs {
         // on Windows included, where links exist and can be read even though
         // creating one takes a privilege `set_link` may not have.
         std::fs::read_link(path).map(Some)
+    }
+
+    async fn read_chunks<F: FnMut(&[u8])>(
+        &self,
+        path: &Path,
+        chunk: usize,
+        mut visit: F,
+    ) -> io::Result<()> {
+        use std::io::Read as _;
+
+        let mut file = std::fs::File::open(path)?;
+        let mut buffer = vec![0; chunk.max(1)];
+        loop {
+            match file.read(&mut buffer) {
+                Ok(0) => return Ok(()),
+                Ok(n) => visit(&buffer[..n]),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
     }
 }
 
@@ -1435,6 +1503,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // ---- reading in pieces ----
+
+    /// The pieces `read_chunks` hands over for `path`, each kept whole.
+    fn pieces(fs: &impl ReadStorage, path: &Path, chunk: usize) -> io::Result<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        block_on(fs.read_chunks(path, chunk, |piece| out.push(piece.to_vec())))?;
+        Ok(out)
+    }
+
+    #[test]
+    fn stdfs_reads_a_file_in_pieces_no_longer_than_asked() {
+        let dir = tmp("chunks");
+        let path = dir.join("video.mov");
+        let bytes: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let got = pieces(&StdFs, &path, 4096).unwrap();
+        assert!(
+            got.iter()
+                .all(|piece| !piece.is_empty() && piece.len() <= 4096)
+        );
+        assert_eq!(got.concat(), bytes);
+        // Borrowed, the backend still reads in pieces of its own.
+        assert_eq!(pieces(&&StdFs, &path, 4096).unwrap(), got);
+
+        std::fs::write(&path, b"").unwrap();
+        assert!(pieces(&StdFs, &path, 4096).unwrap().is_empty());
+        assert_eq!(pieces(&StdFs, &path, 0).unwrap(), Vec::<Vec<u8>>::new());
+
+        let missing = pieces(&StdFs, &dir.join("absent"), 4096).unwrap_err();
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_default_hands_over_what_read_returns() {
+        let fs = InMemoryFs::new();
+        block_on(fs.write(Path::new("a.bin"), &[1, 2, 3, 4, 5])).unwrap();
+        let got = pieces(&fs, Path::new("a.bin"), 2).unwrap();
+        assert_eq!(got, vec![vec![1, 2], vec![3, 4], vec![5]]);
+        assert_eq!(pieces(&fs, Path::new("a.bin"), 0).unwrap().len(), 5);
+        assert!(pieces(&fs, Path::new("absent"), 2).is_err());
     }
 
     // ---- capability declaration ----

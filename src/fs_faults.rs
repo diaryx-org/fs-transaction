@@ -32,6 +32,15 @@ macro_rules! reads_like_stdfs {
             async fn read_link(&self, path: &Path) -> io::Result<Option<std::path::PathBuf>> {
                 StdFs.read_link(path).await
             }
+
+            async fn read_chunks<F: FnMut(&[u8])>(
+                &self,
+                path: &Path,
+                chunk: usize,
+                visit: F,
+            ) -> io::Result<()> {
+                StdFs.read_chunks(path, chunk, visit).await
+            }
         }
     };
 }
