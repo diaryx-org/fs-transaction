@@ -24,6 +24,21 @@ _No commits since the last tag._
 
 <!-- git-cliff:end -->
 
+## v0.4.1 — 2026-10-27
+
+### Added
+
+- **fs** — read a file in pieces with ReadStorage::read_chunks ([`3b0aa82`](https://github.com/diaryx-org/fs-transaction/commit/3b0aa82d6b030af2f32c877b4a6a37fcf9a76821))
+
+### Fixed
+
+- **ci** — restore the cache, and Zig, for a job whose runner leaves out builds ([`f3156eb`](https://github.com/diaryx-org/fs-transaction/commit/f3156eb8fd9008e8c27abacbef7fda58b49e6c5e))
+
+### Changed
+
+- **replayable** — compare only the ops whose paths meet ([`d4bebe0`](https://github.com/diaryx-org/fs-transaction/commit/d4bebe0b60d62b2cba14f4482b3bb75fca5912bc))
+
+
 ## v0.4.0 — 2026-09-27
 
 ### Breaking
