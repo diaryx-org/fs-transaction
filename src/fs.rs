@@ -192,6 +192,9 @@ pub trait SharedRead: Send + Sync {
     /// Read the entire contents of a file as a string, as
     /// [`ReadStorage::read_to_string`] would.
     fn read_to_string(&self, path: &Path) -> io::Result<String>;
+
+    /// Return the entries in a directory, as [`ReadStorage::read_dir`] would.
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>>;
 }
 
 /// A borrowed [`ReadStorage`] is itself a [`ReadStorage`] — so an owned backend
@@ -406,6 +409,10 @@ impl SharedRead for SharedStd {
 
     fn read_to_string(&self, path: &Path) -> io::Result<String> {
         std::fs::read_to_string(path)
+    }
+
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
+        crate::exec::block_on(StdFs.read_dir(path))
     }
 }
 
@@ -1803,6 +1810,11 @@ mod tests {
             reader.read_to_string(&gone).unwrap_err().kind(),
             block_on(StdFs.read_to_string(&gone)).unwrap_err().kind()
         );
+        let mut listed = reader.read_dir(&root).unwrap();
+        let mut expected = block_on(StdFs.read_dir(&root)).unwrap();
+        listed.sort_by(|a, b| a.path().cmp(b.path()));
+        expected.sort_by(|a, b| a.path().cmp(b.path()));
+        assert_eq!(listed, expected);
     }
 
     #[test]
@@ -1824,6 +1836,10 @@ mod tests {
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            reader.read_dir(Path::new("")).unwrap().len(),
+            block_on(fs.read_dir(Path::new(""))).unwrap().len()
         );
     }
 

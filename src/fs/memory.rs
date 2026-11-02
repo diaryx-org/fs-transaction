@@ -217,6 +217,10 @@ impl SharedRead for SharedMemory {
     fn read_to_string(&self, path: &Path) -> io::Result<String> {
         crate::exec::block_on(self.0.read_to_string(path))
     }
+
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
+        crate::exec::block_on(self.0.read_dir(path))
+    }
 }
 
 impl ReadStorage for InMemoryFs {
