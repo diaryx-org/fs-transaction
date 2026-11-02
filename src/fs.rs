@@ -153,6 +153,45 @@ pub trait ReadStorage {
             Ok(())
         }
     }
+
+    /// This backend's reads as a [`SharedRead`] that any thread may call, or
+    /// `None` where they cannot be. Without one, a consumer reads one file at
+    /// a time.
+    ///
+    /// For a consumer that reads many files and could read them on several
+    /// threads at once: a workspace walk, a search index. The futures this
+    /// trait returns carry no `Send` promise, and `&self` is not promised to
+    /// be shareable either, so without this a caller generic over the backend
+    /// has no way to know that two reads may overlap. A backend whose reads
+    /// are blocking calls already, like [`StdFs`], loses nothing by handing
+    /// them over as plain functions.
+    ///
+    /// `None` is the default, and the right answer for any backend that is
+    /// more than its reads: one that is async in earnest (a network, OPFS), one
+    /// that counts, coordinates or injects faults per call, or one that wraps
+    /// another. Handing over the inner backend's reader would let a caller go
+    /// around the wrapper. A reader that is returned must answer exactly as
+    /// [`read`](ReadStorage::read) and
+    /// [`read_to_string`](ReadStorage::read_to_string) would.
+    fn shared_reader(&self) -> Option<Arc<dyn SharedRead>> {
+        None
+    }
+}
+
+/// Reads that may run on any thread, at the same time as each other — what a
+/// backend that can offer them hands over through
+/// [`ReadStorage::shared_reader`].
+///
+/// Synchronous on purpose: a reader is called from worker threads that have
+/// no executor, and a backend that would need one should decline instead.
+pub trait SharedRead: Send + Sync {
+    /// Read the entire contents of a file as bytes, as
+    /// [`ReadStorage::read`] would.
+    fn read(&self, path: &Path) -> io::Result<Vec<u8>>;
+
+    /// Read the entire contents of a file as a string, as
+    /// [`ReadStorage::read_to_string`] would.
+    fn read_to_string(&self, path: &Path) -> io::Result<String>;
 }
 
 /// A borrowed [`ReadStorage`] is itself a [`ReadStorage`] — so an owned backend
@@ -199,6 +238,10 @@ impl<S: ReadStorage + ?Sized> ReadStorage for &S {
         visit: F,
     ) -> io::Result<()> {
         (**self).read_chunks(path, chunk, visit).await
+    }
+
+    fn shared_reader(&self) -> Option<Arc<dyn SharedRead>> {
+        (**self).shared_reader()
     }
 }
 
@@ -247,6 +290,10 @@ impl<S: ReadStorage + ?Sized> ReadStorage for Arc<S> {
         visit: F,
     ) -> io::Result<()> {
         (**self).read_chunks(path, chunk, visit).await
+    }
+
+    fn shared_reader(&self) -> Option<Arc<dyn SharedRead>> {
+        (**self).shared_reader()
     }
 }
 
@@ -347,9 +394,28 @@ impl Metadata {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StdFs;
 
+/// [`StdFs`]'s [`SharedRead`]: the same `std::fs` calls, on whichever thread
+/// asks. A type of its own, so that the two traits' `read` never meet on one
+/// value.
+struct SharedStd;
+
+impl SharedRead for SharedStd {
+    fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+        std::fs::read(path)
+    }
+
+    fn read_to_string(&self, path: &Path) -> io::Result<String> {
+        std::fs::read_to_string(path)
+    }
+}
+
 impl ReadStorage for StdFs {
     async fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
         std::fs::read(path)
+    }
+
+    fn shared_reader(&self) -> Option<Arc<dyn SharedRead>> {
+        Some(Arc::new(SharedStd))
     }
 
     async fn read_to_string(&self, path: &Path) -> io::Result<String> {
@@ -1696,6 +1762,69 @@ mod tests {
         assert!(!Bare.capabilities().exclusive_create);
         let err = block_on(Bare.create_new(Path::new("x"), b"")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        // Nor does it hand over a reader it never offered.
+        assert!(Bare.shared_reader().is_none());
+    }
+
+    // ---- shared_reader ----
+
+    #[test]
+    fn the_std_reader_answers_as_the_backend_does_from_any_thread() {
+        let root = tmp("shared-std");
+        let paths: Vec<PathBuf> = (0..8)
+            .map(|i| {
+                let path = root.join(format!("{i}.md"));
+                std::fs::write(&path, format!("file {i}")).unwrap();
+                path
+            })
+            .collect();
+        let reader = StdFs
+            .shared_reader()
+            .expect("std::fs reads are blocking calls already");
+        let read: Vec<String> = std::thread::scope(|scope| {
+            let handles: Vec<_> = paths
+                .iter()
+                .map(|path| {
+                    let reader = Arc::clone(&reader);
+                    scope.spawn(move || reader.read_to_string(path).unwrap())
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for (path, text) in paths.iter().zip(&read) {
+            assert_eq!(*text, block_on(StdFs.read_to_string(path)).unwrap());
+            assert_eq!(
+                reader.read(path).unwrap(),
+                block_on(StdFs.read(path)).unwrap()
+            );
+        }
+        let gone = root.join("gone.md");
+        assert_eq!(
+            reader.read_to_string(&gone).unwrap_err().kind(),
+            block_on(StdFs.read_to_string(&gone)).unwrap_err().kind()
+        );
+    }
+
+    #[test]
+    fn a_borrowed_or_shared_backend_keeps_its_reader() {
+        assert!(<&StdFs as ReadStorage>::shared_reader(&&StdFs).is_some());
+        assert!(<Arc<StdFs> as ReadStorage>::shared_reader(&Arc::new(StdFs)).is_some());
+    }
+
+    #[test]
+    fn the_in_memory_reader_sees_writes_made_after_it_was_taken() {
+        let fs = InMemoryFs::new();
+        let reader = fs.shared_reader().unwrap();
+        block_on(fs.write(Path::new("a.md"), b"later")).unwrap();
+        assert_eq!(reader.read_to_string(Path::new("a.md")).unwrap(), "later");
+        block_on(fs.write(Path::new("bin.dat"), &[0xff, 0xfe])).unwrap();
+        assert_eq!(
+            reader
+                .read_to_string(Path::new("bin.dat"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     // ---- sync ----

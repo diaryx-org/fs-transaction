@@ -89,6 +89,6 @@ mod fs_faults;
 
 pub use change::{ChangeSet, Expected, FileOp};
 pub use error::{Error, Result};
-pub use fs::{InMemoryFs, ReadStorage, StdFs, Storage};
+pub use fs::{InMemoryFs, ReadStorage, SharedRead, StdFs, Storage};
 pub use journal::{Journal, Recovered, recover};
 pub use ordered::{BatchOp, OrderedBatch};

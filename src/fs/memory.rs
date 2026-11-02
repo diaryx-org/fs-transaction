@@ -11,7 +11,7 @@ use std::io::{self, Error, ErrorKind};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use super::{DirEntry, FileType, Metadata, ReadStorage};
+use super::{DirEntry, FileType, Metadata, ReadStorage, SharedRead};
 
 use super::{Capabilities, Storage};
 
@@ -204,6 +204,21 @@ fn not_found(path: &Path) -> Error {
     )
 }
 
+/// [`InMemoryFs`]'s [`SharedRead`]. Every read is a map lookup, ready the
+/// moment it is asked, so the backend's own futures are driven in place. A
+/// type of its own, so that the two traits' `read` never meet on one value.
+struct SharedMemory(InMemoryFs);
+
+impl SharedRead for SharedMemory {
+    fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+        crate::exec::block_on(self.0.read(path))
+    }
+
+    fn read_to_string(&self, path: &Path) -> io::Result<String> {
+        crate::exec::block_on(self.0.read_to_string(path))
+    }
+}
+
 impl ReadStorage for InMemoryFs {
     async fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
         let normalized = normalize_path(path);
@@ -225,6 +240,12 @@ impl ReadStorage for InMemoryFs {
         // `std::fs::read_to_string`) instead of a misleading `NotFound`.
         let bytes = self.read(path).await?;
         String::from_utf8(bytes).map_err(|e| Error::new(ErrorKind::InvalidData, e))
+    }
+
+    /// A clone, which shares the maps this one holds, so the reader sees every
+    /// later write as `read` would.
+    fn shared_reader(&self) -> Option<Arc<dyn SharedRead>> {
+        Some(Arc::new(SharedMemory(self.clone())))
     }
 
     async fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
