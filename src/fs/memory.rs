@@ -511,6 +511,14 @@ impl Storage for InMemoryFs {
         }
         self.changed(&from_norm);
         self.changed(&to_norm);
+        // A folder moved onto a name a watcher's copy may still hold (one
+        // removed a moment before) is new in every entry: each is reported,
+        // so the copy rewrites what it held there rather than keeping it.
+        if is_dir {
+            for entry in self.entries_under(&to_norm) {
+                self.changed(&entry);
+            }
+        }
         Ok(())
     }
 
@@ -557,6 +565,25 @@ impl Storage for InMemoryFs {
 }
 
 impl InMemoryFs {
+    /// Every file, link and folder under `dir`, not `dir` itself, in order,
+    /// read with the locks then released.
+    fn entries_under(&self, dir: &Path) -> Vec<PathBuf> {
+        let under = |p: &&PathBuf| p.starts_with(dir) && p.as_path() != dir;
+        let mut entries: Vec<PathBuf> = self
+            .files
+            .read()
+            .unwrap()
+            .keys()
+            .chain(self.binary_files.read().unwrap().keys())
+            .chain(self.symlinks.read().unwrap().keys())
+            .chain(self.directories.read().unwrap().iter())
+            .filter(under)
+            .cloned()
+            .collect();
+        entries.sort();
+        entries
+    }
+
     fn rename_dir(&self, from_norm: &Path, to_norm: &Path, to: &Path) -> io::Result<()> {
         {
             // A *directory* rename keeps the refusal a file rename gave up:
@@ -1175,6 +1202,56 @@ mod tests {
         fs.unwatch();
         block_on(fs.write(Path::new("/e.md"), b"x")).unwrap();
         assert_eq!(seen.lock().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn a_folder_renamed_onto_a_removed_one_reports_every_entry_under_it() {
+        use std::sync::Mutex;
+        let fs = InMemoryFs::new();
+        block_on(async {
+            fs.write(Path::new("/a/x.md"), b"old").await.unwrap();
+            fs.write(Path::new("/b/x.md"), b"new").await.unwrap();
+            fs.write(Path::new("/b/sub/y.bin"), &[0xff]).await.unwrap();
+        });
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        fs.watch({
+            let seen = seen.clone();
+            move |p| seen.lock().unwrap().push(p.to_path_buf())
+        });
+        block_on(async {
+            fs.remove_dir_all(Path::new("/a")).await.unwrap();
+            fs.rename(Path::new("/b"), Path::new("/a")).await.unwrap();
+        });
+        let told: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            told,
+            ["/a", "/b", "/a", "/a/sub", "/a/sub/y.bin", "/a/x.md"]
+        );
+    }
+
+    #[test]
+    fn a_watcher_may_read_and_unwatch_the_tree_it_is_told_of() {
+        use std::sync::Mutex;
+        let fs = InMemoryFs::new();
+        let read = Arc::new(Mutex::new(Vec::new()));
+        fs.watch({
+            let fs = fs.clone();
+            let read = read.clone();
+            move |p| {
+                read.lock().unwrap().push(block_on(fs.read(p)).ok());
+                fs.unwatch();
+            }
+        });
+        block_on(async {
+            fs.write(Path::new("/a.md"), b"a").await.unwrap();
+            fs.write(Path::new("/b.md"), b"b").await.unwrap();
+        });
+        assert_eq!(*read.lock().unwrap(), [Some(b"a".to_vec())]);
     }
 
     #[test]
