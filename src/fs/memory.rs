@@ -55,6 +55,26 @@ pub struct InMemoryFs {
     /// the target's content; the parent's `read_dir` reports the link itself
     /// as [`FileType::SYMLINK`].
     symlinks: Arc<RwLock<HashMap<PathBuf, PathBuf>>>,
+    /// Told the path of each entry a [`Storage`] call changes, shared by
+    /// every clone ([`watch`](Self::watch)).
+    watcher: Arc<RwLock<Watcher>>,
+}
+
+/// A watcher's callback.
+type OnChange = Arc<dyn Fn(&Path) + Send + Sync>;
+
+/// What [`InMemoryFs::watch`] was given, if anything.
+#[derive(Default)]
+struct Watcher(Option<OnChange>);
+
+impl std::fmt::Debug for Watcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "Watcher(set)"
+        } else {
+            "Watcher(none)"
+        })
+    }
 }
 
 impl InMemoryFs {
@@ -135,6 +155,37 @@ impl InMemoryFs {
         self.binary_files.write().unwrap().clear();
         self.directories.write().unwrap().clear();
         self.symlinks.write().unwrap().clear();
+    }
+
+    /// Tell `on_change` the path of every entry a [`Storage`] call changes
+    /// from now on, in this filesystem and every clone of it: a file written,
+    /// replaced or removed, a directory made or removed (its own path, not
+    /// each entry under it), both ends of a rename, a link set. It is called
+    /// after the change, with no lock held, so it may read the filesystem to
+    /// see what the path now holds — which is how a host that keeps the tree
+    /// somewhere lasting (a browser's OPFS) learns what to write out or
+    /// remove, without the tree being exported whole.
+    ///
+    /// The bulk loaders ([`with_files`](Self::with_files),
+    /// [`load_binary_entries`](Self::load_binary_entries),
+    /// [`add_symlink`](Self::add_symlink)) and [`clear`](Self::clear) are
+    /// not reported: they are how such a host fills the tree from what it
+    /// kept. Replaces the watcher given before.
+    pub fn watch(&self, on_change: impl Fn(&Path) + Send + Sync + 'static) {
+        self.watcher.write().unwrap().0 = Some(Arc::new(on_change));
+    }
+
+    /// Stop telling the watcher [`watch`](Self::watch) was given.
+    pub fn unwatch(&self) {
+        self.watcher.write().unwrap().0 = None;
+    }
+
+    /// Tell the watcher, if there is one, that the entry at `path` changed.
+    fn changed(&self, path: &Path) {
+        let watcher = self.watcher.read().unwrap().0.clone();
+        if let Some(watcher) = watcher {
+            watcher(path);
+        }
     }
 
     /// Add a symlink from `link` to `target`. Reading `link` (or its
@@ -368,6 +419,7 @@ impl Storage for InMemoryFs {
                 self.files.write().unwrap().remove(&resolved);
             }
         }
+        self.changed(&resolved);
         Ok(())
     }
 
@@ -400,27 +452,26 @@ impl Storage for InMemoryFs {
             dirs.insert(normalized.clone());
         }
         insert_ancestor_dirs(&mut dirs, &normalized);
+        drop(dirs);
+        self.changed(&normalized);
         Ok(())
     }
 
     async fn remove_file(&self, path: &Path) -> io::Result<()> {
         let normalized = normalize_path(path);
-        if self.files.write().unwrap().remove(&normalized).is_some() {
-            return Ok(());
+        let removed = self.files.write().unwrap().remove(&normalized).is_some()
+            || self
+                .binary_files
+                .write()
+                .unwrap()
+                .remove(&normalized)
+                .is_some()
+            || self.symlinks.write().unwrap().remove(&normalized).is_some();
+        if !removed {
+            return Err(not_found(path));
         }
-        if self
-            .binary_files
-            .write()
-            .unwrap()
-            .remove(&normalized)
-            .is_some()
-        {
-            return Ok(());
-        }
-        if self.symlinks.write().unwrap().remove(&normalized).is_some() {
-            return Ok(());
-        }
-        Err(not_found(path))
+        self.changed(&normalized);
+        Ok(())
     }
 
     async fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
@@ -441,6 +492,7 @@ impl Storage for InMemoryFs {
             .write()
             .unwrap()
             .retain(|p| p != &normalized && !p.starts_with(&normalized));
+        self.changed(&normalized);
         Ok(())
     }
 
@@ -453,10 +505,13 @@ impl Storage for InMemoryFs {
 
         let is_dir = self.directories.read().unwrap().contains(&from_norm);
         if is_dir {
-            self.rename_dir(&from_norm, &to_norm, to)
+            self.rename_dir(&from_norm, &to_norm, to)?;
         } else {
-            self.rename_file(&from_norm, &to_norm, from, to).await
+            self.rename_file(&from_norm, &to_norm, from, to).await?;
         }
+        self.changed(&from_norm);
+        self.changed(&to_norm);
+        Ok(())
     }
 
     async fn set_link(&self, path: &Path, target: &Path) -> io::Result<()> {
@@ -471,7 +526,8 @@ impl Storage for InMemoryFs {
         self.symlinks
             .write()
             .unwrap()
-            .insert(normalized, normalize_path(target));
+            .insert(normalized.clone(), normalize_path(target));
+        self.changed(&normalized);
         Ok(())
     }
 
@@ -607,9 +663,10 @@ impl InMemoryFs {
             }
         }
 
-        if let Some(parent) = to_norm.parent() {
-            self.create_dir_all(parent).await?;
-        }
+        // The destination's folders, made as a write makes them: not through
+        // `create_dir_all`, which a watcher would hear of as a change of its
+        // own.
+        insert_ancestor_dirs(&mut self.directories.write().unwrap(), to_norm);
 
         // The non-directory occupant, if any, is replaced — file, binary, or
         // link alike, exactly the entry-level replacement `rename(2)` performs.
@@ -1081,6 +1138,43 @@ mod tests {
             block_on(clone.read_to_string(Path::new("shared.md"))).unwrap(),
             "visible everywhere"
         );
+    }
+
+    #[test]
+    fn a_watcher_is_told_each_changed_entry_and_not_the_bulk_loads() {
+        use std::sync::Mutex;
+        let fs = InMemoryFs::new();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        // Watched through a clone: every clone shares the watcher.
+        fs.clone().watch({
+            let seen = seen.clone();
+            move |p| seen.lock().unwrap().push(p.to_path_buf())
+        });
+        fs.load_binary_entries(vec![("/loaded/a.bin".into(), vec![0xff])]);
+        block_on(async {
+            fs.write(Path::new("/a/b.md"), b"hi").await.unwrap();
+            fs.create_dir_all(Path::new("/a/c")).await.unwrap();
+            fs.rename(Path::new("/a/b.md"), Path::new("/a/d.md"))
+                .await
+                .unwrap();
+            fs.remove_file(Path::new("/a/d.md")).await.unwrap();
+            assert!(fs.remove_file(Path::new("/a/none.md")).await.is_err());
+            fs.remove_dir_all(Path::new("/a")).await.unwrap();
+        });
+        let told: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            told,
+            ["/a/b.md", "/a/c", "/a/b.md", "/a/d.md", "/a/d.md", "/a"]
+        );
+
+        fs.unwatch();
+        block_on(fs.write(Path::new("/e.md"), b"x")).unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 6);
     }
 
     #[test]
