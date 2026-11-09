@@ -2,10 +2,11 @@
 title: Tasks
 description: Deferred work in fs-transaction — one file each, every one with a done state
 created: 2026-09-16
-updated: 2026-09-27
+updated: 2026-11-08
 contents:
   - "[A strength below Ordered: handed over](a-strength-below-ordered.md)"
   - "[A replay checker that scales with a set's size](a-checker-that-scales.md)"
+  - "[A set can write its own journal](a-set-can-write-its-own-journal.md)"
 ---
 
 # Tasks
