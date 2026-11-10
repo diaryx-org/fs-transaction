@@ -484,6 +484,12 @@ impl Journal {
     /// rule is in full in the source of `replayable.rs`. A set of one is never
     /// refused.
     ///
+    /// Nor may any set, of one or of many, name this journal's own path in
+    /// the root or the sibling it is staged through: that is refused with
+    /// [`Error::JournalPath`], before anything is written, since a set that
+    /// wrote the journal would wedge the root and one that removed it would
+    /// commit through a record it had destroyed.
+    ///
     /// Whatever recovers an interruption of this call must name the same
     /// journal — see [`Journal`] for why the two operations live together.
     pub async fn apply<FS: Storage>(
@@ -508,6 +514,12 @@ impl Journal {
         for (path, _) in &changes.expected {
             guard_in_root(path)?;
         }
+        // The journal is the one path in the root the crate keeps for
+        // itself, and a set built from data the caller did not write can
+        // name it as easily as it can name `../../etc/passwd`. Written, it
+        // wedges the root behind a journal recovery cannot read; removed or
+        // replaced, it takes away the record this very set commits through.
+        self.guard_own_path(&changes.ops, root)?;
         // Refuse a set a crash could not be recovered from — see
         // [`crate::replayable`]. A set of one replays from its only op, which
         // is always its crash point, so it needs no such rule.
@@ -1826,6 +1838,45 @@ pub(crate) fn guard_ops(ops: &[FileOp]) -> Result<()> {
     Ok(())
 }
 
+impl Journal {
+    /// Refuse an op that names this journal's path in `root`, or the sibling
+    /// [`Storage::write_atomic`] stages it through.
+    ///
+    /// Every path an op touches is compared after [`normalize`], so
+    /// `notes/../.fstx-journal` is the journal too; a [`FileOp::SetLink`]
+    /// target is not, being recorded rather than touched. A
+    /// [homed](Journal::kept_in) journal lives outside the root, so no
+    /// staged path can name it unless its home is inside the root.
+    fn guard_own_path(&self, ops: &[FileOp], root: &Path) -> Result<()> {
+        let journal = self.path_in(root);
+        let staging = crate::fs::temp_sibling(&journal);
+        let refuse = |path: &Path| {
+            let landed = root.join(crate::path::normalize(path));
+            if landed == journal || landed == staging {
+                return Err(Error::JournalPath(path.to_path_buf()));
+            }
+            Ok(())
+        };
+        for op in ops {
+            match op {
+                FileOp::Write { path, .. }
+                | FileOp::Remove { path }
+                | FileOp::SetExecutable { path, .. }
+                | FileOp::SetLink { path, .. } => refuse(path)?,
+                FileOp::Rename { from, to } => {
+                    refuse(from)?;
+                    refuse(to)?;
+                }
+                FileOp::CopyFrom { path, source } => {
+                    refuse(path)?;
+                    refuse(source)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Check every staged expectation against the tree as it stands, before the
 /// set touches anything.
 ///
@@ -3072,6 +3123,150 @@ mod tests {
             matches!(err, Error::Escape(_)),
             "expected Escape, got {err:?}"
         );
+    }
+
+    /// Whether `err` is the refusal of a set naming the journal at `path`.
+    fn names_the_journal(err: &Error, path: &Path) -> bool {
+        matches!(err, Error::JournalPath(p) if p == path)
+    }
+
+    #[test]
+    fn apply_refuses_a_lone_write_to_the_journal() {
+        // Alone, the write skips the journal and used to land as an ordinary
+        // file, which every later apply then refused as a stale journal and
+        // recovery refused as not a journal: a wedged root.
+        let root = tmp("own-journal-alone");
+        let mut cs = ChangeSet::new();
+        cs.write(Journal::DEFAULT_NAME, "hello");
+        let err = block_on(cs.apply(&StdFs, &root)).unwrap_err();
+        assert!(
+            names_the_journal(&err, Path::new(Journal::DEFAULT_NAME)),
+            "{err:?}"
+        );
+        assert!(!Journal::default().path_in(&root).exists());
+
+        let mut next = ChangeSet::new();
+        next.write("b", "y");
+        block_on(next.apply(&StdFs, &root)).unwrap();
+        assert_eq!(read(&root, "b").as_deref(), Some("y"));
+    }
+
+    #[test]
+    fn apply_refuses_a_lone_write_to_the_journal_in_memory() {
+        let fs = crate::fs::InMemoryFs::new();
+        let root = Path::new("/root");
+        let mut cs = ChangeSet::new();
+        cs.write(Journal::DEFAULT_NAME, "hello");
+        let err = block_on(cs.apply(&fs, root)).unwrap_err();
+        assert!(
+            names_the_journal(&err, Path::new(Journal::DEFAULT_NAME)),
+            "{err:?}"
+        );
+        assert!(!block_on(fs.try_exists(&Journal::default().path_in(root))).unwrap());
+    }
+
+    #[test]
+    fn apply_refuses_a_journaled_write_to_the_journal() {
+        // With a second op the set is journaled, and the write used to be
+        // reported as done and then retired as the set's own journal.
+        let root = tmp("own-journal-write");
+        let mut cs = ChangeSet::new();
+        cs.write(Journal::DEFAULT_NAME, "x");
+        cs.write("b", "y");
+        let err = block_on(cs.apply(&StdFs, &root)).unwrap_err();
+        assert!(
+            names_the_journal(&err, Path::new(Journal::DEFAULT_NAME)),
+            "{err:?}"
+        );
+        assert_eq!(read(&root, "b"), None);
+        assert!(!Journal::default().path_in(&root).exists());
+    }
+
+    #[test]
+    fn apply_refuses_a_set_removing_its_own_journal() {
+        // The set used to delete the journal it was committing through, land,
+        // and report a torn apply when the journal was gone at retirement.
+        let root = tmp("own-journal-remove");
+        let mut cs = ChangeSet::new();
+        cs.remove(Journal::DEFAULT_NAME);
+        cs.write("b", "y");
+        let err = block_on(cs.apply(&StdFs, &root)).unwrap_err();
+        assert!(
+            names_the_journal(&err, Path::new(Journal::DEFAULT_NAME)),
+            "{err:?}"
+        );
+        assert_eq!(read(&root, "b"), None);
+        assert!(!Journal::default().path_in(&root).exists());
+    }
+
+    #[test]
+    fn apply_refuses_the_journal_however_it_is_spelled() {
+        // The journal's staging sibling, a path that folds to the journal's,
+        // a rename either way, a copy out of it, and a named journal's own
+        // name.
+        let named = Journal::named(".mine").unwrap();
+        type Stage = fn(&mut ChangeSet);
+        let cases: [(&Journal, &str, Stage); 6] = [
+            (&Journal::default(), "staging", |cs| {
+                cs.write(
+                    crate::fs::temp_sibling(Path::new(Journal::DEFAULT_NAME)),
+                    "x",
+                );
+            }),
+            (&Journal::default(), "folded", |cs| {
+                cs.write("notes/../.fstx-journal", "x");
+            }),
+            (&Journal::default(), "rename-onto", |cs| {
+                cs.rename("a", Journal::DEFAULT_NAME);
+            }),
+            (&Journal::default(), "rename-from", |cs| {
+                cs.rename(Journal::DEFAULT_NAME, "a2");
+            }),
+            (&Journal::default(), "copy-from", |cs| {
+                cs.copy_from("a2", Journal::DEFAULT_NAME);
+            }),
+            (&named, "named", |cs| {
+                cs.write(".mine", "x");
+            }),
+        ];
+        for (journal, name, stage) in cases {
+            let root = tmp(&format!("own-journal-{name}"));
+            std::fs::write(root.join("a"), "a").unwrap();
+            let mut cs = ChangeSet::new();
+            stage(&mut cs);
+            cs.write("b", "y");
+            let err = block_on(journal.apply(&cs, &StdFs, &root)).unwrap_err();
+            assert!(matches!(err, Error::JournalPath(_)), "{name}: {err:?}");
+            assert_eq!(read(&root, "b"), None, "{name}");
+            assert_eq!(read(&root, "a").as_deref(), Some("a"), "{name}");
+        }
+    }
+
+    #[test]
+    fn apply_lands_a_file_that_only_shares_the_journals_name() {
+        // Only the journal's own path in the root is kept: the same name in a
+        // subdirectory is an ordinary file, and so is the default name under
+        // a named journal, or in the root of a homed one.
+        let root = tmp("own-journal-elsewhere");
+        let mut cs = ChangeSet::new();
+        cs.write("notes/.fstx-journal", "a");
+        cs.write("b", "y");
+        block_on(cs.apply(&StdFs, &root)).unwrap();
+        assert_eq!(read(&root, "notes/.fstx-journal").as_deref(), Some("a"));
+
+        let mut cs = ChangeSet::new();
+        cs.write(Journal::DEFAULT_NAME, "x");
+        cs.write("c", "z");
+        let named = Journal::named(".mine").unwrap();
+        block_on(named.apply(&cs, &StdFs, &root)).unwrap();
+        assert_eq!(read(&root, Journal::DEFAULT_NAME).as_deref(), Some("x"));
+        std::fs::remove_file(root.join(Journal::DEFAULT_NAME)).unwrap();
+
+        let home = tmp("own-journal-home");
+        let homed = Journal::default().kept_in(&home).unwrap();
+        block_on(homed.apply(&cs, &StdFs, &root)).unwrap();
+        assert_eq!(read(&root, Journal::DEFAULT_NAME).as_deref(), Some("x"));
+        assert!(!homed.path_in(&root).exists());
     }
 
     #[test]

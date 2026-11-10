@@ -2,7 +2,8 @@
 //!
 //! The split between the variants is the crate's whole safety story:
 //! [`Io`](Error::Io), [`Escape`](Error::Escape),
-//! [`Drifted`](Error::Drifted), and [`Unreplayable`](Error::Unreplayable)
+//! [`JournalPath`](Error::JournalPath), [`Drifted`](Error::Drifted), and
+//! [`Unreplayable`](Error::Unreplayable)
 //! are ordinary refusals that
 //! leave the target untouched, the construction-time refusals
 //! ([`InvalidJournalName`](Error::InvalidJournalName),
@@ -37,6 +38,18 @@ pub enum Error {
     /// written or journaled, because a set assembled from untrusted data must
     /// not be able to reach out of the tree it was pointed at.
     Escape(PathBuf),
+
+    /// A staged op named the path the set's own
+    /// [`Journal`](crate::journal::Journal) lives at in the root, or the
+    /// sibling it is staged through. The journal is the one path in the root
+    /// the crate keeps for itself: a set that wrote it would leave a file
+    /// every later apply refuses as a stale journal and recovery refuses as
+    /// not one, and a set that removed or replaced it would pull the record
+    /// of its own commit out from under itself. Refused, like
+    /// [`Escape`](Error::Escape), before anything is written or journaled. A
+    /// [homed](crate::journal::Journal::kept_in) journal keeps no file in the
+    /// root, so under one a file of the same name there is ordinary.
+    JournalPath(PathBuf),
 
     /// An [expectation](crate::ChangeSet::expect) the set staged did not hold
     /// when it was applied: the tree at this path is not what the caller read
@@ -134,6 +147,11 @@ impl fmt::Display for Error {
         match self {
             Error::Io(e) => write!(f, "io error: {e}"),
             Error::Escape(p) => write!(f, "path escapes the root: {}", p.display()),
+            Error::JournalPath(p) => write!(
+                f,
+                "path is the set's own journal and cannot be staged: {}",
+                p.display()
+            ),
             Error::Drifted(p) => write!(
                 f,
                 "the tree drifted from what the set expected at {}; \
