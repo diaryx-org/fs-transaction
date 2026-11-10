@@ -1,13 +1,27 @@
 ---
 title: A set can write its own journal
 description: "A set that names the journal's path is applied like any other file: alone, it plants a file that wedges the root until someone deletes it by hand; beside other ops, it reports Ok and the file is gone"
-status: open
+status: done
 created: 2026-11-08
-updated: 2026-11-08
+updated: 2026-11-10
 part_of: "[Tasks](tasks.md)"
 ---
 
 # A set can write its own journal
+
+**Status.** Done, by `fix(journal): refuse a set that names its own
+journal`. `Journal::apply` refuses, right after the root clamp and before
+anything is written or journaled, any op whose path (normalized, so
+`notes/../.fstx-journal` counts) lands on the journal's path in the root or
+its `write_atomic` staging sibling, with `Error::JournalPath` naming the
+staged path. It compares paths exactly rather than through `owns_path`, whose
+containment test would also refuse `notes/.fstx-journal` or `a.fstx-journal`.
+A homed journal's root keeps no such path. The rows of the table are held by
+`apply_refuses_a_lone_write_to_the_journal` (and its `InMemoryFs` twin),
+`apply_refuses_a_journaled_write_to_the_journal` and
+`apply_refuses_a_set_removing_its_own_journal`; the other spellings by
+`apply_refuses_the_journal_however_it_is_spelled`, and what stays ordinary by
+`apply_lands_a_file_that_only_shares_the_journals_name`.
 
 `ChangeSet::apply` clamps every staged path to the root (`guard_ops`, then
 `guard_in_root` on each expectation) and nothing else. A path equal to the
